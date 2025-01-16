@@ -1,0 +1,16 @@
+mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=../install
+cmake --build . --config Release
+cmake --install .
+
+
+
+// CONNECTING TO SOCKET
+wscat -c ws://127.0.0.1:9001 -s "json"
+
+// ACTIVATING INSTANCE
+{"path": "/api/v1/integration/activate", "verb": "SET", "payload": {"integrationGuid": "1abcdx", "instanceGuid": "1abcdx"}}
+
+
+// INVOKING COMMANDS
+{"path": "/api/v1/integration/sdk/action/invoke", "verb": "SET", "payload": {"actionId": "obs_desktop_mute_toggle", "integrationGuid": "ae67192054b1d99f", "parameters":{} }}
