@@ -31,9 +31,14 @@ const char *obs_module_description()
 bool obs_module_load()
 {
     // Called when the module is loaded.
-    // Connect to G HUB
     m_shutting_down = false;
-    connect();
+    
+    // Start connection in a separate thread to avoid blocking OBS startup
+    std::thread([]{
+        // Add a small delay to let OBS finish initializing
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        connect();
+    }).detach();
 
     return true;
 }
@@ -233,7 +238,8 @@ void vorti::applets::obs_plugin::reconnect() {
     disconnect();
 
     int attempt = 0;
-    const int max_attempts = 50;
+    const int max_attempts = 50; // Reduced from 50 to 5 attempts
+    const int retry_delay_seconds = 2;
     
     while (!is_connected() && attempt < max_attempts && !m_shutting_down) {
         try {
@@ -247,19 +253,26 @@ void vorti::applets::obs_plugin::reconnect() {
             
             attempt++;
             if (attempt < max_attempts) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
             }
         } catch (const std::exception& e) {
             log_to_obs("Reconnection attempt failed: " + std::string(e.what()));
             attempt++;
             if (attempt < max_attempts) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
             }
         }
     }
 
     if (attempt >= max_attempts) {
-        log_to_obs("Max reconnection attempts reached (" + std::to_string(max_attempts) + ")");
+        log_to_obs("Max reconnection attempts reached (" + std::to_string(max_attempts) + "), will try again later");
+        // Schedule another reconnection attempt after a longer delay
+        std::thread([]{
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            if (!m_shutting_down && !is_connected()) {
+                reconnect();
+            }
+        }).detach();
     }
 }
 

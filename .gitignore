@@ -29,7 +29,4 @@
 
 # Misc.
 *.DS_Store
-
-other/json/*
-other/asio/*
-other/websocketpp/*
+build
