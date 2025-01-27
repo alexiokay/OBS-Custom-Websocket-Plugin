@@ -226,6 +226,8 @@ bool vorti::applets::obs_plugin::connect()
     return true;
 }
 
+
+// infinite reconnect
 void vorti::applets::obs_plugin::reconnect() {
     if (m_shutting_down) {
         log_to_obs("Not attempting reconnection - shutting down");
@@ -238,12 +240,11 @@ void vorti::applets::obs_plugin::reconnect() {
     disconnect();
 
     int attempt = 0;
-    const int max_attempts = 50; // Reduced from 50 to 5 attempts
     const int retry_delay_seconds = 2;
     
-    while (!is_connected() && attempt < max_attempts && !m_shutting_down) {
+    while (!is_connected() && !m_shutting_down) {
         try {
-            log_to_obs("Reconnection attempt " + std::to_string(attempt + 1) + " of " + std::to_string(max_attempts));
+            log_to_obs("Reconnection attempt " + std::to_string(attempt + 1));
             
             // Attempt to establish new connection with full initialization
             if (connect()) {
@@ -252,29 +253,16 @@ void vorti::applets::obs_plugin::reconnect() {
             }
             
             attempt++;
-            if (attempt < max_attempts) {
-                std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
-            }
+            std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
+
         } catch (const std::exception& e) {
             log_to_obs("Reconnection attempt failed: " + std::string(e.what()));
             attempt++;
-            if (attempt < max_attempts) {
-                std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
-            }
+            std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
         }
     }
-
-    if (attempt >= max_attempts) {
-        log_to_obs("Max reconnection attempts reached (" + std::to_string(max_attempts) + "), will try again later");
-        // Schedule another reconnection attempt after a longer delay
-        std::thread([]{
-            std::this_thread::sleep_for(std::chrono::seconds(30));
-            if (!m_shutting_down && !is_connected()) {
-                reconnect();
-            }
-        }).detach();
-    }
 }
+
 
 void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::connection_hdl &connection_handle)
 {
