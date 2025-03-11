@@ -2,6 +2,8 @@
 
 This is a plugin for [OBS Studio](https://obsproject.com/) exposing actions to [VortiDeck](https://www.vortideck.com), allowing users to take control of their OBS setup through VortiDeck peripherals.
 
+This is customized obs plugin for Logitech GHub, it includes constant reconnecting logic and Will include mdns searching in future
+
 ## File structure
 
 * `obs_plugin` directory contains the source code for the plugin.
