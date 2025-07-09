@@ -18,7 +18,7 @@ This is customized obs plugin for Logitech GHub, it includes constant reconnecti
 * [WebSocket++](https://github.com/zaphoyd/websocketpp)
 
 
-# Start of Selection
+
 ## Commands 
 
 The following commands are used to build, install, and interact with the VortiDeck OBS Plugin:
@@ -52,4 +52,3 @@ The following commands are used to build, install, and interact with the VortiDe
      ```
 
 These commands facilitate the setup and operation of the VortiDeck OBS Plugin, enabling seamless integration with OBS Studio.
-# End of Selection
