@@ -1,25 +1,78 @@
 #include "obs_plugin.hpp"
 
+#define _WEBSOCKETPP_CPP11_RANDOM_DEVICE_
+
+#ifndef ASIO_STANDALONE
+    #define ASIO_STANDALONE
+#endif
+
+#ifndef _WEBSOCKETPP_CPP11_TYPE_TRAITS_
+    #define _WEBSOCKETPP_CPP11_TYPE_TRAITS_
+#endif
+
+#pragma warning(push)
+#pragma warning(disable : 4267)
+#include <nlohmann/json.hpp>
+#include <websocketpp/client.hpp>
+#include <websocketpp/config/asio_no_tls_client.hpp>
+#pragma warning(pop)
+
+#include <libobs/obs.h>
 #include <UI/obs-frontend-api/obs-frontend-api.h>
 #include <libobs/obs-module.h>
+
 #include <libobs/util/platform.h>
 
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <sstream>
+
 using namespace vorti::applets::obs_plugin;
+
+// Simple plugin interface for banner manager
+struct plugin_interface {
+    bool is_connected() const;
+    bool send_message(const nlohmann::json& message) const;
+};
+
+// Implementation of plugin_interface methods
+bool plugin_interface::is_connected() const {
+    return vorti::applets::obs_plugin::is_connected();
+}
+
+bool plugin_interface::send_message(const nlohmann::json& message) const {
+    return vorti::applets::obs_plugin::send_message(message);
+}
+
+// Global plugin instance for cross-module access
+plugin_interface* g_obs_plugin_instance = new plugin_interface();
+
+// Log function definition (needed before other functions use it)
+void log_to_obs(std::string_view message) {
+    blog(LOG_INFO, "%s", message.data());  // string_view version
+    // Use regular logging for now
+    printf("[OBS Plugin] %.*s\n", static_cast<int>(message.size()), message.data());
+}
 
 /*
 Helpful resources: https://obsproject.com/docs/reference-modules.html
 */
 
 /* Defines common functions (required) */
-OBS_DECLARE_MODULE()
+// TEMPORARILY COMMENT OUT OBS FUNCTIONS
+OBS_DECLARE_MODULE()  // Required for OBS to recognize the plugin
 
-
+// TEMPORARILY COMMENT OUT OBS-SPECIFIC FUNCTIONS
+// (Uncommented obs_module_post_load to enable menu functionality)
 const char *obs_module_name()
 {
     // The full name of the module
     return s_integration_name.c_str();
 }
-
 
 const char *obs_module_description()
 {
@@ -27,14 +80,13 @@ const char *obs_module_description()
     return s_integration_description.c_str();
 }
 
-
 bool obs_module_load()
 {
     // Called when the module is loaded.
     m_shutting_down = false;
     
-    // Start connection in a separate thread to avoid blocking OBS startup
-    std::thread([]{
+    // Start connection in a separate jthread to avoid blocking OBS startup
+    std::jthread([]{
         // Add a small delay to let OBS finish initializing
         std::this_thread::sleep_for(std::chrono::seconds(1));
         connect();
@@ -43,8 +95,7 @@ bool obs_module_load()
     return true;
 }
 
-
-static void handle_obs_frontend_save(obs_data_t *save_data, bool saving, void *)
+static void handle_obs_frontend_save(obs_data_t * /*save_data*/, bool /*saving*/, void *)
 {
     // Save implies frontend loaded
     // Populate our collections map here
@@ -54,12 +105,17 @@ static void handle_obs_frontend_save(obs_data_t *save_data, bool saving, void *)
     }
 }
 
-
 static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
 {
     if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP)
     {
         m_collection_locked = true;
+        
+        // CRITICAL: Clean up banner sources before scene collection changes
+        // This prevents "sources could not be unloaded" errors
+        if constexpr (BANNER_MANAGER_ENABLED) {
+            m_banner_manager.cleanup_for_scene_collection_change();
+        }
     }
     else if (event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED
              || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_LIST_CHANGED || event == OBS_FRONTEND_EVENT_SCENE_CHANGED)
@@ -69,6 +125,31 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
         if (helper_populate_collections())
         {
             register_parameter_actions();
+        }
+        
+        // Re-initialize banners after scene collection changes are complete
+        if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED) {
+            if constexpr (BANNER_MANAGER_ENABLED) {
+                // Use printf since log_to_obs is not available in this scope
+                printf("[OBS Plugin] Scene collection changed - re-initializing banners\n");
+                m_banner_manager.initialize_after_obs_ready();
+                
+                // SAFE: Enable signal connections after banners are stable
+                printf("[OBS Plugin] Enabling banner signal protection after scene collection change\n");
+                m_banner_manager.enable_signal_connections_when_safe();
+            }
+        }
+        
+        // SAFE: Enable signal connections when scenes are first available
+        if (event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED) {
+            if constexpr (BANNER_MANAGER_ENABLED) {
+                static bool signals_enabled = false;
+                if (!signals_enabled) {
+                    printf("[OBS Plugin] Scene list ready - enabling banner signal protection\n");
+                    m_banner_manager.enable_signal_connections_when_safe();
+                    signals_enabled = true;
+                }
+            }
         }
     }
     else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED || event == OBS_FRONTEND_EVENT_RECORDING_STARTED)
@@ -117,6 +198,20 @@ void obs_module_post_load()
     obs_frontend_add_event_callback(handle_obs_frontend_event, nullptr);
     obs_frontend_add_save_callback(handle_obs_frontend_save, nullptr);
 
+    // Register custom VortiDeck Banner source
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        vorti::applets::banner_manager::register_vortideck_banner_source();
+    }
+
+    // Initialize banner functionality
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        create_obs_menu();
+        
+        // Enable analytics tracking when plugin starts
+        m_banner_manager.enable_analytics_tracking(true, 60); // Report every 60 seconds
+        log_to_obs("ANALYTICS: Analytics tracking enabled for VortiDeck ad displays");
+    }
+
     register_actions_broadcast();
 
     start_loop();
@@ -126,17 +221,38 @@ void obs_module_post_load()
 void obs_module_unload()
 {
     // Called when the module is unloaded.
-    uninitialize_actions();
+    blog(LOG_INFO, "[OBS Plugin] OBS module unloading - setting shutdown flag");
+    
+    // Set shutdown flag FIRST to stop all threads immediately
+    {
+        std::lock_guard<std::mutex> wl(vorti::applets::obs_plugin::m_lock);
+        vorti::applets::obs_plugin::m_shutting_down = true;
+    }
+    
+    // Notify all waiting threads to wake up and check shutdown flag
+    vorti::applets::obs_plugin::m_compressor_ready_cv.notify_all();
+    vorti::applets::obs_plugin::m_initialization_cv.notify_all();
+
+    vorti::applets::obs_plugin::uninitialize_actions();
 
     obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
     obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
 
-    disconnect();
-}
-void log_to_obs(const std::string &message) {
-    blog(LOG_INFO, message.c_str());  // Log to OBS
-}
+    // Cleanup banner functionality FIRST (before disconnecting)
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        blog(LOG_INFO, "[OBS Plugin] Cleaning up banner manager...");
+        // Call explicit cleanup method to stop all threads
+        m_banner_manager.shutdown();
+        
+        // Unregister custom VortiDeck Banner source
+        vorti::applets::banner_manager::unregister_vortideck_banner_source();
+        blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
+    }
 
+    vorti::applets::obs_plugin::disconnect();
+    
+    blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
+}
 
 bool vorti::applets::obs_plugin::connect()
 {
@@ -162,7 +278,7 @@ bool vorti::applets::obs_plugin::connect()
 
         if (nullptr == m_websocket_thread)
         {
-            m_websocket_thread.reset(new std::thread(&_run_forever));
+            m_websocket_thread.reset(new std::jthread(&vorti::applets::obs_plugin::_run_forever));
         }
     }
 
@@ -244,7 +360,7 @@ void vorti::applets::obs_plugin::reconnect() {
     
     while (!is_connected() && !m_shutting_down) {
         try {
-            log_to_obs("Reconnection attempt " + std::to_string(attempt + 1));
+            log_to_obs(std::format("Reconnection attempt {}", attempt + 1));
             
             // Attempt to establish new connection with full initialization
             if (connect()) {
@@ -253,12 +369,18 @@ void vorti::applets::obs_plugin::reconnect() {
             }
             
             attempt++;
-            std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
+            // Interruptible sleep - check shutdown every 100ms
+            for (int i = 0; i < retry_delay_seconds * 10 && !m_shutting_down; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
 
         } catch (const std::exception& e) {
             log_to_obs("Reconnection attempt failed: " + std::string(e.what()));
             attempt++;
-            std::this_thread::sleep_for(std::chrono::seconds(retry_delay_seconds));
+            // Interruptible sleep - check shutdown every 100ms  
+            for (int i = 0; i < retry_delay_seconds * 10 && !m_shutting_down; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
     }
 }
@@ -284,27 +406,22 @@ void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::conn
         }
     }
 
-    // Notify any waiting threads
+    // Notify any waiting jthreads
     m_compressor_ready_cv.notify_all();
     m_initialization_cv.notify_all();
 
-    // Release all locks before attempting reconnection
+    // Don't create detached threads during shutdown - causes crashes
+    // Reconnection will be handled by the main websocket loop instead
     if (should_reconnect && !m_shutting_down) {
-        // Create a new thread without capturing this
-        std::thread([]() {
-            try {
-                // Call the static reconnect function
-                vorti::applets::obs_plugin::reconnect();
-            } catch (const std::exception& e) {
-                log_to_obs("Reconnection failed: " + std::string(e.what()));
-            }
-        }).detach();
+        log_to_obs("Connection lost - reconnection will be attempted by main loop");
     }
 }
 
 
 void vorti::applets::obs_plugin::disconnect()
 {
+    log_to_obs("Disconnect: Starting shutdown sequence");
+    
     // Set connection state first
     {
         std::lock_guard<std::mutex> wl(m_lock);
@@ -312,29 +429,69 @@ void vorti::applets::obs_plugin::disconnect()
         m_integration_guid.clear();
         m_integration_instance.clear();
         m_current_message_id = 1;
+        m_shutting_down = true;  // Ensure shutdown flag is set
     }
+
+    // Notify all waiting threads immediately
+    m_compressor_ready_cv.notify_all();
+    m_initialization_cv.notify_all();
 
     // Stop the status update loop first
     stop_loop();
 
-    // Then stop the websocket and thread
+    // FIXED: Improved websocket shutdown with timeout to prevent hangs
     if (m_websocket_thread)
     {
         try {
+            log_to_obs("Disconnect: Stopping websocket");
+            
+            // Stop the websocket gracefully
             m_websocket.stop();
+            
+            // Wait for jthread to finish with timeout to prevent hanging
             if (m_websocket_thread->joinable())
             {
-                m_websocket_thread->join();
+                log_to_obs("Disconnect: Requesting thread stop");
+                m_websocket_thread->request_stop();
+                
+                // Use a separate thread to join with timeout
+                std::atomic<bool> join_completed{false};
+                std::jthread timeout_thread([&]() {
+                    m_websocket_thread->join();
+                    join_completed = true;
+                });
+                
+                // Wait up to 3 seconds for graceful shutdown
+                auto timeout_start = std::chrono::steady_clock::now();
+                const auto timeout_duration = std::chrono::seconds(3);
+                
+                while (!join_completed && 
+                       (std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                
+                if (!join_completed) {
+                    log_to_obs("Disconnect: Thread join timeout - forcing cleanup");
+                    // Thread is stuck, just reset and let it die
+                    timeout_thread.detach();
+                } else {
+                    log_to_obs("Disconnect: Thread joined successfully");
+                }
             }
+            
+            // Reset the websocket client state
+            m_websocket.reset();
+            
         } catch (const std::exception& e) {
             log_to_obs("Error during WebSocket shutdown: " + std::string(e.what()));
         }
+        
+        // Reset the thread - at this point we've either joined or timed out
         m_websocket_thread.reset();
+        log_to_obs("Disconnect: Websocket thread cleanup complete");
     }
 
-    // Notify any waiting threads
-    m_compressor_ready_cv.notify_all();
-    m_initialization_cv.notify_all();
+    log_to_obs("Disconnect: Shutdown sequence complete");
 }
 
 
@@ -355,6 +512,9 @@ void vorti::applets::obs_plugin::_run_forever()
         m_websocket.set_access_channels(websocketpp::log::alevel::connect);
         m_websocket.set_access_channels(websocketpp::log::alevel::disconnect);
         m_websocket.set_access_channels(websocketpp::log::alevel::app);
+        
+        // Set a reasonable reuse address to prevent hanging
+        m_websocket.set_reuse_addr(true);
     }
 
     while (!m_shutting_down)
@@ -366,7 +526,10 @@ void vorti::applets::obs_plugin::_run_forever()
             
             if (!connection) {
                 log_to_obs("Failed to create connection");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                // Interruptible sleep - check shutdown every 100ms
+                for (int i = 0; i < 10 && !m_shutting_down; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
                 continue;
             }
 
@@ -374,9 +537,16 @@ void vorti::applets::obs_plugin::_run_forever()
             m_websocket.connect(connection);
             
             try {
+                // Run websocket with periodic shutdown checks
                 m_websocket.run();
             } catch (const std::exception& e) {
                 log_to_obs("Exception in WebSocket run: " + std::string(e.what()));
+            }
+            
+            // Additional shutdown check after websocket.run() exits
+            if (m_shutting_down) {
+                log_to_obs("WebSocket run exited due to shutdown");
+                break;
             }
             
             // If we get here, the connection was closed
@@ -390,9 +560,9 @@ void vorti::applets::obs_plugin::_run_forever()
             // Reset for next attempt
             m_websocket.reset();
             
-            // Small delay before next attempt
-            if (!m_shutting_down) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Small delay before next attempt - interruptible
+            for (int i = 0; i < 10 && !m_shutting_down; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
         catch (const std::exception& e)
@@ -406,7 +576,10 @@ void vorti::applets::obs_plugin::_run_forever()
             }
             m_websocket.reset();
             
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Interruptible sleep - check shutdown every 100ms
+            for (int i = 0; i < 10 && !m_shutting_down; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
     }
 }
@@ -415,7 +588,7 @@ void vorti::applets::obs_plugin::_run_forever()
 ws_client::connection_ptr vorti::applets::obs_plugin::_create_connection()
 {
     websocketpp::lib::error_code error_code;
-    auto connection = m_websocket.get_connection("ws://192.168.178.129:" + std::to_string(m_current_port), error_code);
+            auto connection = m_websocket.get_connection(std::format("ws://192.168.178.129:{}", m_current_port), error_code);
 
     assert(connection || 0 != error_code.value());
     if (!connection || 0 != error_code.value())
@@ -424,17 +597,17 @@ ws_client::connection_ptr vorti::applets::obs_plugin::_create_connection()
     }
 
     connection->set_open_handler([](const websocketpp::connection_hdl &connection_handle) {
-        websocket_open_handler(connection_handle);
+        vorti::applets::obs_plugin::websocket_open_handler(connection_handle);
     });
     connection->set_message_handler(
         [](const websocketpp::connection_hdl &connection_handle, const ws_client::message_ptr &response) {
-            websocket_message_handler(connection_handle, response);
+            vorti::applets::obs_plugin::websocket_message_handler(connection_handle, response);
         });
     connection->set_close_handler([](const websocketpp::connection_hdl &connection_handle) {
-        websocket_close_handler(connection_handle);
+        vorti::applets::obs_plugin::websocket_close_handler(connection_handle);
     });
     connection->set_fail_handler([](const websocketpp::connection_hdl &connection_handle) {
-        websocket_fail_handler(connection_handle);
+        vorti::applets::obs_plugin::websocket_fail_handler(connection_handle);
     });
 
     if (!m_subprotocol.empty())
@@ -489,15 +662,21 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
         log_to_obs("Parsing JSON payload...");
         nlohmann::json message = nlohmann::json::parse(payload);
 
-        if (!message["result"].is_null() && (message["result"]["code"].get<std::string>() != "SUCCESS"))
-        {
-            log_to_obs("Error received in result: " + message["result"]["code"].get<std::string>());
-            return;
+        // Safely check for error results
+        if (message.contains("result") && !message["result"].is_null() && 
+            message["result"].contains("code") && !message["result"]["code"].is_null()) {
+            std::string result_code = message["result"]["code"].get<std::string>();
+            if (result_code != "SUCCESS") {
+                log_to_obs("Error received in result: " + result_code);
+                return;
+            }
         }
 
-        // Handle registration response first
-        if ((message["verb"].get<std::string>() == "SET")
-            && (message["path"].get<std::string>() == "/api/v1/integration/register"))
+        // Handle registration response first  
+        if (message.contains("verb") && !message["verb"].is_null() && 
+            message.contains("path") && !message["path"].is_null() &&
+            (message["verb"].get<std::string>() == "SET") &&
+            (message["path"].get<std::string>() == "/api/v1/integration/register"))
         {
             log_to_obs("Registration response received, initializing actions...");
             if (!initialize_actions()) {
@@ -508,8 +687,10 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
         }
 
         // Handle activation response
-        if ((message["verb"].get<std::string>() == "SET")
-            && (message["path"].get<std::string>() == "/api/v1/integration/activate"))
+        if (message.contains("verb") && !message["verb"].is_null() && 
+            message.contains("path") && !message["path"].is_null() &&
+            (message["verb"].get<std::string>() == "SET") &&
+            (message["path"].get<std::string>() == "/api/v1/integration/activate"))
         {
             log_to_obs("Activation response received");
             auto instance_info_payload = message["payload"];
@@ -550,34 +731,82 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
             return;
         }
 
-        // Rest of the message handling...
+        // Handle server_info messages (these don't have verb/path fields)
+        if (message.contains("action") && !message["action"].is_null() && 
+            message["action"].get<std::string>() == "server_info") {
+            log_to_obs("Received server_info message - ignoring");
+            return;
+        }
 
-        if ((message["verb"].get<std::string>() == "BROADCAST")
-            && (message["path"].get<std::string>() == "/api/v1/integration/sdk/action/invoke"))
+        // Safely check for verb and path fields before accessing them
+        if (!message.contains("verb") || !message.contains("path") || 
+            message["verb"].is_null() || message["path"].is_null()) {
+            log_to_obs("DEBUG: Message missing verb/path fields - ignoring");
+            return;
+        }
+
+        // Rest of the message handling...
+        std::string verb = message["verb"].get<std::string>();
+        std::string path = message["path"].get<std::string>();
+        log_to_obs(std::format("DEBUG: Processing message with verb: {}, path: {}", verb, path));
+
+        if ((verb == "BROADCAST") && (path == "/api/v1/integration/sdk/action/invoke"))
         {
-            // log_to_obs("Received BROADCAST /api/v1/integration/sdk/action/invoke");
+            log_to_obs("DEBUG: Received BROADCAST /api/v1/integration/sdk/action/invoke");
 
             auto invoked_action = message["payload"];
 
             if (!invoked_action.is_null())
             {
-                // log_to_obs("Invoked action: " + invoked_action.dump());
-                // log_to_obs("Integration GUID: " + m_integration_guid);
+                log_to_obs("DEBUG: Payload is not null, checking integration GUID");
+                log_to_obs("DEBUG: Expected GUID: '" + m_integration_guid + "'");
+                
+                if (invoked_action.contains("integrationGuid")) {
+                    std::string received_guid = invoked_action["integrationGuid"].get<std::string>();
+                    log_to_obs("DEBUG: Received GUID: '" + received_guid + "'");
+                    
+                    if (received_guid == m_integration_guid) {
+                        log_to_obs("DEBUG: Integration GUID matches!");
 
-                if (invoked_action["integrationGuid"] == m_integration_guid)
-                {
-                    // log_to_obs("Integration GUID matches: " + m_integration_guid);
+                        action_invoke_parameters parameters;
+                        std::string action_id;
+                        bool extraction_succeeded = false;
+                        
+                        try {
+                            action_id = invoked_action["actionId"];
+                            log_to_obs("DEBUG: Received action_id = '" + action_id + "'");
+                            
+                            // Manually extract parameters with type conversion
+                            auto json_params = invoked_action["parameters"];
+                            for (auto it = json_params.begin(); it != json_params.end(); ++it) {
+                                std::string key = it.key();
+                                const auto& value = it.value();
+                                
+                                if (value.is_string()) {
+                                    parameters[key] = value.get<std::string>();
+                                } else if (value.is_number()) {
+                                    parameters[key] = std::to_string(value.get<double>());
+                                } else if (value.is_boolean()) {
+                                    parameters[key] = value.get<bool>() ? "true" : "false";
+                                } else {
+                                    parameters[key] = value.dump(); // Fallback to JSON string
+                                }
+                            }
+                            log_to_obs(std::format("DEBUG: Parameters extracted and converted successfully ({} params)", parameters.size()));
+                            extraction_succeeded = true;
+                            
+                        } catch (const std::exception& e) {
+                            log_to_obs("ERROR: Failed to extract action parameters: " + std::string(e.what()));
+                            log_to_obs("ERROR: Skipping action execution due to parameter error");
+                            // Don't return - just skip action execution to keep websocket alive
+                        }
 
-                    action_invoke_parameters parameters = invoked_action["parameters"];
-                    std::string action_id = invoked_action["actionId"];
-                    // log_to_obs("Action ID: " + action_id);
-
-
-                    if (action_id == actions::s_stream_start)
-                    {
-                        action_stream_start(parameters);
-                    }
-                    else if (action_id == actions::s_stream_stop)
+                        if (extraction_succeeded) {
+                            if (action_id == actions::s_stream_start)
+                            {
+                                action_stream_start(parameters);
+                            }
+                            else if (action_id == actions::s_stream_stop)
                     {
                         action_stream_stop(parameters);
                     }
@@ -669,12 +898,57 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                     {
                         action_mixer_mute_toggle(parameters);
                     }
+                        // Banner action handlers
+    else if constexpr (BANNER_MANAGER_ENABLED) {
+        if (action_id == actions::s_banner_show)
+        {
+            action_banner_show(parameters);
+        }
+        else if (action_id == actions::s_banner_hide)
+        {
+            action_banner_hide(parameters);
+        }
+        else if (action_id == actions::s_banner_toggle)
+        {
+            action_banner_toggle(parameters);
+        }
+        else if (action_id == actions::s_banner_set_data)
+        {
+            action_banner_set_data(parameters);
+        }
+        // Essential banner queue and analytics actions
+        else if (action_id == actions::s_banner_set_queue)
+        {
+            action_banner_set_queue(parameters);
+        }
+        else if (action_id == actions::s_banner_add_to_queue)
+        {
+            action_banner_add_to_queue(parameters);
+        }
+        else if (action_id == actions::s_analytics_get_report)
+        {
+            action_analytics_get_report(parameters);
+        }
+    }
+                            else
+                            {
+                                log_to_obs("DEBUG: Unhandled action_id: '" + action_id + "'");
+                            }
+                        } // End of if (extraction_succeeded)
+                    } else {
+                        log_to_obs("DEBUG: Integration GUID mismatch!");
+                    }
+                } else {
+                    log_to_obs("DEBUG: No integrationGuid field in payload");
                 }
+            } else {
+                log_to_obs("DEBUG: Payload is null");
             }
         }
     }
-    catch (std::exception e)
+    catch (std::exception& e)
     {
+        log_to_obs("ERROR: Exception in message handling: " + std::string(e.what()));
     }
 }
 
@@ -840,6 +1114,64 @@ void vorti::applets::obs_plugin::register_regular_actions()
     actions.push_back(register_action(actions::s_mic_mute, "APPLET_OBS_MIC_MUTE"));
     actions.push_back(register_action(actions::s_mic_unmute, "APPLET_OBS_MIC_UNMUTE"));
     actions.push_back(register_action(actions::s_mic_mute_toggle, "APPLET_OBS_MIC_MUTE_TOGGLE"));
+
+    // ADD THESE BANNER ACTIONS:
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        actions.push_back(register_action(actions::s_banner_show, "APPLET_OBS_BANNER_SHOW"));
+        actions.push_back(register_action(actions::s_banner_hide, "APPLET_OBS_BANNER_HIDE"));
+        actions.push_back(register_action(actions::s_banner_toggle, "APPLET_OBS_BANNER_TOGGLE"));
+        
+        // Banner set data action with enhanced parameters (CSS, dimensions)
+        action_parameters banner_params;
+        nlohmann::json content_data_param = {
+            {"name", "content_data"},
+            {"displayName", "Content Data"},
+            {"description", "Image URL, Base64 data, or file path"}
+        };
+        nlohmann::json content_type_param = {
+            {"name", "content_type"},
+            {"displayName", "Content Type"},
+            {"description", "MIME type (image/png, image/jpeg, video/mp4, text, color, etc.)"}
+        };
+        nlohmann::json css_param = {
+            {"name", "css"},
+            {"displayName", "Custom CSS"},
+            {"description", "Optional custom CSS styling (overrides default styles)"}
+        };
+        nlohmann::json width_param = {
+            {"name", "width"},
+            {"displayName", "Width"},
+            {"description", "Optional custom width in pixels (default: 1920)"}
+        };
+        nlohmann::json height_param = {
+            {"name", "height"},
+            {"displayName", "Height"},
+            {"description", "Optional custom height in pixels (default: auto-sized by content type)"}
+        };
+        banner_params.push_back(content_data_param);
+        banner_params.push_back(content_type_param);
+        banner_params.push_back(css_param);
+        banner_params.push_back(width_param);
+        banner_params.push_back(height_param);
+        actions.push_back(register_action(actions::s_banner_set_data, "APPLET_OBS_BANNER_SET_DATA", banner_params));
+    }
+
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        actions.push_back(register_action(actions::s_banner_show, "APPLET_OBS_BANNER_SHOW"));
+        actions.push_back(register_action(actions::s_banner_hide, "APPLET_OBS_BANNER_HIDE"));
+        actions.push_back(register_action(actions::s_banner_toggle, "APPLET_OBS_BANNER_TOGGLE"));
+    }
+
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        actions.push_back(register_action(actions::s_banner_show, "APPLET_OBS_BANNER_SHOW"));
+        actions.push_back(register_action(actions::s_banner_hide, "APPLET_OBS_BANNER_HIDE"));
+        actions.push_back(register_action(actions::s_banner_toggle, "APPLET_OBS_BANNER_TOGGLE"));
+        
+        // Essential banner queue and analytics actions
+        actions.push_back(register_action(actions::s_banner_set_queue, "APPLET_OBS_BANNER_SET_QUEUE"));
+        actions.push_back(register_action(actions::s_banner_add_to_queue, "APPLET_OBS_BANNER_ADD_TO_QUEUE"));
+        actions.push_back(register_action(actions::s_analytics_get_report, "APPLET_OBS_ANALYTICS_GET_REPORT"));
+    }
 
     // clang-format off
     nlohmann::json register_actions =
@@ -1947,7 +2279,7 @@ void vorti::applets::obs_plugin::start_loop()
     if (!m_loop_thread.joinable())
     {
         m_loop_thread_running = true;
-        m_loop_thread = std::thread(&loop_function);
+        m_loop_thread = std::jthread(&loop_function);
     }
 }
 
@@ -1964,7 +2296,7 @@ void vorti::applets::obs_plugin::stop_loop()
         }
     }
 
-    // Stop the thread
+    // Stop the jthread
     if (is_joining)
     {
         m_loop_thread.join();
@@ -2113,6 +2445,21 @@ void vorti::applets::obs_plugin::loop_function()
         }
 
         send_message(new_status);
+        
+        // Send analytics reports if banner manager is enabled
+        if constexpr (BANNER_MANAGER_ENABLED) {
+            // Update viewer metrics for analytics
+            int estimated_viewers = 0;
+            // Estimate viewers based on stream metrics (simplified)
+            if (status_payload["currentState"] == "STREAMING" && bps > 0) {
+                estimated_viewers = static_cast<int>(bps / 100); // Rough estimate based on bitrate
+            }
+            
+            m_banner_manager.track_viewer_metrics(estimated_viewers, bps, fps);
+            
+            // Send periodic batch analytics reports
+            m_banner_manager.send_batch_analytics_report();
+        }
     }
 
     // Cleanup
@@ -2121,3 +2468,516 @@ void vorti::applets::obs_plugin::loop_function()
         os_cpu_usage_info_destroy(cpu_usage);
     }
 }
+void vorti::applets::obs_plugin::create_obs_menu()
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        m_banner_manager.add_banner_menu();
+        
+        // CRITICAL: Initialize banners after OBS is fully loaded
+        // This prevents the "sources could not be unloaded" error
+        m_banner_manager.initialize_after_obs_ready();
+    }
+}
+
+// Menu callbacks are now handled by the banner manager
+
+// Banner action implementations
+void vorti::applets::obs_plugin::action_banner_show(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_SHOW: Command received from API");
+        
+        // Check premium status and schedule VortiDeck ads
+        handle_banner_premium_status_and_ads(parameters);
+        
+        log_to_obs("ACTION_BANNER_SHOW: Calling banner manager show_banner()");
+        m_banner_manager.show_banner();
+        
+        // Log creator banner activity with revenue share
+        float revenue_share = m_banner_manager.get_revenue_share();
+        std::string user_type = m_banner_manager.is_premium_user() ? "premium" : "free";
+        log_to_obs("ACTION_BANNER_SHOW: Banner show completed - " + user_type + " user (" + 
+                   std::to_string(revenue_share * 100) + "% revenue share)");
+    } else {
+        log_to_obs("ACTION_BANNER_SHOW: Banner manager disabled");
+    }
+}
+
+void vorti::applets::obs_plugin::action_banner_hide(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_HIDE: Command received from API");
+        
+        // Check premium status and schedule VortiDeck ads
+        handle_banner_premium_status_and_ads(parameters);
+        
+        // Additional free user warning
+        if (!m_banner_manager.is_premium_user()) {
+            log_to_obs("ACTION_BANNER_HIDE: FREE USER - Banner hiding very limited (5sec auto-restore) - upgrade to premium for full control");
+        }
+        
+        log_to_obs("ACTION_BANNER_HIDE: Calling banner manager hide_banner()");
+        m_banner_manager.hide_banner();
+        
+        log_to_obs("ACTION_BANNER_HIDE: Banner hide completed");
+        
+        // Safety check: Ensure protection system will re-enable for free users
+        if (!m_banner_manager.is_premium_user()) {
+            log_to_obs("ACTION_BANNER_HIDE: FREE USER - Protection system will auto-restore in 5-10 seconds");
+        }
+    } else {
+        log_to_obs("ACTION_BANNER_HIDE: Banner manager disabled");
+    }
+}
+
+void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_TOGGLE: Command received from API");
+        
+        // Check premium status and schedule VortiDeck ads
+        handle_banner_premium_status_and_ads(parameters);
+        
+        // Additional free user warning for toggle
+        if (!m_banner_manager.is_premium_user()) {
+            log_to_obs("ACTION_BANNER_TOGGLE: FREE USER - Banner toggle very limited (hiding auto-restores in 5sec) - upgrade to premium for full control");
+        }
+        
+        log_to_obs("ACTION_BANNER_TOGGLE: Calling banner manager toggle_banner()");
+        m_banner_manager.toggle_banner();
+        
+        log_to_obs("ACTION_BANNER_TOGGLE: Banner toggle completed");
+        
+        // Safety check: Ensure protection system is active for free users
+        if (!m_banner_manager.is_premium_user()) {
+            // Give a moment for the toggle to complete, then ensure protection is active
+            std::jthread([]() {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                log_to_obs("ACTION_BANNER_TOGGLE: FREE USER - Ensuring protection system is active");
+                // Note: The banner manager handles its own protection re-enabling
+            }).detach();
+        }
+    } else {
+        log_to_obs("ACTION_BANNER_TOGGLE: Banner manager disabled");
+    }
+}
+
+void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_SET_DATA: Command received from API");
+        
+        // Check premium status and schedule VortiDeck ads
+        handle_banner_premium_status_and_ads(parameters);
+        
+        auto content_data_it = parameters.find("content_data");
+        auto content_type_it = parameters.find("content_type");
+        
+        // Check for queue_mode parameter
+        bool queue_mode = false;
+        auto queue_mode_it = parameters.find("queue_mode");
+        if (queue_mode_it != parameters.end()) {
+            queue_mode = (queue_mode_it->second == "true");
+        }
+        
+        // Check for auto_rotate parameter (only applies to queue mode)
+        bool auto_rotate = true; // Default to true for queue mode
+        auto auto_rotate_it = parameters.find("auto_rotate");
+        if (auto_rotate_it != parameters.end()) {
+            auto_rotate = (auto_rotate_it->second == "true");
+        }
+        
+        if (content_data_it != parameters.end() && content_type_it != parameters.end()) {
+            // Extract analytics parameters
+            std::string ad_id = "ad_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+            std::string campaign_id = "default_campaign";
+            int planned_duration_ms = 30000; // Default 30 seconds
+            
+            // Check for ad_id parameter
+            auto ad_id_it = parameters.find("ad_id");
+            if (ad_id_it != parameters.end()) {
+                ad_id = ad_id_it->second;
+            }
+            
+            // Check for campaign_id parameter
+            auto campaign_id_it = parameters.find("campaign_id");
+            if (campaign_id_it != parameters.end()) {
+                campaign_id = campaign_id_it->second;
+            }
+            
+            // Check for duration parameter
+            auto duration_it = parameters.find("duration_seconds");
+            if (duration_it != parameters.end()) {
+                try {
+                    planned_duration_ms = std::stoi(duration_it->second) * 1000;
+                } catch (const std::exception&) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Invalid duration format, using default 30 seconds");
+                }
+            }
+            
+            log_to_obs("ACTION_BANNER_SET_DATA: Setting banner content - Type: " + content_type_it->second + 
+                      ", Data: " + content_data_it->second.substr(0, 50) + "..." +
+                      ", Ad ID: " + ad_id + ", Campaign: " + campaign_id + 
+                      ", Queue Mode: " + (queue_mode ? "true" : "false") +
+                      (queue_mode ? ", Auto-Rotate: " + std::string(auto_rotate ? "true" : "false") : ""));
+            
+            // Start analytics tracking (only for immediate mode - queue mode handles its own analytics)
+            if constexpr (BANNER_MANAGER_ENABLED) {
+                if (!queue_mode) {
+                    m_banner_manager.track_ad_display_start(ad_id, campaign_id, planned_duration_ms, content_type_it->second);
+                }
+            }
+            
+            // Check for optional CSS parameter
+            auto css_it = parameters.find("css");
+            std::string custom_css = "";
+            if (css_it != parameters.end()) {
+                custom_css = css_it->second;
+                log_to_obs("ACTION_BANNER_SET_DATA: Custom CSS provided: " + custom_css.substr(0, 100) + "...");
+            }
+            
+            // Check for optional width/height parameters
+            auto width_it = parameters.find("width");
+            auto height_it = parameters.find("height");
+            int custom_width = 0;
+            int custom_height = 0;
+            
+            // Note: animation_duration and auto_hide parameters are passed through but not processed 
+            // Animations are handled purely in CSS
+            // Auto-hide is handled automatically by queue/window management
+            
+            if (width_it != parameters.end()) {
+                try {
+                    custom_width = std::stoi(width_it->second);
+                    log_to_obs("ACTION_BANNER_SET_DATA: Custom width: " + std::to_string(custom_width));
+                } catch (const std::invalid_argument& e) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Invalid width format: " + width_it->second + " (" + e.what() + ")");
+                } catch (const std::out_of_range& e) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Width value out of range: " + width_it->second + " (" + e.what() + ")");
+                }
+            }
+            
+            if (height_it != parameters.end()) {
+                try {
+                    custom_height = std::stoi(height_it->second);
+                    log_to_obs("ACTION_BANNER_SET_DATA: Custom height: " + std::to_string(custom_height));
+                } catch (const std::invalid_argument& e) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Invalid height format: " + height_it->second + " (" + e.what() + ")");
+                } catch (const std::out_of_range& e) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Height value out of range: " + height_it->second + " (" + e.what() + ")");
+                }
+            }
+            
+            // Handle queue mode vs immediate display
+            if (queue_mode) {
+                // QUEUE MODE: Add banner to queue instead of immediate display
+                log_to_obs("ACTION_BANNER_SET_DATA: Queue mode - adding banner to queue");
+                
+                // Create AdWindow object
+                banner_manager::AdWindow ad_window;
+                ad_window.id = ad_id;
+                ad_window.content_data = content_data_it->second;
+                ad_window.content_type = content_type_it->second;
+                ad_window.css = custom_css;
+                ad_window.duration_seconds = planned_duration_ms / 1000; // Convert to seconds
+                ad_window.auto_rotate = auto_rotate;
+                ad_window.start_time = std::chrono::system_clock::now();
+                
+                // Enable auto-rotation if requested (only for queue mode)
+                if (auto_rotate && !m_banner_manager.is_auto_rotation_enabled()) {
+                    m_banner_manager.enable_auto_rotation(true);
+                    log_to_obs("ACTION_BANNER_SET_DATA: Auto-rotation enabled for queue mode");
+                } else if (!auto_rotate && m_banner_manager.is_auto_rotation_enabled()) {
+                    m_banner_manager.enable_auto_rotation(false);
+                    log_to_obs("ACTION_BANNER_SET_DATA: Auto-rotation disabled for manual control");
+                }
+                
+                // Add to queue
+                m_banner_manager.add_ad_to_queue(ad_window);
+                
+                log_to_obs("ACTION_BANNER_SET_DATA: Banner '" + ad_id + "' added to queue successfully");
+                
+            } else {
+                // IMMEDIATE MODE: Current replacement behavior
+                log_to_obs("ACTION_BANNER_SET_DATA: Immediate mode - replacing current banner");
+                
+                // Check ad frequency limits for free users BEFORE showing banner
+                if (!m_banner_manager.is_premium_user() && !m_banner_manager.can_show_ad_now()) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: FREE USER - Banner blocked due to ad frequency limit (1 minute between ads)");
+                    log_to_obs("ACTION_BANNER_SET_DATA: Upgrade to premium for unlimited ad frequency");
+                    return; // Exit early without showing banner
+                }
+                
+                // Set custom duration if provided
+                int custom_duration_seconds = planned_duration_ms / 1000;
+                if (custom_duration_seconds > 0) {
+                    m_banner_manager.set_custom_banner_duration(custom_duration_seconds);
+                    log_to_obs("ACTION_BANNER_SET_DATA: Set custom duration: " + std::to_string(custom_duration_seconds) + " seconds");
+                }
+                
+                // Set banner content with custom parameters
+                m_banner_manager.set_banner_content_with_custom_params(
+                    content_data_it->second, 
+                    content_type_it->second,
+                    custom_css,
+                    custom_width,
+                    custom_height
+                );
+                
+                // Show banner using appropriate method based on user type
+                if (m_banner_manager.is_premium_user()) {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Premium user - showing banner with freedom");
+                    m_banner_manager.show_premium_banner();
+                } else {
+                    log_to_obs("ACTION_BANNER_SET_DATA: Free user - showing banner with restrictions");
+                    m_banner_manager.show_banner();
+                }
+            }
+            
+            // Log creator banner activity with revenue share
+            float revenue_share = m_banner_manager.get_revenue_share();
+            std::string user_type = m_banner_manager.is_premium_user() ? "premium" : "free";
+            std::string mode_desc = queue_mode ? "queued" : "displayed immediately";
+            log_to_obs("ACTION_BANNER_SET_DATA: Banner " + mode_desc + " successfully - " + user_type + " user (" + 
+                       std::to_string(revenue_share * 100) + "% revenue share)");
+            
+            // Schedule analytics end tracking (only for immediate mode - queue mode handles its own analytics)
+            if constexpr (BANNER_MANAGER_ENABLED) {
+                if (!queue_mode) {
+                    std::jthread([ad_id, planned_duration_ms]() {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(planned_duration_ms));
+                        m_banner_manager.track_ad_display_end(ad_id, planned_duration_ms);
+                    }).detach();
+                }
+            }
+        } else {
+            log_to_obs("ACTION_BANNER_SET_DATA: ERROR - Missing required parameters (content_data and content_type)");
+        }
+    } else {
+        log_to_obs("ACTION_BANNER_SET_DATA: Banner manager disabled");
+    }
+}
+
+
+
+// Premium status and monetization helper
+void vorti::applets::obs_plugin::handle_banner_premium_status_and_ads(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("PREMIUM_STATUS: Processing premium status and ad scheduling");
+        
+        // Convert parameters to JSON for premium status checking
+        nlohmann::json premium_data;
+        
+        // Check for premium status in parameters
+        auto premium_it = parameters.find("premium_status");
+        if (premium_it != parameters.end()) {
+            premium_data["premium_status"] = (premium_it->second == std::string("true"));
+            log_to_obs("PREMIUM_STATUS: Premium status parameter found: " + premium_it->second);
+        } else {
+            log_to_obs("PREMIUM_STATUS: No premium status parameter - using default (free)");
+        }
+        
+        // Check for custom ad frequency (premium users only)
+        auto ad_freq_it = parameters.find("ad_frequency_minutes");
+        if (ad_freq_it != parameters.end()) {
+            try {
+                int frequency = std::stoi(ad_freq_it->second);
+                premium_data["ad_frequency_minutes"] = frequency;
+                log_to_obs("PREMIUM_STATUS: Ad frequency parameter found: " + std::to_string(frequency) + " minutes");
+            } catch (const std::invalid_argument& e) {
+                log_to_obs("PREMIUM_STATUS: Invalid ad_frequency_minutes format: " + ad_freq_it->second + " (" + e.what() + ")");
+            } catch (const std::out_of_range& e) {
+                log_to_obs("PREMIUM_STATUS: Ad frequency value out of range: " + ad_freq_it->second + " (" + e.what() + ")");
+            }
+        }
+        
+        // Update premium status in banner manager
+        log_to_obs("PREMIUM_STATUS: Updating banner manager premium status");
+        m_banner_manager.update_premium_status(premium_data);
+        
+        log_to_obs("PREMIUM_STATUS: Premium status update completed");
+    } else {
+        log_to_obs("PREMIUM_STATUS: Banner manager disabled");
+    }
+}
+// Banner helper implementations are now in obs_plugin_banner.cpp
+// These helper functions are kept for backward compatibility but delegate to the actual implementations
+
+// ============================================================================
+// BANNER QUEUE AND ANALYTICS ACTION IMPLEMENTATIONS  
+// ============================================================================
+
+void vorti::applets::obs_plugin::action_banner_set_queue(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_SET_QUEUE: Setting banner queue");
+        
+        // Parse banners array from parameters (expecting JSON string)
+        auto banners_it = parameters.find("banners");
+        if (banners_it == parameters.end()) {
+            log_to_obs("ACTION_BANNER_SET_QUEUE: ERROR - Missing 'banners' parameter");
+            return;
+        }
+        
+        try {
+            // Parse JSON banners array
+            nlohmann::json banners_json = nlohmann::json::parse(banners_it->second);
+            
+            if (!banners_json.is_array()) {
+                log_to_obs("ACTION_BANNER_SET_QUEUE: ERROR - 'banners' must be an array");
+                return;
+            }
+            
+            // Convert JSON to AdWindow objects
+            std::vector<banner_manager::AdWindow> queue;
+            
+            for (const auto& banner : banners_json) {
+                if (!banner.contains("id") || !banner.contains("content_data") || !banner.contains("content_type")) {
+                    log_to_obs("ACTION_BANNER_SET_QUEUE: Skipping banner - missing required fields");
+                    continue;
+                }
+                
+                banner_manager::AdWindow ad_window;
+                ad_window.id = banner["id"].get<std::string>();
+                ad_window.content_data = banner["content_data"].get<std::string>();
+                ad_window.content_type = banner["content_type"].get<std::string>();
+                ad_window.duration_seconds = banner.value("duration_seconds", 30);
+                ad_window.css = banner.value("css", "");
+                ad_window.auto_rotate = banner.value("auto_rotate", true);
+                ad_window.start_time = std::chrono::system_clock::now();
+                
+                queue.push_back(ad_window);
+                
+                log_to_obs("ACTION_BANNER_SET_QUEUE: Added banner '" + ad_window.id + "' (" + 
+                          std::to_string(ad_window.duration_seconds) + "s)");
+            }
+            
+            if (queue.empty()) {
+                log_to_obs("ACTION_BANNER_SET_QUEUE: WARNING - No valid banners to add to queue");
+                return;
+            }
+            
+            // Handle premium status and monetization
+            handle_banner_premium_status_and_ads(parameters);
+            
+            // Set the queue in banner manager
+            m_banner_manager.set_ad_queue(queue);
+            
+            log_to_obs("ACTION_BANNER_SET_QUEUE: Successfully set queue with " + 
+                      std::to_string(queue.size()) + " banners");
+            
+        } catch (const nlohmann::json::exception& e) {
+            log_to_obs("ACTION_BANNER_SET_QUEUE: JSON parsing error: " + std::string(e.what()));
+        } catch (const std::exception& e) {
+            log_to_obs("ACTION_BANNER_SET_QUEUE: Error: " + std::string(e.what()));
+        }
+        
+    } else {
+        log_to_obs("ACTION_BANNER_SET_QUEUE: Banner manager disabled");
+    }
+}
+
+void vorti::applets::obs_plugin::action_banner_add_to_queue(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_BANNER_ADD_TO_QUEUE: Adding banner to queue");
+        
+        // Get required parameters
+        auto id_it = parameters.find("id");
+        auto content_data_it = parameters.find("content_data");
+        auto content_type_it = parameters.find("content_type");
+        
+        if (id_it == parameters.end() || content_data_it == parameters.end() || content_type_it == parameters.end()) {
+            log_to_obs("ACTION_BANNER_ADD_TO_QUEUE: ERROR - Missing required parameters (id, content_data, content_type)");
+            return;
+        }
+        
+        // Create AdWindow object
+        banner_manager::AdWindow ad_window;
+        ad_window.id = id_it->second;
+        ad_window.content_data = content_data_it->second;
+        ad_window.content_type = content_type_it->second;
+        ad_window.start_time = std::chrono::system_clock::now();
+        
+        // Get optional parameters
+        auto duration_it = parameters.find("duration_seconds");
+        if (duration_it != parameters.end()) {
+            try {
+                ad_window.duration_seconds = std::stoi(duration_it->second);
+            } catch (const std::exception&) {
+                ad_window.duration_seconds = 30; // Default
+            }
+        } else {
+            ad_window.duration_seconds = 30; // Default
+        }
+        
+        auto css_it = parameters.find("css");
+        if (css_it != parameters.end()) {
+            ad_window.css = css_it->second;
+        }
+        
+        auto auto_rotate_it = parameters.find("auto_rotate");
+        if (auto_rotate_it != parameters.end()) {
+            ad_window.auto_rotate = (auto_rotate_it->second == "true");
+        } else {
+            ad_window.auto_rotate = true; // Default
+        }
+        
+        // Handle premium status and monetization
+        handle_banner_premium_status_and_ads(parameters);
+        
+        // Add to queue
+        m_banner_manager.add_ad_to_queue(ad_window);
+        
+        log_to_obs("ACTION_BANNER_ADD_TO_QUEUE: Successfully added banner '" + ad_window.id + 
+                  "' (" + std::to_string(ad_window.duration_seconds) + "s) to queue");
+        
+    } else {
+        log_to_obs("ACTION_BANNER_ADD_TO_QUEUE: Banner manager disabled");
+    }
+}
+
+void vorti::applets::obs_plugin::action_analytics_get_report(const action_invoke_parameters &parameters)
+{
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        log_to_obs("ACTION_ANALYTICS_GET_REPORT: Generating analytics report");
+        
+        // Force send a batch analytics report
+        m_banner_manager.send_batch_analytics_report();
+        
+        // Send queue status
+        if (is_connected()) {
+            // Get current queue status
+            nlohmann::json queue_status = {
+                {"path", "/api/v1/obs/analytics/queue-status"},
+                {"verb", "SET"},
+                {"payload", {
+                    {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count()},
+                    {"current_viewer_count", m_banner_manager.calculate_current_viewer_estimate()},
+                    {"premium_user", m_banner_manager.is_premium_user()},
+                    {"revenue_share", m_banner_manager.get_revenue_share()},
+                    {"plugin_version", "1.0.0"},
+                    {"obs_version", obs_get_version_string()},
+                    {"system_status", "operational"}
+                }}
+            };
+            
+            if (send_message(queue_status)) {
+                log_to_obs("ACTION_ANALYTICS_GET_REPORT: Queue status sent successfully");
+            } else {
+                log_to_obs("ACTION_ANALYTICS_GET_REPORT: Failed to send queue status");
+            }
+        }
+        
+        log_to_obs("ACTION_ANALYTICS_GET_REPORT: Analytics report sent to VortiDeck");
+        
+    } else {
+        log_to_obs("ACTION_ANALYTICS_GET_REPORT: Banner manager disabled");
+    }
+}
+
+
+
+

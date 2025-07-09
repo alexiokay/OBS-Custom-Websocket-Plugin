@@ -5,15 +5,29 @@ add_definitions(-DWIN32_LEAN_AND_MEAN)
 add_definitions(-D_SCL_SECURE_NO_WARNINGS)
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
 
+# Require C++23 standard for newest features
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable additional warnings for better code quality (but don't treat warnings as errors)
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
+
 set(PLUGIN_NAME "vorti_obs")
 set(APPLET_NAME "${PLUGIN_NAME}_plugin")
 set(BUNDLE_NAME "${PLUGIN_NAME}.plugin")
 
 set(SOURCES
-    src/obs_plugin.cpp)
+    src/obs_plugin.cpp
+    src/banner_manager.cpp)
 
 set(HEADERS
-    src/obs_plugin.hpp)
+    src/obs_plugin.hpp
+    src/banner_manager.hpp)
 
 if(WIN32)
     if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8") 
