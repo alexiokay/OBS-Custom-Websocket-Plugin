@@ -1,54 +1,96 @@
-add cuyrrent content to : # VortiDeck OBS Plugin
+# VortiDeck OBS Plugin Documentation
 
-This is a plugin for [OBS Studio](https://obsproject.com/) exposing actions to [VortiDeck](https://www.vortideck.com), allowing users to take control of their OBS setup through VortiDeck peripherals.
+The VortiDeck OBS Plugin enables remote control of OBS Studio through WebSocket connections, with special focus on banner management and streaming controls.
 
-This is customized obs plugin for Logitech GHub, it includes constant reconnecting logic and Will include mdns searching in future
+## Features
 
-## File structure
+### Core OBS Controls
+- **Streaming Control**: Start, stop, toggle streaming
+- **Recording Control**: Start, stop, toggle recording  
+- **Buffer Control**: Start, stop, toggle, save replay buffer
+- **Audio Control**: Mute/unmute desktop audio and microphone
+- **Scene Management**: Switch between scenes and collections
+- **Source Control**: Show/hide sources and mixers
 
-* `obs_plugin` directory contains the source code for the plugin.
-* `obs_plugin/libs` directory contains precompiled libraries of [OBS Studio](https://github.com/obsproject/obs-studio).
-* `other` directory contains libraries and other dependencies for the plugin.
-* `other/obs-studio` directory contains source code for an API-only version of [OBS Studio](https://github.com/obsproject/obs-studio).
+### Banner System
+- **Dynamic Banner Display**: Overlay banners on scenes that cannot be disabled by users
+- **Real-time Content Updates**: Send images/videos directly through WebSocket
+- **Multiple Content Types**: Support for PNG, JPG, GIF, MP4, and URLs
+- **Scene Integration**: Automatically adds banner to all scenes as locked overlay
+- **Menu Integration**: OBS Tools menu for manual banner control
 
-## Libraries and Other Dependencies
-* [Asio C++ Library](https://github.com/chriskohlhoff/asio)
-* [JSON for Modern C++](https://github.com/nlohmann/json)
-* [OBS Studio](https://github.com/obsproject/obs-studio)
-* [WebSocket++](https://github.com/zaphoyd/websocketpp)
+## Quick Start
 
+1. **Install the Plugin**: Copy the compiled plugin to your OBS plugins directory
+2. **Start OBS**: The plugin automatically connects to WebSocket server on port 9001
+3. **Connect Your Server**: Use the WebSocket API to send commands
+4. **Control Banners**: Send banner content and visibility commands
 
+## Documentation Structure
 
-## Commands 
+- [Installation Guide](installation.md) - How to install and configure the plugin
+- [API Reference](api-reference.md) - Complete WebSocket API documentation
+- [Banner System](banner-system.md) - Banner functionality and usage
+- [Examples](examples.md) - Code examples and use cases
+- [Troubleshooting](troubleshooting.md) - Common issues and solutions
+- [Development](development.md) - Building and extending the plugin
 
-The following commands are used to build, install, and interact with the VortiDeck OBS Plugin:
+## WebSocket Connection
 
-1. **Build the Plugin**: 
-   - Run the following commands in your terminal:
-     ```
-     mkdir build && cd build
-     cmake .. -DCMAKE_INSTALL_PREFIX=../install
-     cmake --build . --config Release
-     cmake --install .
-     ```
+The plugin connects to `ws://localhost:9001` by default and uses JSON messages for communication.
 
-2. **Connecting to the WebSocket**: 
-   - Use the `wscat` tool to connect to the WebSocket server:
-     ```
-     wscat -c ws://127.0.0.1:9001 -s "json"
-     ```
+### Basic Message Format```json
+{
+  "path": "/api/v1/integration/sdk/action/invoke",
+  "verb": "SET",
+  "payload": {
+    "actionId": "action_name",
+    "parameters": {}
+  }
+}
+```
 
-3. **Activating an Instance**: 
-   - Before activating an integration instance, ensure that the plugin client is recognized by the WebSocket server. Send an activation message with the generated `integrationGuid` and `instanceGuid`, which will be stored on the server. If this step is not completed, the plugin will not function correctly.
-   - Send a JSON payload to activate an integration instance:
-     ```json
-     {"path": "/api/v1/integration/activate", "verb": "SET", "payload": {"integrationGuid": "1abcdx", "instanceGuid": "1abcdx"}}
-     ```
+## Quick Examples
 
-4. **Invoking Commands**: 
-   - To invoke specific actions, send a JSON payload like the following:
-     ```json
-     {"path": "/api/v1/integration/sdk/action/invoke", "verb": "SET", "payload": {"actionId": "obs_desktop_mute_toggle", "integrationGuid": "ae67192054b1d99f", "parameters": {}}}
-     ```
+### Show Banner
+```json
+{
+  "path": "/api/v1/integration/sdk/action/invoke",
+  "verb": "SET",
+  "payload": {
+    "actionId": "obs_banner_show",
+    "parameters": {}
+  }
+}
+```
 
-These commands facilitate the setup and operation of the VortiDeck OBS Plugin, enabling seamless integration with OBS Studio.
+### Set Banner Content (Base64)
+```json
+{
+  "path": "/api/v1/integration/sdk/action/invoke",
+  "verb": "SET",
+  "payload": {
+    "actionId": "obs_banner_set_data",
+    "parameters": {
+      "content_data": "base64_encoded_image_data",
+      "content_type": "image/png"
+    }
+  }
+}
+```
+
+### Start Streaming
+```json
+{
+  "path": "/api/v1/integration/sdk/action/invoke",
+  "verb": "SET", 
+  "payload": {
+    "actionId": "obs_stream_start",
+    "parameters": {}
+  }
+}
+```
+
+## Support
+
+For issues and questions, please refer to the [Troubleshooting Guide](troubleshooting.md) or contact the VortiDeck team.
