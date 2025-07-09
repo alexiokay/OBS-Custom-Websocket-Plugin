@@ -391,7 +391,7 @@ more:
 - when premium status is true and customizable sstatus for add then check if the custom_css on vortideck banner is filled
 - on sources + menu adding vortideck banner adds something completly else than the actual browser source we use for vortideck, its completly diffrent object. please replace it with correct objet and remove legacy code  connected to the wrong one
 - premium users CANT open the properties, the properties button of banner should be grayed out for them.??
--there is no need for auti_rotation we send banners and they cannot directly set things which happens by default. auto rotation should be send diffrently. 
+-there is no need for auti_rotation we send banners and they cannot directly set things which happens by default. auto rotation should be send diffrently. the same for animation_duration parameter - what is even that?
 
 
 ----------
