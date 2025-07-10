@@ -10,6 +10,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <nlohmann/json.hpp>
 
 using namespace vorti::applets;
@@ -2900,6 +2901,8 @@ void banner_manager::start_ad_rotation()
             // STEP 3: Show ads within the 10-second window
             int window_time_used = 0;
             const int max_window_time = 10; // 10 seconds for testing
+            std::set<std::string> displayed_ads_in_window; // Track all displayed ads in this window
+            size_t ads_displayed_in_window = 0;
             
             while (window_time_used < max_window_time && !stop_token.stop_requested() && m_window_active.load()) {
                 // Get next ad from queue
@@ -2920,13 +2923,41 @@ void banner_manager::start_ad_rotation()
                         current_ad_id = current_ad.id;
                         ad_duration = current_ad.duration_seconds;
                         
+                        // Smart rotation logic:
+                        // 1. If we have only 1 ad, show it once per window
+                        // 2. If we have multiple ads, show each once per window
+                        // 3. If we've shown all ads in this window, close the window
+                        
+                        if (m_ad_queue.banners.size() == 1) {
+                            // Single ad case: show once per window
+                            if (displayed_ads_in_window.count(current_ad_id) > 0) {
+                                log_message("ROTATION: Single ad already displayed in this window - closing window");
+                                break;
+                            }
+                        } else {
+                            // Multiple ads case: show each ad once per window
+                            if (displayed_ads_in_window.size() >= m_ad_queue.banners.size()) {
+                                log_message("ROTATION: All ads displayed in this window - closing window");
+                                break;
+                            }
+                            
+                            // Skip if this specific ad was already shown in this window
+                            if (displayed_ads_in_window.count(current_ad_id) > 0) {
+                                log_message("ROTATION: Ad " + current_ad_id + " already displayed in this window - rotating to next");
+                                rotate_to_next_ad();
+                                continue;
+                            }
+                        }
+                        
                         // Check if ad can fit in remaining window time
                         int remaining_time = max_window_time - window_time_used;
                         if (ad_duration <= remaining_time) {
                             has_ad = true;
                             
                             log_message("ROTATION: Showing ad " + current_ad_id + " (" + 
-                                       std::to_string(ad_duration) + "s) in window");
+                                       std::to_string(ad_duration) + "s) in window [" + 
+                                       std::to_string(ads_displayed_in_window + 1) + "/" + 
+                                       std::to_string(m_ad_queue.banners.size()) + "]");
                             
                             // Set the banner content
                             set_banner_content_with_custom_params(
@@ -2950,6 +2981,10 @@ void banner_manager::start_ad_rotation()
                             // Track analytics
                             track_ad_display_start(current_ad_id, "queue_campaign", 
                                                  ad_duration * 1000, current_ad.content_type);
+                            
+                            // Mark this ad as displayed in this window
+                            displayed_ads_in_window.insert(current_ad_id);
+                            ads_displayed_in_window++;
                         } else {
                             log_message("ROTATION: Ad " + current_ad_id + " (" + 
                                        std::to_string(ad_duration) + "s) too long for remaining window time (" + 
