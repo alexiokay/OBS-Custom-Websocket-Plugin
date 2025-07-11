@@ -319,6 +319,13 @@ bool vorti::applets::obs_plugin::connect()
             disconnect();
             return false;
         }
+        
+        // Check if initialization was actually successful
+        if (m_integration_instance.empty() || m_integration_guid.empty()) {
+            log_to_obs("Initialization failed - missing integration details");
+            disconnect();
+            return false;
+        }
     }
 
     // Register regular actions
@@ -1020,11 +1027,10 @@ bool vorti::applets::obs_plugin::initialize_actions()
 
     send_message(initalize_actions);
 
-    // Await initialization details
-    std::unique_lock<std::mutex> lk(m_initialization_mutex);
-    m_initialization_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(1));
-
-    return !m_integration_instance.empty() && !m_integration_guid.empty();
+    // Don't wait here - let the main connect() function handle the timeout
+    // The activation response will be handled by websocket_message_handler
+    // which will notify m_initialization_cv when ready
+    return true;
 }
 
 

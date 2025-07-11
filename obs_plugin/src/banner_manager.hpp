@@ -186,6 +186,70 @@ namespace vorti {
                 bool custom_positioning = false;
                 std::chrono::system_clock::time_point last_updated;
             };
+
+            // NEW: Centralized Premium Status Handler
+            class PremiumStatusHandler {
+            public:
+                // Check if user is premium
+                static bool is_premium(const banner_manager* manager) {
+                    return manager->m_is_premium.load();
+                }
+                
+                // Check if a specific action is allowed for current user type
+                static bool is_action_allowed(const banner_manager* manager, const std::string& action_type) {
+                    bool is_premium = manager->m_is_premium.load();
+                    
+                    // Premium actions that are restricted for free users
+                    if (action_type == "banner_hide" || action_type == "banner_remove" || 
+                        action_type == "banner_modify" || action_type == "banner_position" ||
+                        action_type == "banner_css_edit" || action_type == "banner_duration_control") {
+                        return is_premium;
+                    }
+                    
+                    // Actions allowed for all users
+                    return true;
+                }
+                
+                // Get user type as string for logging
+                static std::string get_user_type_string(const banner_manager* manager) {
+                    return manager->m_is_premium.load() ? "premium" : "free";
+                }
+                
+                // Get revenue share for current user
+                static float get_revenue_share(const banner_manager* manager) {
+                    return manager->m_revenue_share.load();
+                }
+                
+                // Get ad frequency for current user
+                static int get_ad_frequency_minutes(const banner_manager* manager) {
+                    return manager->m_ad_frequency_minutes.load();
+                }
+                
+                // Check if custom positioning is allowed
+                static bool can_customize_positioning(const banner_manager* manager) {
+                    return manager->m_custom_positioning.load();
+                }
+                
+                // Log premium-related actions
+                static void log_premium_action(const banner_manager* manager, const std::string& action, 
+                                             const std::string& result) {
+                    std::string user_type = get_user_type_string(manager);
+                    std::string log_msg = "PREMIUM: " + user_type + " user - " + action + " - " + result;
+                    manager->log_message(log_msg);
+                }
+                
+                // Handle premium restriction with automatic logging
+                static bool handle_premium_restriction(const banner_manager* manager, const std::string& action_type, 
+                                                     const std::string& action_description) {
+                    if (!is_action_allowed(manager, action_type)) {
+                        log_premium_action(manager, action_description, "DENIED (premium required)");
+                        return false;
+                    }
+                    
+                    log_premium_action(manager, action_description, "ALLOWED");
+                    return true;
+                }
+            };
             
             // State variables
             obs_source_t* m_banner_source;
@@ -321,7 +385,7 @@ namespace vorti {
             std::atomic<int> m_estimated_total_viewers{0};
             
             // Logging helper
-            void log_message(std::string_view message);
+            void log_message(std::string_view message) const;
         };
 
         // Custom source data structure removed - using browser_source directly

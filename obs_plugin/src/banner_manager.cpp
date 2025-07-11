@@ -181,10 +181,9 @@ void banner_manager::initialize_after_obs_ready()
     // Set flag to prevent multiple calls
     m_initialization_started.store(true);
     
-    bool is_premium = m_is_premium.load();
-    log_message("INITIALIZATION: User type: " + std::string(is_premium ? "premium" : "free"));
+    log_message("INITIALIZATION: User type: " + PremiumStatusHandler::get_user_type_string(this));
     
-    if (!is_premium) {
+    if (!PremiumStatusHandler::is_premium(this)) {
         // FREE USERS: Initialize banners after OBS is fully loaded
         log_message("INITIALIZATION: FREE USER - Starting automatic banner initialization");
         
@@ -210,7 +209,7 @@ void banner_manager::initialize_after_obs_ready()
     }
     
     // Enable signal connections for free users after OBS is fully ready
-    if (!is_premium) {
+    if (!PremiumStatusHandler::is_premium(this)) {
         log_message("INITIALIZATION: Enabling signal-based banner protection for free users");
         enable_signal_connections_when_safe();
     }
@@ -227,14 +226,12 @@ void banner_manager::enable_signal_connections_when_safe()
     }
     
     // STEP 1: Re-enable signal connections with minimal handlers
-    bool is_premium = m_is_premium.load();
-    
-    if (!is_premium) {
+    if (!PremiumStatusHandler::is_premium(this)) {
         log_message("STEP 1: Enabling signal connections with minimal handlers");
-    connect_scene_signals();
+        connect_scene_signals();
         m_signals_connected.store(true);
     } else {
-        log_message("PREMIUM USER: Signal connections not needed - you have complete banner freedom");
+        PremiumStatusHandler::log_premium_action(this, "signal connections", "not needed - complete banner freedom");
     }
 }
 
@@ -338,11 +335,10 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
         
         // Check if this is our banner being removed (metadata-based detection)
         if (manager->is_vortideck_banner_item(item)) {
-            bool is_premium = manager->m_is_premium.load();
             manager->log_message("SIGNAL: Banner removal detected - Name: " + std::string(name) + 
-                               ", User: " + (is_premium ? "premium" : "free"));
+                               ", User: " + PremiumStatusHandler::get_user_type_string(manager));
             
-            if (!is_premium) {
+            if (!PremiumStatusHandler::is_premium(manager)) {
                 manager->log_message("SIGNAL: FREE USER - Starting banner restoration");
                 
                 std::jthread([manager]() {
@@ -365,7 +361,7 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
                 }).detach();
             } else {
                 // PREMIUM USER: Trigger cleanup after banner deletion
-                manager->log_message("SIGNAL: PREMIUM USER - Banner deleted, triggering cleanup");
+                PremiumStatusHandler::log_premium_action(manager, "banner deletion", "triggering cleanup");
                 
                 // Trigger cleanup in a jthread to avoid blocking the signal
                 std::jthread([manager]() {
@@ -534,11 +530,10 @@ void banner_manager::show_banner(bool enable_duration_timer)
 {
     log_message("SHOW_BANNER: Starting banner display process...");
     
-    bool is_premium = m_is_premium.load();
-    log_message("SHOW_BANNER: User type: " + std::string(is_premium ? "premium" : "free"));
+    log_message("SHOW_BANNER: User type: " + PremiumStatusHandler::get_user_type_string(this));
     
     // CHECK AD FREQUENCY LIMITS (free users only)
-    if (!is_premium && !can_show_ad_now()) {
+    if (!PremiumStatusHandler::is_premium(this) && !can_show_ad_now()) {
         auto now = std::chrono::system_clock::now();
         auto time_since_last = std::chrono::duration_cast<std::chrono::seconds>(now - m_last_ad_end_time);
         int remaining_wait = 60 - static_cast<int>(time_since_last.count());
@@ -581,9 +576,9 @@ void banner_manager::show_banner(bool enable_duration_timer)
         log_message("SHOW_BANNER: Using existing banner source");
     }
     
-    if (!is_premium) {
+    if (!PremiumStatusHandler::is_premium(this)) {
         // FREE USERS: FORCED banner initialization across ALL scenes
-        log_message("SHOW_BANNER: FREE USER - Forcing banner display across all scenes");
+        PremiumStatusHandler::log_premium_action(this, "banner display", "forcing across all scenes");
         initialize_banners_all_scenes();
         m_banner_visible = true;
         
@@ -615,7 +610,7 @@ void banner_manager::show_banner(bool enable_duration_timer)
         }
     } else {
         // PREMIUM USERS: Complete freedom - NO forced banner initialization
-        log_message("SHOW_BANNER: PREMIUM USER - Complete freedom mode (no forced banners)");
+        PremiumStatusHandler::log_premium_action(this, "banner display", "complete freedom mode (no forced banners)");
         log_message("SHOW_BANNER: PREMIUM USER - Use WebSocket API to add banners if desired");
         // NO automatic banner creation for premium users
         // They have complete choice whether to have banners or not
@@ -643,7 +638,7 @@ void banner_manager::hide_banner()
     log_message("HIDE_BANNER: Starting banner hide process...");
     
     // Check premium status - free users have VERY limited hiding privileges
-    if (!m_is_premium.load()) {
+    if (!PremiumStatusHandler::handle_premium_restriction(this, "banner_hide", "banner hiding")) {
         log_message("HIDE_BANNER: FREE USER - Banner hiding heavily restricted - upgrade to premium for full control");
         log_message("HIDE_BANNER: FREE USER - Banners can only be hidden for 5 seconds before auto-restore");
         
@@ -658,7 +653,7 @@ void banner_manager::hide_banner()
         // BUT don't auto-restore if this is a duration timer hide (permanent until next ad)
         std::jthread([this]() {
             std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (!m_is_premium.load()) {
+            if (!PremiumStatusHandler::is_premium(this)) {
                 // Only auto-restore if this wasn't a duration timer hide (check if we can show ads)
                 if (can_show_ad_now()) {
                     log_message("HIDE_BANNER: FREE USER - Auto-restoring banner after 5 seconds");
@@ -684,7 +679,7 @@ void banner_manager::hide_banner()
             m_intentional_hide_in_progress.store(false);
             
             // Safety re-enable of protection system
-            if (!m_is_premium.load()) {
+            if (!PremiumStatusHandler::is_premium(this)) {
                 log_message("HIDE_BANNER: FREE USER - Safety re-enabling protection system");
                 connect_scene_signals();
                 start_persistence_monitor();
@@ -702,7 +697,7 @@ void banner_manager::hide_banner()
     }
     
     // Premium users can hide freely
-    log_message("HIDE_BANNER: PREMIUM USER - Hiding banner with full control");
+    PremiumStatusHandler::log_premium_action(this, "banner hiding", "full control");
     remove_banner_from_scenes();
     log_message("HIDE_BANNER: PREMIUM USER - Banner hidden (full control)");
 }
@@ -745,8 +740,6 @@ void banner_manager::set_banner_content(std::string_view content_data, std::stri
     
     create_banner_source(content_data, content_type);
     
-    bool is_premium = m_is_premium.load();
-    
     // If banner was visible, update it in the scene
     if (was_visible_before_update) {
         log_message("BANNER CONTENT: Banner was visible before update - refreshing content in scenes");
@@ -758,7 +751,7 @@ void banner_manager::set_banner_content(std::string_view content_data, std::stri
         m_banner_visible = was_visible_before_update;
         log_message("BANNER CONTENT: SECURITY FIX - Restored visibility flag after remove_banner_from_scenes()");
         
-        if (!is_premium) {
+        if (!PremiumStatusHandler::is_premium(this)) {
             // FREE USERS: Content change triggers ALL scenes update
             log_message("FREE USER: Content changed - updating banners across ALL scenes");
             initialize_banners_all_scenes();
@@ -770,7 +763,7 @@ void banner_manager::set_banner_content(std::string_view content_data, std::stri
             }
         } else {
             // PREMIUM USERS: Content change only affects current scene (if they choose)
-            log_message("PREMIUM USER: Content set - use show_premium_banner() to add to current scene");
+            PremiumStatusHandler::log_premium_action(this, "content change", "use show_premium_banner() to add to current scene");
         }
         
         // Final security verification
@@ -780,7 +773,7 @@ void banner_manager::set_banner_content(std::string_view content_data, std::stri
         log_message("BANNER CONTENT: Banner was not visible before update - no scene refresh needed");
     }
     
-    log_message(std::format("Banner content set - Type: {} (User: {})", content_type, (is_premium ? "premium" : "free")));
+    log_message(std::format("Banner content set - Type: {} (User: {})", content_type, PremiumStatusHandler::get_user_type_string(this)));
 }
 
 void banner_manager::set_banner_content_with_custom_params(std::string_view content_data, std::string_view content_type,
@@ -804,8 +797,6 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
     
     create_banner_source_with_custom_params(content_data, content_type, custom_css, custom_width, custom_height, css_locked);
     
-    bool is_premium = m_is_premium.load();
-    
     // If banner was visible, update it in the scene WITHOUT removing it
     if (was_visible_before_update) {
         log_message("ENHANCED BANNER: Banner was visible before update - updating content WITHOUT removing from scenes");
@@ -813,7 +804,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
         // DO NOT remove banner from scenes - just refresh the content in place
         // The create_banner_source_with_custom_params already updated the browser source content
         
-        if (!is_premium) {
+        if (!PremiumStatusHandler::is_premium(this)) {
             // FREE USERS: Content updated in-place, just refresh protection
             log_message("FREE USER: Enhanced content changed - banners updated in-place (full-screen)");
             
@@ -844,7 +835,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
             }
         } else {
             // PREMIUM USERS: Content change only affects current scene (if they choose)
-            log_message("PREMIUM USER: Enhanced content set - use show_premium_banner() to add to current scene");
+            PremiumStatusHandler::log_premium_action(this, "enhanced content change", "use show_premium_banner() to add to current scene");
         }
         
         // Final security verification
@@ -855,7 +846,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
     }
     
     // CRITICAL: Ensure protection systems remain active for free users after ANY content update
-    if (!is_premium) {
+    if (!PremiumStatusHandler::is_premium(this)) {
         log_message("FREE USER: SECURITY - Ensuring protection system remains active after content update");
         
         // Force re-enable signal connections if needed
@@ -873,7 +864,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
         log_message("FREE USER: SECURITY - Protection systems verified active after content update");
     }
     
-    log_message(std::format("Enhanced banner content set - Type: {} (User: {})", content_type, (is_premium ? "premium" : "free")));
+    log_message(std::format("Enhanced banner content set - Type: {} (User: {})", content_type, PremiumStatusHandler::get_user_type_string(this)));
 }
 
 
@@ -881,9 +872,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
 void banner_manager::show_premium_banner()
 {
     // PREMIUM USERS ONLY: Add banner to current scene by choice
-    bool is_premium = m_is_premium.load();
-    
-    if (!is_premium) {
+    if (!PremiumStatusHandler::handle_premium_restriction(this, "banner_position", "premium banner function")) {
         log_message("FREE USER: Cannot use premium banner function - banners are automatically managed");
         return;
     }
@@ -897,7 +886,7 @@ void banner_manager::show_premium_banner()
     add_banner_to_current_scene();
     m_banner_visible = true;
     
-    log_message("PREMIUM USER: Banner added to current scene - you have full control");
+    PremiumStatusHandler::log_premium_action(this, "banner added to current scene", "you have full control");
 }
 
 bool banner_manager::is_banner_visible() const
@@ -1015,28 +1004,28 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
          // Create HTML page with text content
          url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
          css_content = "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }";
-     } else if (content_type.find("image") != std::string::npos || content_type.find("video") != std::string::npos) {
+     } else if (is_image_content(content_type) || is_video_content(content_type)) {
          // For image/video URLs - create HTML wrapper for proper CSS targeting
-         if (content_data.find("http://") == 0 || content_data.find("https://") == 0) {
+         if (is_url(content_data)) {
              // Create HTML wrapper with image/video element
-             std::string element_tag = content_type.find("video") != std::string::npos ? "video" : "img";
-             std::string extra_attrs = content_type.find("video") != std::string::npos ? " autoplay loop muted" : "";
+             std::string element_tag = is_video_content(content_type) ? "video" : "img";
+             std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
              std::string default_css = std::format("body {{ margin: 0; padding: 0; background: transparent; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; overflow: hidden; }} {} {{ width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; border: none; }}", element_tag);
              
              url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
                                      default_css, element_tag, content_data, extra_attrs, element_tag);
              css_content = ""; // CSS is now embedded in HTML
          } else {
-             // Local file or other image URL - same wrapper approach
-             std::string element_tag = content_type.find("video") != std::string::npos ? "video" : "img";
-             std::string extra_attrs = content_type.find("video") != std::string::npos ? " autoplay loop muted" : "";
+             // Local file or other image/video path - same wrapper approach
+             std::string element_tag = is_video_content(content_type) ? "video" : "img";
+             std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
              std::string default_css = std::format("body {{ margin: 0; padding: 0; background: transparent; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; overflow: hidden; }} {} {{ width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; border: none; }}", element_tag);
              
              url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
                                      default_css, element_tag, content_data, extra_attrs, element_tag);
              css_content = ""; // CSS is now embedded in HTML
          }
-     } else if (content_data.find("http://") == 0 || content_data.find("https://") == 0) {
+     } else if (is_url(content_data)) {
          // Direct URL - use as is
          url_content = content_data;
          css_content = "";
@@ -1259,9 +1248,9 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
         css_content = custom_css.empty() ? 
             "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }" :
             std::string(custom_css);
-                    } else if (content_type.find("image") != std::string::npos || content_type.find("video") != std::string::npos) {
+                    } else if (is_image_content(content_type) || is_video_content(content_type)) {
         // For image/video URLs - check if custom CSS needs HTML structure
-        if (content_data.find("http://") == 0 || content_data.find("https://") == 0) {
+        if (is_url(content_data)) {
             // Check if custom CSS references HTML elements (img, video, etc.)
             bool needs_html_wrapper = !custom_css.empty() && 
                                     (custom_css.find("img") != std::string::npos || 
@@ -1271,17 +1260,15 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
             
             if (needs_html_wrapper) {
                 // Create HTML wrapper with image/video element for CSS targeting
-                std::string element_tag = content_type.find("video") != std::string::npos ? "video" : "img";
-                std::string extra_attrs = content_type.find("video") != std::string::npos ? " autoplay loop muted" : "";
+                std::string element_tag = is_video_content(content_type) ? "video" : "img";
+                std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
                 
                 // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
-                bool is_premium = m_is_premium.load();
-                
                 // If css_locked is not explicitly set, use smart defaults:
                 // - Premium users: CSS editable by default 
                 // - Free users: CSS locked by default (for ad content protection)
                 bool final_css_locked = css_locked;
-                if (!css_locked && !is_premium) {
+                if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
                     // Free users get locked CSS by default unless explicitly overridden
                     final_css_locked = true;
                     log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
@@ -1320,17 +1307,15 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
                                      custom_css.find("animation") != std::string::npos);
             
             if (needs_html_wrapper) {
-                std::string element_tag = content_type.find("video") != std::string::npos ? "video" : "img";
-                std::string extra_attrs = content_type.find("video") != std::string::npos ? " autoplay loop muted" : "";
+                std::string element_tag = is_video_content(content_type) ? "video" : "img";
+                std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
                 
                 // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
-                bool is_premium = m_is_premium.load();
-                
                 // If css_locked is not explicitly set, use smart defaults:
                 // - Premium users: CSS editable by default 
                 // - Free users: CSS locked by default (for ad content protection)
                 bool final_css_locked = css_locked;
-                if (!css_locked && !is_premium) {
+                if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
                     // Free users get locked CSS by default unless explicitly overridden
                     final_css_locked = true;
                     log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
@@ -1360,7 +1345,7 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
                     std::string(custom_css);
             }
         }
-    } else if (content_data.find("http://") == 0 || content_data.find("https://") == 0) {
+    } else if (is_url(content_data)) {
         // Direct URL - use as is
         url_content = std::string(content_data);
         css_content = std::string(custom_css); // Use provided CSS or empty
@@ -1584,9 +1569,8 @@ void banner_manager::add_banner_to_current_scene()
 void banner_manager::initialize_banners_all_scenes()
 {
     // This function is ONLY for FREE USERS - premium users have complete freedom
-    bool is_premium = m_is_premium.load();
-    if (is_premium) {
-        log_message("PREMIUM USER: Banner initialization skipped - you have complete banner freedom");
+    if (PremiumStatusHandler::is_premium(this)) {
+        PremiumStatusHandler::log_premium_action(this, "banner initialization", "SKIPPED - complete banner freedom");
         return;
     }
     
@@ -1965,7 +1949,7 @@ void banner_manager::rename_source_if_needed(obs_source_t* source, std::string_v
 }
 
 
-void banner_manager::log_message(std::string_view message)
+void banner_manager::log_message(std::string_view message) const
 {
     // Use proper OBS logging directly
     blog(LOG_INFO, "[Banner Manager] %s", message.data());
