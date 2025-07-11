@@ -155,7 +155,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED || event == OBS_FRONTEND_EVENT_RECORDING_STARTED)
     {
         std::lock_guard<std::mutex> wlock(m_thread_lock);
-        m_start_time = std::chrono::high_resolution_clock::now();
+        m_start_time = std::chrono::steady_clock::now();
         m_total_streamed_bytes = 0;
         m_total_streamed_frames = 0;
     }
@@ -241,6 +241,24 @@ void obs_module_unload()
     // Cleanup banner functionality FIRST (before disconnecting)
     if constexpr (BANNER_MANAGER_ENABLED) {
         blog(LOG_INFO, "[OBS Plugin] Cleaning up banner manager...");
+        // Set shutdown flag to prevent new banner operations
+        m_banner_manager_shutdown.store(true);
+        
+        // Stop and join all banner tracking threads
+        {
+            std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
+            for (auto& thread : m_banner_tracking_threads) {
+                if (thread.joinable()) {
+                    thread.request_stop();
+                    // Don't wait too long for tracking threads
+                    if (thread.joinable()) {
+                        thread.detach(); // Let them finish naturally if they don't stop quickly
+                    }
+                }
+            }
+            m_banner_tracking_threads.clear();
+        }
+        
         // Call explicit cleanup method to stop all threads
         m_banner_manager.shutdown();
         
@@ -2031,7 +2049,7 @@ action_parameters vorti::applets::obs_plugin::helper_get_available_sources()
     for (const auto &scene : current_collection)
     {
         std::vector<nlohmann::json> list_selection_source;
-        for (const auto &source : scene.second.sources)
+        for (const auto &source : scene.second.source_list)
         {
             // clang-format off
             nlohmann::json selection =
@@ -2103,7 +2121,7 @@ action_parameters vorti::applets::obs_plugin::helper_get_available_mixers()
     for (const auto &scene : current_collection)
     {
         std::vector<nlohmann::json> list_selection_mixer;
-        for (const auto &source : scene.second.mixers)
+        for (const auto &source : scene.second.mixer_list)
         {
             // clang-format off
             nlohmann::json selection =
@@ -2219,7 +2237,7 @@ bool vorti::applets::obs_plugin::helper_populate_collections()
         auto *obs_scenes = new scene_info;
         auto &current_collection_scene = current_collection[name_str];
 
-        current_collection_scene.sources.clear();
+        current_collection_scene.source_list.clear();
 
         auto sourceEnumProc = [](obs_scene_t *scene, obs_sceneitem_t *currentItem, void *privateData) -> bool {
             auto *parameters = (scene_info *)privateData;
@@ -2230,25 +2248,25 @@ bool vorti::applets::obs_plugin::helper_populate_collections()
             if (((source_type & OBS_SOURCE_VIDEO) == OBS_SOURCE_VIDEO)
                 || ((source_type & OBS_SOURCE_ASYNC) == OBS_SOURCE_ASYNC))
             {
-                parameters->sources.push_back(std::string(obs_source_get_name(source)));
+                parameters->source_list.push_back(std::string(obs_source_get_name(source)));
             }
             else if ((source_type & OBS_SOURCE_AUDIO) == OBS_SOURCE_AUDIO)
             {
-                parameters->mixers.push_back(std::string(obs_source_get_name(source)));
+                parameters->mixer_list.push_back(std::string(obs_source_get_name(source)));
             }
 
             return true;
         };
         obs_scene_enum_items(scene, sourceEnumProc, obs_scenes);
 
-        for (const auto &scene_element : obs_scenes->sources)
+        for (const auto &scene_element : obs_scenes->source_list)
         {
-            current_collection_scene.sources.push_back(scene_element);
+            current_collection_scene.source_list.push_back(scene_element);
         }
 
-        for (const auto &scene_element : obs_scenes->mixers)
+        for (const auto &scene_element : obs_scenes->mixer_list)
         {
-            current_collection_scene.mixers.push_back(scene_element);
+            current_collection_scene.mixer_list.push_back(scene_element);
         }
 
         delete obs_scenes;
@@ -2393,7 +2411,7 @@ void vorti::applets::obs_plugin::loop_function()
 
         if (status_payload["currentState"] != "IDLE")
         {
-            auto duration = std::chrono::high_resolution_clock::now() - m_start_time;
+            auto duration = std::chrono::steady_clock::now() - m_start_time;
             duration_hours = std::chrono::duration_cast<std::chrono::hours>(duration).count() % 24;
             duration_minutes = std::chrono::duration_cast<std::chrono::minutes>(duration).count() % 60;
             duration_seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count() % 60;
@@ -2491,6 +2509,11 @@ void vorti::applets::obs_plugin::create_obs_menu()
 void vorti::applets::obs_plugin::action_banner_show(const action_invoke_parameters &parameters)
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
+        if (m_banner_manager_shutdown.load()) {
+            log_to_obs("ACTION_BANNER_SHOW: Rejected - shutdown in progress");
+            return;
+        }
+        
         log_to_obs("ACTION_BANNER_SHOW: Command received from API");
         
         // Check premium status and schedule VortiDeck ads
@@ -2512,6 +2535,11 @@ void vorti::applets::obs_plugin::action_banner_show(const action_invoke_paramete
 void vorti::applets::obs_plugin::action_banner_hide(const action_invoke_parameters &parameters)
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
+        if (m_banner_manager_shutdown.load()) {
+            log_to_obs("ACTION_BANNER_HIDE: Rejected - shutdown in progress");
+            return;
+        }
+        
         log_to_obs("ACTION_BANNER_HIDE: Command received from API");
         
         // Check premium status and schedule VortiDeck ads
@@ -2539,6 +2567,11 @@ void vorti::applets::obs_plugin::action_banner_hide(const action_invoke_paramete
 void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parameters &parameters)
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
+        if (m_banner_manager_shutdown.load()) {
+            log_to_obs("ACTION_BANNER_TOGGLE: Rejected - shutdown in progress");
+            return;
+        }
+        
         log_to_obs("ACTION_BANNER_TOGGLE: Command received from API");
         
         // Check premium status and schedule VortiDeck ads
@@ -2557,11 +2590,16 @@ void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parame
         // Safety check: Ensure protection system is active for free users
         if (!m_banner_manager.is_premium_user()) {
             // Give a moment for the toggle to complete, then ensure protection is active
-            std::jthread([]() {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                log_to_obs("ACTION_BANNER_TOGGLE: FREE USER - Ensuring protection system is active");
-                // Note: The banner manager handles its own protection re-enabling
-            }).detach();
+            {
+                std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
+                m_banner_tracking_threads.emplace_back([this]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    if (!m_banner_manager_shutdown.load()) {
+                        log_to_obs("ACTION_BANNER_TOGGLE: FREE USER - Ensuring protection system is active");
+                        // Note: The banner manager handles its own protection re-enabling
+                    }
+                });
+            }
         }
     } else {
         log_to_obs("ACTION_BANNER_TOGGLE: Banner manager disabled");
@@ -2571,6 +2609,11 @@ void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parame
 void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_parameters &parameters)
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
+        if (m_banner_manager_shutdown.load()) {
+            log_to_obs("ACTION_BANNER_SET_DATA: Rejected - shutdown in progress");
+            return;
+        }
+        
         log_to_obs("ACTION_BANNER_SET_DATA: Command received from API");
         
         // Check premium status and schedule VortiDeck ads
@@ -2750,10 +2793,15 @@ void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_para
             // Schedule analytics end tracking (only for immediate mode - queue mode handles its own analytics)
             if constexpr (BANNER_MANAGER_ENABLED) {
                 if (!queue_mode) {
-                    std::jthread([ad_id, planned_duration_ms]() {
+                    // Use managed thread instead of detached to prevent use-after-free
+                    std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
+                    m_banner_tracking_threads.emplace_back([this, ad_id, planned_duration_ms]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(planned_duration_ms));
-                        m_banner_manager.track_ad_display_end(ad_id, planned_duration_ms);
-                    }).detach();
+                        // Check if banner manager is still valid before calling
+                        if (!m_banner_manager_shutdown.load()) {
+                            m_banner_manager.track_ad_display_end(ad_id, planned_duration_ms);
+                        }
+                    });
                 }
             }
         } else {
@@ -2944,7 +2992,7 @@ void vorti::applets::obs_plugin::action_banner_add_to_queue(const action_invoke_
     }
 }
 
-void vorti::applets::obs_plugin::action_analytics_get_report(const action_invoke_parameters &parameters)
+void vorti::applets::obs_plugin::action_analytics_get_report(const action_invoke_parameters &parameters [[maybe_unused]])
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
         log_to_obs("ACTION_ANALYTICS_GET_REPORT: Generating analytics report");

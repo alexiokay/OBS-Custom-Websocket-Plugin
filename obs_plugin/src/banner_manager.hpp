@@ -257,6 +257,10 @@ namespace vorti {
             bool m_banner_persistent;  // True when banner should be unhideable
             bool m_persistence_monitor_active;  // Monitor jthread active flag
             std::atomic<bool> m_shutting_down{false};  // Shutdown flag for thread coordination
+            
+            // Thread management for temporary operations
+            std::vector<std::jthread> m_temporary_threads;
+            std::mutex m_threads_mutex;
             std::string m_current_banner_content;
             std::string m_current_content_type;
             
@@ -290,6 +294,7 @@ namespace vorti {
     std::atomic<bool> m_in_window_gap{false};
     std::chrono::system_clock::time_point m_window_gap_start;
     std::jthread m_window_gap_thread;
+    std::jthread m_persistence_monitor_thread;
             
             // Ad frequency control for free users
             std::chrono::system_clock::time_point m_last_ad_end_time;
@@ -386,6 +391,14 @@ namespace vorti {
             
             // Logging helper
             void log_message(std::string_view message) const;
+            
+            // Thread management helpers
+            void start_temporary_thread(std::function<void()> task);
+            void cleanup_finished_threads();
+            void stop_all_threads();
+            
+            // Static thread helper for signal callbacks (uses weak pointer pattern)
+            static void start_safe_signal_thread(banner_manager* manager, std::function<void(banner_manager*)> task);
         };
 
         // Custom source data structure removed - using browser_source directly

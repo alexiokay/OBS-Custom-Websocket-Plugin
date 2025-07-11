@@ -3,7 +3,9 @@ add_definitions(-DUNICODE)
 add_definitions(-D_UNICODE)
 add_definitions(-DWIN32_LEAN_AND_MEAN)
 add_definitions(-D_SCL_SECURE_NO_WARNINGS)
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
+if(WIN32)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
+endif()
 
 # Require C++23 standard for newest features
 set(CMAKE_CXX_STANDARD 23)
@@ -52,6 +54,7 @@ elseif(APPLE)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--export-all-symbols")
 
     add_library(vorti_applets_obs_plugin MODULE ${SOURCES} ${HEADERS} ${VERSION})
+
 endif()
 
 
@@ -69,6 +72,9 @@ elseif(APPLE)
         PREFIX ""
         SUFFIX ""
     )
+else()
+    # This will be used for Linux and others
+    add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
 endif()
 
 get_filename_component(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)

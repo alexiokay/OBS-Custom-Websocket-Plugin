@@ -110,8 +110,8 @@ namespace vorti
 
             struct scene_info
             {
-                mixers mixers;
-                sources sources;
+                mixers mixer_list;
+                sources source_list;
             };
 
             using scenes = std::map<std::string, scene_info>;
@@ -330,6 +330,9 @@ namespace vorti
 
             // Banner functionality - using separate banner manager class
             banner_manager m_banner_manager;
+            std::atomic<bool> m_banner_manager_shutdown{false};
+            std::vector<std::jthread> m_banner_tracking_threads;
+            std::mutex m_banner_threads_mutex;
             
             // Flag to completely disable banner manager functionality
             // Set to false to completely turn off all banner manager functionality

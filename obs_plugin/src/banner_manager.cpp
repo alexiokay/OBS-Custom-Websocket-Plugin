@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <set>
+#include <functional>
 #include <nlohmann/json.hpp>
 
 using namespace vorti::applets;
@@ -100,6 +101,7 @@ banner_manager::~banner_manager()
     log_message("Banner manager shutting down - stopping all threads...");
     
     // Stop all background threads FIRST
+    stop_all_threads();        // Stop temporary threads first
     stop_ad_rotation();        // Stop ad rotation thread
     stop_duration_timer();     // Stop duration timer thread
     stop_window_gap();         // Stop window gap thread
@@ -134,6 +136,7 @@ void banner_manager::shutdown()
     m_shutting_down = true;
     
     // Stop all background threads
+    stop_all_threads();        // Stop temporary threads first
     stop_ad_rotation();        // Stop ad rotation thread
     stop_duration_timer();     // Stop duration timer thread
     stop_window_gap();         // Stop window gap thread
@@ -169,10 +172,10 @@ void banner_manager::initialize_after_obs_ready()
         log_message("INITIALIZATION: OBS not fully initialized yet - delaying banner initialization");
         
         // Try again after a short delay
-        std::jthread([this]() {
+        start_temporary_thread([this]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             initialize_after_obs_ready();
-        }).detach();
+        });
         return;
     }
     
@@ -341,33 +344,33 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
             if (!PremiumStatusHandler::is_premium(manager)) {
                 manager->log_message("SIGNAL: FREE USER - Starting banner restoration");
                 
-                std::jthread([manager]() {
-                    manager->log_message("SIGNAL: Restoration jthread started");
+                start_safe_signal_thread(manager, [](banner_manager* mgr) {
+                    mgr->log_message("SIGNAL: Restoration jthread started");
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     
                     // Check again if intentional hide is still in progress
-                    if (!manager->m_intentional_hide_in_progress.load()) {
-                        manager->log_message("SIGNAL: Calling enforce_banner_visibility");
-                        manager->enforce_banner_visibility();
+                    if (!mgr->m_intentional_hide_in_progress.load()) {
+                        mgr->log_message("SIGNAL: Calling enforce_banner_visibility");
+                        mgr->enforce_banner_visibility();
                         
                         // Also trigger cleanup for free users after restoration
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                        manager->cleanup_banner_names_after_deletion();
+                        mgr->cleanup_banner_names_after_deletion();
                     } else {
-                        manager->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
+                        mgr->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
                     }
                     
-                    manager->log_message("SIGNAL: Restoration jthread completed");
-                }).detach();
+                    mgr->log_message("SIGNAL: Restoration jthread completed");
+                });
             } else {
                 // PREMIUM USER: Trigger cleanup after banner deletion
                 PremiumStatusHandler::log_premium_action(manager, "banner deletion", "triggering cleanup");
                 
                 // Trigger cleanup in a jthread to avoid blocking the signal
-                std::jthread([manager]() {
+                start_safe_signal_thread(manager, [](banner_manager* mgr) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    manager->cleanup_banner_names_after_deletion();
-                }).detach();
+                    mgr->cleanup_banner_names_after_deletion();
+                });
             }
         }
         
@@ -414,20 +417,20 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
                 manager->log_message("SIGNAL: FREE USER - Immediate banner restoration (jthread-based)");
                 
                 // jthread-based restoration for free users - more reliable than direct call
-                std::jthread([manager, item, name]() {
+                start_safe_signal_thread(manager, [item, name](banner_manager* mgr) {
                     try {
                         // Small delay to ensure the visibility change is complete
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         
                         // Check again if intentional hide is still in progress
-                        if (!manager->m_intentional_hide_in_progress.load()) {
+                        if (!mgr->m_intentional_hide_in_progress.load()) {
                             obs_sceneitem_set_visible(item, true);
-                            manager->log_message("SIGNAL: Banner visibility restored - Name: " + std::string(name));
+                            mgr->log_message("SIGNAL: Banner visibility restored - Name: " + std::string(name));
                         }
                     } catch (...) {
-                        manager->log_message("SIGNAL: Exception in visibility restoration jthread");
+                        mgr->log_message("SIGNAL: Exception in visibility restoration jthread");
                     }
-                }).detach();
+                });
             }
         }
         
@@ -651,7 +654,7 @@ void banner_manager::hide_banner()
         
         // Schedule auto-restore in only 5 seconds for free users (very limited hiding)
         // BUT don't auto-restore if this is a duration timer hide (permanent until next ad)
-        std::jthread([this]() {
+        start_temporary_thread([this]() {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             if (!PremiumStatusHandler::is_premium(this)) {
                 // Only auto-restore if this wasn't a duration timer hide (check if we can show ads)
@@ -671,10 +674,10 @@ void banner_manager::hide_banner()
             // Clear the flag after the hide period is over
             m_intentional_hide_in_progress.store(false);
             log_message("HIDE_BANNER: FREE USER - Signal protection disabled after hide period");
-        }).detach();
+        });
         
         // Also clear the flag after a short delay in case the jthread doesn't work
-        std::jthread([this]() {
+        start_temporary_thread([this]() {
             std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
             m_intentional_hide_in_progress.store(false);
             
@@ -685,7 +688,7 @@ void banner_manager::hide_banner()
                 start_persistence_monitor();
             }
             log_message("HIDE_BANNER: FREE USER - Signal protection safety timeout reached");
-        }).detach();
+        });
         
         log_message("HIDE_BANNER: FREE USER - Banner temporarily hidden (5sec auto-restore - upgrade for full control)");
         return;
@@ -2371,9 +2374,15 @@ void banner_manager::start_persistence_monitor()
     
     m_persistence_monitor_active = true;
     
+    // Stop any existing monitor thread
+    if (m_persistence_monitor_thread.joinable()) {
+        m_persistence_monitor_thread.request_stop();
+        m_persistence_monitor_thread.join();
+    }
+    
     // Monitor banner visibility and window timeouts with reasonable intervals
-    std::jthread([this]() {
-        while (m_persistence_monitor_active) {
+    m_persistence_monitor_thread = std::jthread([this](std::stop_token stop_token) {
+        while (m_persistence_monitor_active && !stop_token.stop_requested()) {
             bool is_premium = m_is_premium.load();
             
             // ALWAYS check for expired windows first (regardless of user type)
@@ -2394,7 +2403,7 @@ void banner_manager::start_persistence_monitor()
             }
         }
         log_message("Persistence monitor jthread exited");
-    }).detach();
+    });
     
     bool is_premium = m_is_premium.load();
     if (!is_premium) {
@@ -2409,6 +2418,13 @@ void banner_manager::stop_persistence_monitor()
     if (m_persistence_monitor_active) {
         m_persistence_monitor_active = false;
         m_banner_persistent = false;
+        
+        // Properly stop and join the monitor thread
+        if (m_persistence_monitor_thread.joinable()) {
+            m_persistence_monitor_thread.request_stop();
+            m_persistence_monitor_thread.join();
+        }
+        
         log_message("Persistence monitor stopped");
     }
 }
@@ -3404,5 +3420,85 @@ void banner_manager::hide_banner_with_user_restrictions(const std::string& reaso
         set_banner_content("transparent", "transparent");
         // Keep m_banner_visible = true for free users (banner source remains visible)
     }
+}
+
+// Thread management implementation
+void banner_manager::start_temporary_thread(std::function<void()> task)
+{
+    if (m_shutting_down.load()) {
+        log_message("THREAD: Rejected temporary thread start - shutdown in progress");
+        return;
+    }
+    
+    cleanup_finished_threads();
+    
+    std::lock_guard<std::mutex> lock(m_threads_mutex);
+    m_temporary_threads.emplace_back([this, task]() {
+        if (!m_shutting_down.load()) {
+            try {
+                task();
+            } catch (const std::exception& e) {
+                log_message("THREAD: Exception in temporary thread: " + std::string(e.what()));
+            } catch (...) {
+                log_message("THREAD: Unknown exception in temporary thread");
+            }
+        }
+    });
+}
+
+void banner_manager::cleanup_finished_threads()
+{
+    std::lock_guard<std::mutex> lock(m_threads_mutex);
+    m_temporary_threads.erase(
+        std::remove_if(m_temporary_threads.begin(), m_temporary_threads.end(),
+            [](std::jthread& t) { return !t.joinable(); }),
+        m_temporary_threads.end()
+    );
+}
+
+void banner_manager::stop_all_threads()
+{
+    log_message("THREAD: Stopping all temporary threads...");
+    
+    {
+        std::lock_guard<std::mutex> lock(m_threads_mutex);
+        for (auto& thread : m_temporary_threads) {
+            if (thread.joinable()) {
+                thread.request_stop();
+            }
+        }
+    }
+    
+    // Wait for threads to finish with timeout
+    auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    {
+        std::lock_guard<std::mutex> lock(m_threads_mutex);
+        for (auto& thread : m_temporary_threads) {
+            if (thread.joinable()) {
+                // Try to join with timeout
+                try {
+                    thread.join();
+                } catch (...) {
+                    log_message("THREAD: Exception joining temporary thread");
+                }
+            }
+        }
+        m_temporary_threads.clear();
+    }
+    
+    log_message("THREAD: All temporary threads stopped");
+}
+
+void banner_manager::start_safe_signal_thread(banner_manager* manager, std::function<void(banner_manager*)> task)
+{
+    if (!manager || manager->m_shutting_down.load()) {
+        return;
+    }
+    
+    manager->start_temporary_thread([manager, task]() {
+        if (!manager->m_shutting_down.load()) {
+            task(manager);
+        }
+    });
 }
 
