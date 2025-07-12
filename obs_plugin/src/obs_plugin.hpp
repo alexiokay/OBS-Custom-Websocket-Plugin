@@ -10,12 +10,18 @@
     #define _WEBSOCKETPP_CPP11_TYPE_TRAITS_
 #endif
 
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4267)
+#endif
+
 #include <nlohmann/json.hpp>
 #include <websocketpp/client.hpp>
 #include <websocketpp/config/asio_no_tls_client.hpp>
+
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
 
 // FIX THE OBS INCLUDES TO MATCH THE EXISTING PATTERN IN THE .CPP FILE:
 #include <libobs/obs.h>

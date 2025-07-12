@@ -35,13 +35,13 @@ struct plugin_interface {
 extern plugin_interface* g_obs_plugin_instance;
 
 banner_manager::banner_manager()
-    : m_banner_source(nullptr)
+    : m_banner_source_name("VortiDeck Banner")
+    , m_banner_source(nullptr)
     , m_banner_visible(false)
     , m_banner_persistent(false)
     , m_persistence_monitor_active(false)
     , m_current_banner_content("")
     , m_current_content_type("")
-    , m_banner_source_name("VortiDeck Banner")
 {
     log_message("CONSTRUCTOR: Initializing banner manager...");
     
@@ -141,8 +141,14 @@ void banner_manager::shutdown()
     // Set shutdown flags to prevent new operations
     m_shutting_down = true;
     
-    // Stop all background threads
-    stop_all_threads();        // Stop temporary threads first
+    // CRITICAL: Disconnect signal handlers FIRST to prevent banner restoration during shutdown
+    disconnect_scene_signals();
+    
+    // Stop monitoring thread first (most likely to cause delays)
+    stop_persistence_monitor();
+    
+    // Stop all other background threads
+    stop_all_threads();        // Stop temporary threads 
     stop_ad_rotation();        // Stop ad rotation thread
     stop_duration_timer();     // Stop duration timer thread
     stop_window_gap();         // Stop window gap thread
@@ -155,10 +161,6 @@ void banner_manager::shutdown()
             m_analytics_thread.join();
         }
     }
-    
-    // Clean up signal handlers and monitoring
-    disconnect_scene_signals();
-    stop_persistence_monitor();
     
     log_message("Banner manager shutdown complete - all threads stopped");
 }
@@ -181,7 +183,7 @@ void banner_manager::initialize_after_obs_ready()
     }
     
     // Safety check - ensure OBS is fully initialized
-    if (!obs_frontend_get_current_scene()) {
+    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load() || !obs_frontend_get_current_scene()) {
         log_message("INITIALIZATION: OBS not fully initialized yet - delaying banner initialization");
         
         // Try again after a short delay
@@ -2269,7 +2271,11 @@ banner_manager::AdDisplayMetrics* banner_manager::find_active_ad_display(const s
 
 int banner_manager::calculate_current_viewer_estimate()
 {
-    // Get real OBS streaming data
+    // Get real OBS streaming data - only if frontend is available
+    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+        return 0;  // Frontend unavailable, return 0 viewers
+    }
+    
     obs_output_t* streaming_output = obs_frontend_get_streaming_output();
     if (!streaming_output) {
         // Not streaming, return 0
@@ -2413,21 +2419,32 @@ void banner_manager::start_persistence_monitor()
             // ALWAYS check for expired windows first (regardless of user type)
             auto_close_expired_windows();
             
-            if (!is_premium) {
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // Check more frequently for testing
-                if (m_banner_source && !is_banner_visible()) {
-                    enforce_banner_visibility();
+            // Use interruptible sleep with stop token check
+            auto start_time = std::chrono::steady_clock::now();
+            auto target_duration = std::chrono::seconds(2);
+            
+            while (std::chrono::steady_clock::now() - start_time < target_duration) {
+                if (stop_token.stop_requested() || !m_persistence_monitor_active) {
+                    log_message("Persistence monitor jthread exited: shutdown requested");
+                    return;
                 }
-            } else if (m_banner_persistent) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                if (m_banner_source && !is_banner_visible()) {
-                    enforce_banner_visibility();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            
+            // Only enforce banner visibility if still active and not shutting down
+            if (m_persistence_monitor_active && !stop_token.stop_requested() && !m_shutting_down) {
+                if (!is_premium) {
+                    if (m_banner_source && !is_banner_visible()) {
+                        enforce_banner_visibility();
+                    }
+                } else if (m_banner_persistent) {
+                    if (m_banner_source && !is_banner_visible()) {
+                        enforce_banner_visibility();
+                    }
                 }
-            } else {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
-        log_message("Persistence monitor jthread exited");
+        log_message("Persistence monitor jthread exited: monitor loop ended");
     });
     
     bool is_premium = m_is_premium.load();
@@ -2494,7 +2511,7 @@ void banner_manager::enforce_banner_visibility()
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
     
-    bool banner_found = false;
+    bool banner_found [[maybe_unused]] = false;
     bool action_taken = false;
     
     for (size_t i = 0; i < scenes.sources.num; i++) {
@@ -3495,7 +3512,7 @@ void banner_manager::stop_all_threads()
     }
     
     // Wait for threads to finish with timeout
-    auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto timeout [[maybe_unused]] = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     {
         std::lock_guard<std::mutex> lock(m_threads_mutex);
         for (auto& thread : m_temporary_threads) {

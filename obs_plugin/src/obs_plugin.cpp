@@ -170,6 +170,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     }
     else if (event == OBS_FRONTEND_EVENT_EXIT)
     {
+        log_to_obs("DISCONNECT TRIGGER: OBS Frontend Exit Event received");
         m_shutting_down = true;
         stop_loop();
 
@@ -308,8 +309,8 @@ bool vorti::applets::obs_plugin::connect()
     // Wait for connection with timeout
     {
         std::unique_lock<std::mutex> lk(m_compressor_ready_mutex);
-        if (m_compressor_ready_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(3)) == std::cv_status::timeout) {
-            log_to_obs("Connection timeout - cleaning up");
+        if (m_compressor_ready_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(10)) == std::cv_status::timeout) {
+            log_to_obs("DISCONNECT TRIGGER: Connection timeout after 10 seconds - cleaning up");
             disconnect();
             return false;
         }
@@ -337,15 +338,15 @@ bool vorti::applets::obs_plugin::connect()
     // Wait for initialization to complete
     {
         std::unique_lock<std::mutex> lk(m_initialization_mutex);
-        if (m_initialization_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(5)) == std::cv_status::timeout) {
-            log_to_obs("Initialization timeout");
+        if (m_initialization_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(15)) == std::cv_status::timeout) {
+            log_to_obs("DISCONNECT TRIGGER: Initialization timeout after 15 seconds");
             disconnect();
             return false;
         }
         
         // Check if initialization was actually successful
         if (m_integration_instance.empty() || m_integration_guid.empty()) {
-            log_to_obs("Initialization failed - missing integration details");
+            log_to_obs("DISCONNECT TRIGGER: Initialization failed - missing integration details");
             disconnect();
             return false;
         }
@@ -416,7 +417,7 @@ void vorti::applets::obs_plugin::reconnect() {
 }
 
 
-void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::connection_hdl &connection_handle)
+void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::connection_hdl &connection_handle [[maybe_unused]])
 {
     if (m_shutting_down) {
         log_to_obs("Connection closed during shutdown");
@@ -450,7 +451,8 @@ void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::conn
 
 void vorti::applets::obs_plugin::disconnect()
 {
-    log_to_obs("Disconnect: Starting shutdown sequence");
+    // Add detailed logging to identify who triggered the disconnect
+    log_to_obs("Disconnect: Starting shutdown sequence - thread ID: " + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())));
     
     // Set connection state first
     {
@@ -651,7 +653,7 @@ ws_client::connection_ptr vorti::applets::obs_plugin::_create_connection()
 }
 
 
-void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::connection_hdl &connection_handle)
+void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::connection_hdl &connection_handle [[maybe_unused]])
 {
     if (m_shutting_down) {
         return;
@@ -674,7 +676,7 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
 }
 
 
-void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::connection_hdl &connection_handle,
+void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::connection_hdl &connection_handle [[maybe_unused]],
                                                           const ws_client::message_ptr &response)
 {
     /* Received a message, handle it */
@@ -983,15 +985,15 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
 }
 
 
-void vorti::applets::obs_plugin::websocket_fail_handler(const websocketpp::connection_hdl &connection_handle)
+void vorti::applets::obs_plugin::websocket_fail_handler(const websocketpp::connection_hdl &connection_handle [[maybe_unused]])
 {
-    /* Something failed! ABORT THE MISSION! ALT+F4 */
+    /* Connection failed - let automatic reconnection handle recovery */
     {
         std::lock_guard<std::mutex> wl(m_lock);
         m_websocket_open = false;
     }
-
-    stop_loop();
+    
+    log_to_obs("WebSocket connection failed - automatic reconnection will retry");
 }
 
 
@@ -1854,10 +1856,10 @@ void vorti::applets::obs_plugin::helper_source_activate(const std::string &scene
         state->new_state = new_state;
         state->is_toggle = is_toggle;
 
-        auto sourceEnumProc = [](obs_scene_t *scene, obs_sceneitem_t *currentItem, void *privateData) -> bool {
+        auto sourceEnumProc = [](obs_scene_t *scene [[maybe_unused]], obs_sceneitem_t *currentItem, void *privateData) -> bool {
             auto *parameters = (new_state_info *)privateData;
             obs_source_t *source = obs_sceneitem_get_source(currentItem);
-            uint32_t source_type = obs_source_get_output_flags(source);
+            uint32_t source_type [[maybe_unused]] = obs_source_get_output_flags(source);
             std::string source_name(obs_source_get_name(source));
 
             if (source_name == parameters->name)
@@ -1926,10 +1928,10 @@ void vorti::applets::obs_plugin::helper_mixer_mute(const std::string &scene_name
         state->new_state = new_state;
         state->is_toggle = is_toggle;
 
-        auto sourceEnumProc = [](obs_scene_t *scene, obs_sceneitem_t *currentItem, void *privateData) -> bool {
+        auto sourceEnumProc = [](obs_scene_t *scene [[maybe_unused]], obs_sceneitem_t *currentItem, void *privateData) -> bool {
             auto *parameters = (new_state_info *)privateData;
             obs_source_t *source = obs_sceneitem_get_source(currentItem);
-            uint32_t source_type = obs_source_get_output_flags(source);
+            uint32_t source_type [[maybe_unused]] = obs_source_get_output_flags(source);
             std::string source_name(obs_source_get_name(source));
 
             if (source_name == parameters->name)
@@ -2259,11 +2261,11 @@ bool vorti::applets::obs_plugin::helper_populate_collections()
 
         current_collection_scene.source_list.clear();
 
-        auto sourceEnumProc = [](obs_scene_t *scene, obs_sceneitem_t *currentItem, void *privateData) -> bool {
+        auto sourceEnumProc = [](obs_scene_t *scene [[maybe_unused]], obs_sceneitem_t *currentItem, void *privateData) -> bool {
             auto *parameters = (scene_info *)privateData;
 
             obs_source_t *source = obs_sceneitem_get_source(currentItem);
-            uint32_t source_type = obs_source_get_output_flags(source);
+            uint32_t source_type [[maybe_unused]] = obs_source_get_output_flags(source);
 
             if (((source_type & OBS_SOURCE_VIDEO) == OBS_SOURCE_VIDEO)
                 || ((source_type & OBS_SOURCE_ASYNC) == OBS_SOURCE_ASYNC))
@@ -2467,29 +2469,35 @@ void vorti::applets::obs_plugin::loop_function()
             status_payload["cpuUsage"] = os_cpu_usage_info_query(cpu_usage);
         }
 
-        char *current_profile = obs_frontend_get_current_profile();
-        if (current_profile != nullptr)
-        {
-            status_payload["activeProfile"] = std::string(current_profile);
-            bfree(current_profile);
+        if (is_obs_frontend_available()) {
+            char *current_profile = obs_frontend_get_current_profile();
+            if (current_profile != nullptr)
+            {
+                status_payload["activeProfile"] = std::string(current_profile);
+                bfree(current_profile);
+            }
         }
 
-        char *current_collection = obs_frontend_get_current_scene_collection();
-        if (current_collection != nullptr)
-        {
-            status_payload["activeCollection"] = std::string(current_collection);
-            bfree(current_collection);
+        if (is_obs_frontend_available()) {
+            char *current_collection = obs_frontend_get_current_scene_collection();
+            if (current_collection != nullptr)
+            {
+                status_payload["activeCollection"] = std::string(current_collection);
+                bfree(current_collection);
+            }
         }
 
-        obs_source_t *current_scene = obs_frontend_get_current_scene();
-        if (current_scene != nullptr)
-        {
-            const char *scene_name = obs_source_get_name(current_scene);
-            if (scene_name != nullptr)
+        if (is_obs_frontend_available()) {
+            obs_source_t *current_scene = obs_frontend_get_current_scene();
+            if (current_scene != nullptr)
+            {
+                const char *scene_name = obs_source_get_name(current_scene);
+                if (scene_name != nullptr)
             {
                 status_payload["activeScene"] = std::string(scene_name);
             }
             obs_source_release(current_scene);
+        }
         }
 
         send_message(new_status);
