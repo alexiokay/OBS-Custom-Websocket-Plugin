@@ -12,7 +12,7 @@
 #include <string>
 #include <set>
 #include <functional>
-#include <nlohmann/json.hpp>
+// JSON include is already in banner_manager.hpp
 
 using namespace vorti::applets;
 

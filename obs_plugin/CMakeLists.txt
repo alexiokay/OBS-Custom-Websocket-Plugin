@@ -105,16 +105,34 @@ endif()
 
 get_filename_component(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
 
+# Debug output to help diagnose path issues
+message(STATUS "Current source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
+message(STATUS "DEPS_DIR: ${DEPS_DIR}")
+message(STATUS "JSON include path: ${DEPS_DIR}/other/json/include")
+message(STATUS "OBS include path: ${DEPS_DIR}/other/obs-studio")
+
 target_include_directories(vorti_applets_obs_plugin
     PUBLIC
     include)
 
-target_include_directories(vorti_applets_obs_plugin
-    SYSTEM PUBLIC
-    ${DEPS_DIR}/other/obs-studio
-    ${DEPS_DIR}/other/websocketpp
-    ${DEPS_DIR}/other/json/include
-    ${DEPS_DIR}/other/asio/asio/include)
+# Set include directories with platform-specific handling
+if(WIN32)
+    target_include_directories(vorti_applets_obs_plugin
+        PRIVATE
+        ${DEPS_DIR}/other/obs-studio
+        ${DEPS_DIR}/other/obs-studio/libobs
+        ${DEPS_DIR}/other/obs-studio/UI
+        ${DEPS_DIR}/other/websocketpp
+        ${DEPS_DIR}/other/json/include
+        ${DEPS_DIR}/other/asio/asio/include)
+else()
+    target_include_directories(vorti_applets_obs_plugin
+        SYSTEM PUBLIC
+        ${DEPS_DIR}/other/obs-studio
+        ${DEPS_DIR}/other/websocketpp
+        ${DEPS_DIR}/other/json/include
+        ${DEPS_DIR}/other/asio/asio/include)
+endif()
 
 target_link_libraries(vorti_applets_obs_plugin
     ${LIBS})

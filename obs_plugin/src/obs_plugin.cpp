@@ -10,15 +10,7 @@
     #define _WEBSOCKETPP_CPP11_TYPE_TRAITS_
 #endif
 
-#pragma warning(push)
-#pragma warning(disable : 4267)
-#include <nlohmann/json.hpp>
-#include <websocketpp/client.hpp>
-#include <websocketpp/config/asio_no_tls_client.hpp>
-#pragma warning(pop)
-
-#include <libobs/obs.h>
-#include <UI/obs-frontend-api/obs-frontend-api.h>
+// WebSocket and JSON includes are already in obs_plugin.hpp
 #include <libobs/obs-module.h>
 
 #include <libobs/util/platform.h>
