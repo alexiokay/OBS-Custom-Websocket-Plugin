@@ -218,9 +218,13 @@ namespace vorti
             void start_loop();
             void stop_loop();
             void loop_function();
+            
+            // Helper function to check if OBS frontend calls are safe
+            bool is_obs_frontend_available();
 
             std::atomic<bool> m_shutting_down;
             std::atomic<bool> m_collection_locked;
+            std::atomic<bool> m_obs_frontend_available;
 
             std::mutex m_lock;
             ws_client m_websocket;

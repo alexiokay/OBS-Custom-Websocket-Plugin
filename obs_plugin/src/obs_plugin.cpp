@@ -76,6 +76,7 @@ bool obs_module_load()
 {
     // Called when the module is loaded.
     m_shutting_down = false;
+    m_obs_frontend_available = false;
     
     // Start connection in a separate jthread to avoid blocking OBS startup
     std::jthread([]{
@@ -189,6 +190,9 @@ void obs_module_post_load()
 
     obs_frontend_add_event_callback(handle_obs_frontend_event, nullptr);
     obs_frontend_add_save_callback(handle_obs_frontend_save, nullptr);
+    
+    // Mark OBS frontend as available after callbacks are registered
+    m_obs_frontend_available = true;
 
     // Register custom VortiDeck Banner source
     if constexpr (BANNER_MANAGER_ENABLED) {
@@ -227,10 +231,7 @@ void obs_module_unload()
 
     vorti::applets::obs_plugin::uninitialize_actions();
 
-    obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
-    obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
-
-    // Cleanup banner functionality FIRST (before disconnecting)
+    // Cleanup banner functionality FIRST (before removing OBS callbacks)
     if constexpr (BANNER_MANAGER_ENABLED) {
         blog(LOG_INFO, "[OBS Plugin] Cleaning up banner manager...");
         // Set shutdown flag to prevent new banner operations
@@ -259,9 +260,21 @@ void obs_module_unload()
         blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
     }
 
+    // Now safe to remove OBS frontend callbacks after all threads are stopped
+    // Mark frontend as unavailable BEFORE removing callbacks
+    m_obs_frontend_available = false;
+    
+    obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
+    obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
+
     vorti::applets::obs_plugin::disconnect();
     
     blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
+}
+
+bool vorti::applets::obs_plugin::is_obs_frontend_available()
+{
+    return !m_shutting_down.load() && m_obs_frontend_available.load();
 }
 
 bool vorti::applets::obs_plugin::connect()
@@ -1283,6 +1296,11 @@ void vorti::applets::obs_plugin::action_stream_start(const action_invoke_paramet
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("Cannot start streaming - OBS frontend unavailable");
+        return;
+    }
+    
     if (!obs_frontend_streaming_active())
     {
         obs_frontend_streaming_start();
@@ -1298,6 +1316,11 @@ void vorti::applets::obs_plugin::action_stream_stop(const action_invoke_paramete
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("Cannot stop streaming - OBS frontend unavailable");
+        return;
+    }
+    
     if (obs_frontend_streaming_active())
     {
         obs_frontend_streaming_stop();
@@ -1313,6 +1336,11 @@ void vorti::applets::obs_plugin::action_stream_toggle(const action_invoke_parame
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("Cannot toggle streaming - OBS frontend unavailable");
+        return;
+    }
+    
     if (obs_frontend_streaming_active())
     {
         obs_frontend_streaming_stop();
@@ -2361,7 +2389,11 @@ void vorti::applets::obs_plugin::loop_function()
 
         obs_output_t *obs_output = nullptr;
 
-        if (obs_frontend_streaming_active())
+        // Safety check: Don't call OBS APIs if frontend is unavailable
+        if (!is_obs_frontend_available()) {
+            status_payload["currentState"] = "IDLE";
+        }
+        else if (obs_frontend_streaming_active())
         {
             obs_output = obs_frontend_get_streaming_output();
             status_payload["currentState"] = "STREAMING";

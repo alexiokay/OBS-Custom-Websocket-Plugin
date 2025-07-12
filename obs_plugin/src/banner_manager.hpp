@@ -152,6 +152,9 @@ namespace vorti {
             static void on_item_visible(void* data, calldata_t* calldata);
             static void on_item_transform(void* data, calldata_t* calldata);
             
+            // Safety checks
+            bool is_obs_safe_to_call() const;
+            
             // Internal operations
                     void create_banner_source(std::string_view content_data, std::string_view content_type);
         void create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,

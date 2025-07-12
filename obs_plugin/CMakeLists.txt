@@ -117,14 +117,31 @@ target_include_directories(vorti_applets_obs_plugin
 
 # Set include directories with platform-specific handling
 if(WIN32)
-    target_include_directories(vorti_applets_obs_plugin
-        PRIVATE
-        ${DEPS_DIR}/other/obs-studio
-        ${DEPS_DIR}/other/obs-studio/libobs
-        ${DEPS_DIR}/other/obs-studio/UI
-        ${DEPS_DIR}/other/websocketpp
-        ${DEPS_DIR}/other/json/include
-        ${DEPS_DIR}/other/asio/asio/include)
+    # For Windows, first try the other/ directory structure
+    if(EXISTS "${DEPS_DIR}/other/json/include")
+        target_include_directories(vorti_applets_obs_plugin
+            PRIVATE
+            ${DEPS_DIR}/other/obs-studio
+            ${DEPS_DIR}/other/obs-studio/libobs
+            ${DEPS_DIR}/other/obs-studio/UI
+            ${DEPS_DIR}/other/websocketpp
+            ${DEPS_DIR}/other/json/include
+            ${DEPS_DIR}/other/asio/asio/include)
+    else()
+        # Fallback: use vcpkg or system-installed dependencies
+        find_package(nlohmann_json QUIET)
+        if(nlohmann_json_FOUND)
+            target_link_libraries(vorti_applets_obs_plugin nlohmann_json::nlohmann_json)
+        endif()
+        
+        # Try to find OBS in standard Windows locations
+        target_include_directories(vorti_applets_obs_plugin
+            PRIVATE
+            "C:/Program Files/obs-studio/include"
+            "C:/obs-studio/include"
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    endif()
 else()
     target_include_directories(vorti_applets_obs_plugin
         SYSTEM PUBLIC

@@ -1,5 +1,11 @@
 #include "banner_manager.hpp"
 #include <UI/obs-frontend-api/obs-frontend-api.h>
+
+// Forward declarations for OBS plugin shutdown flags
+namespace vorti::applets::obs_plugin {
+    extern std::atomic<bool> m_shutting_down;
+    extern std::atomic<bool> m_obs_frontend_available;
+}
 #include <libobs/obs-module.h>
 #include <libobs/util/platform.h>
 #include <algorithm>
@@ -157,6 +163,13 @@ void banner_manager::shutdown()
     log_message("Banner manager shutdown complete - all threads stopped");
 }
 
+bool banner_manager::is_obs_safe_to_call() const
+{
+    // Check both banner manager shutdown flag AND main plugin shutdown
+    return !m_shutting_down && !vorti::applets::obs_plugin::m_shutting_down.load() && 
+           vorti::applets::obs_plugin::m_obs_frontend_available.load();
+}
+
 void banner_manager::initialize_after_obs_ready()
 {
     log_message("INITIALIZATION: Starting banner initialization process...");
@@ -242,6 +255,12 @@ void banner_manager::connect_scene_signals()
 {
     log_message("Connecting scene signals for banner enforcement");
     
+    // Safety check: Don't call OBS APIs if frontend is unavailable
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: Cannot connect scene signals - OBS frontend unavailable");
+        return;
+    }
+    
     // Connect to all existing scenes
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
@@ -273,6 +292,12 @@ void banner_manager::connect_scene_signals()
 void banner_manager::disconnect_scene_signals()
 {
     log_message("Disconnecting scene signals");
+    
+    // Safety check: Don't call OBS APIs if frontend is unavailable
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: No scenes available for signal disconnection");
+        return;
+    }
     
     try {
     // Disconnect from all existing scenes
