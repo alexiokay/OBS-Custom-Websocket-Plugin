@@ -992,6 +992,11 @@ obs_source_t* banner_manager::get_banner_source() const
 
 void banner_manager::add_banner_menu()
 {
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: Cannot add banner menu - OBS frontend unavailable");
+        return;
+    }
+    
     // Add VortiDeck banner menu to OBS
     obs_frontend_add_tools_menu_item("VortiDeck Banner", banner_menu_callback, this);
     log_message("VortiDeck Banner menu added to OBS Tools menu");
@@ -1581,6 +1586,11 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
 
 void banner_manager::add_banner_to_current_scene()
 {
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: Cannot add banner to scene - OBS frontend unavailable");
+        return;
+    }
+    
     if (!m_banner_source) {
         log_message("No banner source to add");
         return;
@@ -1637,6 +1647,11 @@ void banner_manager::add_banner_to_current_scene()
 
 void banner_manager::initialize_banners_all_scenes()
 {
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: Cannot initialize banners - OBS frontend unavailable");
+        return;
+    }
+    
     // This function is ONLY for FREE USERS - premium users have complete freedom
     if (PremiumStatusHandler::is_premium(this)) {
         PremiumStatusHandler::log_premium_action(this, "banner initialization", "SKIPPED - complete banner freedom");
@@ -1719,6 +1734,11 @@ void banner_manager::initialize_banners_all_scenes()
 
 void banner_manager::remove_banner_from_scenes()
 {
+    if (!is_obs_safe_to_call()) {
+        log_message("WARNING: Cannot remove banners from scenes - OBS frontend unavailable");
+        return;
+    }
+    
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
     
@@ -2310,9 +2330,9 @@ banner_manager::AdDisplayMetrics* banner_manager::find_active_ad_display(const s
 
 int banner_manager::calculate_current_viewer_estimate()
 {
-    // Get real OBS streaming data - only if frontend is available
-    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-        return 0;  // Frontend unavailable, return 0 viewers
+    // Get real OBS streaming data - only if frontend is available and not shutting down
+    if (!is_obs_safe_to_call()) {
+        return 0;  // Frontend unavailable or shutting down, return 0 viewers
     }
     
     obs_output_t* streaming_output = obs_frontend_get_streaming_output();

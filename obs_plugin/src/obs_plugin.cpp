@@ -171,11 +171,23 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     else if (event == OBS_FRONTEND_EVENT_EXIT)
     {
         log_to_obs("DISCONNECT TRIGGER: OBS Frontend Exit Event received");
+        
+        // CRITICAL: Mark frontend as unavailable IMMEDIATELY to prevent API calls
+        m_obs_frontend_available = false;
         m_shutting_down = true;
+        
+        // Notify all threads immediately to stop
+        m_compressor_ready_cv.notify_all();
+        m_initialization_cv.notify_all();
+        
+        // Stop banner manager first to prevent OBS API calls during shutdown
+        if constexpr (BANNER_MANAGER_ENABLED) {
+            m_banner_manager_shutdown.store(true);
+            m_banner_manager.shutdown();
+        }
+        
         stop_loop();
-
         uninitialize_actions();
-
         disconnect();
     }
 }
