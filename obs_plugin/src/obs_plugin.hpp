@@ -231,6 +231,7 @@ namespace vorti
             std::atomic<bool> m_shutting_down;
             std::atomic<bool> m_collection_locked;
             std::atomic<bool> m_obs_frontend_available;
+            std::atomic<bool> m_shutdown_complete{false};
 
             std::mutex m_lock;
             ws_client m_websocket;

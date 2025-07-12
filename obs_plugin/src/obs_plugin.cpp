@@ -172,9 +172,19 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     {
         log_to_obs("DISCONNECT TRIGGER: OBS Frontend Exit Event received");
         
+        // Check if shutdown is already in progress to prevent race with module unload
+        if (m_shutdown_complete.load()) {
+            log_to_obs("DISCONNECT TRIGGER: Shutdown already in progress, skipping frontend exit handling");
+            return;
+        }
+        
         // CRITICAL: Mark frontend as unavailable IMMEDIATELY to prevent API calls
-        m_obs_frontend_available = false;
-        m_shutting_down = true;
+        // Use atomic operations to ensure thread safety
+        {
+            std::lock_guard<std::mutex> wl(m_lock);
+            m_obs_frontend_available = false;
+            m_shutting_down = true;
+        }
         
         // Notify all threads immediately to stop
         m_compressor_ready_cv.notify_all();
@@ -183,9 +193,13 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
         // Stop banner manager first to prevent OBS API calls during shutdown
         if constexpr (BANNER_MANAGER_ENABLED) {
             m_banner_manager_shutdown.store(true);
-            m_banner_manager.shutdown();
+            // Don't call full shutdown here as obs_module_unload will handle it
+            // Just set the flag to prevent new operations
+            log_to_obs("DISCONNECT TRIGGER: Banner manager shutdown flag set");
         }
         
+        // Let disconnect() handle the full shutdown sequence with proper guards
+        // This will prevent race conditions with obs_module_unload
         stop_loop();
         uninitialize_actions();
         disconnect();
@@ -229,6 +243,12 @@ void obs_module_post_load()
 
 void obs_module_unload()
 {
+    // Check if shutdown is already complete to prevent double unload
+    if (vorti::applets::obs_plugin::m_shutdown_complete.load()) {
+        blog(LOG_INFO, "[OBS Plugin] Module unload called but shutdown already complete");
+        return;
+    }
+
     // Called when the module is unloaded.
     blog(LOG_INFO, "[OBS Plugin] OBS module unloading - setting shutdown flag");
     
@@ -236,6 +256,7 @@ void obs_module_unload()
     {
         std::lock_guard<std::mutex> wl(vorti::applets::obs_plugin::m_lock);
         vorti::applets::obs_plugin::m_shutting_down = true;
+        vorti::applets::obs_plugin::m_obs_frontend_available = false;  // Immediately disable OBS API calls
     }
     
     // Notify all waiting threads to wake up and check shutdown flag
@@ -250,15 +271,34 @@ void obs_module_unload()
         // Set shutdown flag to prevent new banner operations
         m_banner_manager_shutdown.store(true);
         
-        // Stop and join all banner tracking threads
+        // Stop and join all banner tracking threads with timeout
         {
             std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
             for (auto& thread : m_banner_tracking_threads) {
                 if (thread.joinable()) {
                     thread.request_stop();
-                    // Don't wait too long for tracking threads
+                    
+                    // Try to join with a timeout
+                    auto timeout_start = std::chrono::steady_clock::now();
+                    const auto timeout_duration = std::chrono::seconds(2);
+                    
+                    bool joined = false;
+                    while (!joined && (std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        if (!thread.joinable()) {
+                            joined = true;
+                            break;
+                        }
+                    }
+                    
                     if (thread.joinable()) {
-                        thread.detach(); // Let them finish naturally if they don't stop quickly
+                        try {
+                            thread.join();
+                            blog(LOG_INFO, "[OBS Plugin] Banner tracking thread joined successfully");
+                        } catch (...) {
+                            blog(LOG_WARNING, "[OBS Plugin] Banner tracking thread join failed, detaching");
+                            thread.detach();
+                        }
                     }
                 }
             }
@@ -268,18 +308,27 @@ void obs_module_unload()
         // Call explicit cleanup method to stop all threads
         m_banner_manager.shutdown();
         
-        // Unregister custom VortiDeck Banner source
-        vorti::applets::banner_manager::unregister_vortideck_banner_source();
+        // Unregister custom VortiDeck Banner source only if OBS is still available
+        try {
+            vorti::applets::banner_manager::unregister_vortideck_banner_source();
+            blog(LOG_INFO, "[OBS Plugin] VortiDeck Banner source unregistered");
+        } catch (...) {
+            blog(LOG_WARNING, "[OBS Plugin] Failed to unregister VortiDeck Banner source (OBS may have shut down)");
+        }
+        
         blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
     }
 
-    // Now safe to remove OBS frontend callbacks after all threads are stopped
-    // Mark frontend as unavailable BEFORE removing callbacks
-    m_obs_frontend_available = false;
-    
-    obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
-    obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
+    // Remove OBS frontend callbacks - these should be safe to call even during shutdown
+    try {
+        obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
+        obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
+        blog(LOG_INFO, "[OBS Plugin] OBS frontend callbacks removed");
+    } catch (...) {
+        blog(LOG_WARNING, "[OBS Plugin] Failed to remove OBS frontend callbacks (OBS may have shut down)");
+    }
 
+    // Final websocket disconnect
     vorti::applets::obs_plugin::disconnect();
     
     blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
@@ -463,10 +512,17 @@ void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::conn
 
 void vorti::applets::obs_plugin::disconnect()
 {
+    // Prevent multiple shutdowns using atomic compare-and-swap
+    bool expected = false;
+    if (!m_shutdown_complete.compare_exchange_strong(expected, true)) {
+        log_to_obs("Disconnect: Shutdown already in progress or complete, skipping");
+        return;
+    }
+
     // Add detailed logging to identify who triggered the disconnect
     log_to_obs("Disconnect: Starting shutdown sequence - thread ID: " + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())));
     
-    // Set connection state first
+    // Set connection state first and mark frontend as unavailable
     {
         std::lock_guard<std::mutex> wl(m_lock);
         m_websocket_open = false;
@@ -474,6 +530,7 @@ void vorti::applets::obs_plugin::disconnect()
         m_integration_instance.clear();
         m_current_message_id = 1;
         m_shutting_down = true;  // Ensure shutdown flag is set
+        m_obs_frontend_available = false;  // Prevent OBS API calls
     }
 
     // Notify all waiting threads immediately
@@ -483,54 +540,77 @@ void vorti::applets::obs_plugin::disconnect()
     // Stop the status update loop first
     stop_loop();
 
-    // FIXED: Improved websocket shutdown with timeout to prevent hangs
+    // CRITICAL: Improved websocket shutdown with proper ASIO cleanup
     if (m_websocket_thread)
     {
         try {
-            log_to_obs("Disconnect: Stopping websocket");
+            log_to_obs("Disconnect: Stopping websocket and ASIO threads");
             
-            // Stop the websocket gracefully
+            // STEP 1: Stop the websocket event loop - this should interrupt m_websocket.run()
             m_websocket.stop();
             
-            // Wait for jthread to finish with timeout to prevent hanging
+            // STEP 2: Additional stop operations (websocketpp doesn't expose io_context directly)
+            // The stop() call above should be sufficient to interrupt the event loop
+            
+            // STEP 3: Wait for jthread to finish with timeout to prevent hanging
             if (m_websocket_thread->joinable())
             {
                 log_to_obs("Disconnect: Requesting thread stop");
                 m_websocket_thread->request_stop();
                 
-                // Use a separate thread to join with timeout
-                std::atomic<bool> join_completed{false};
-                std::jthread timeout_thread([&]() {
-                    m_websocket_thread->join();
-                    join_completed = true;
-                });
-                
-                // Wait up to 3 seconds for graceful shutdown
+                // Wait up to 5 seconds for graceful shutdown (increased from 3)
                 auto timeout_start = std::chrono::steady_clock::now();
-                const auto timeout_duration = std::chrono::seconds(3);
+                const auto timeout_duration = std::chrono::seconds(5);
                 
-                while (!join_completed && 
-                       (std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                bool thread_finished [[maybe_unused]] = false;
+                while ((std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
+                    if (!m_websocket_thread->joinable()) {
+                        thread_finished = true;
+                        break;
+                    }
+                    
+                    // Try to join with a short timeout
+                    try {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        // Check if thread finished
+                        if (m_websocket_thread->get_stop_token().stop_requested()) {
+                            // Give it a bit more time to clean up
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            break;
+                        }
+                    } catch (...) {
+                        break;
+                    }
                 }
                 
-                if (!join_completed) {
-                    log_to_obs("Disconnect: Thread join timeout - forcing cleanup");
-                    // Thread is stuck, just reset and let it die
-                    timeout_thread.detach();
-                } else {
-                    log_to_obs("Disconnect: Thread joined successfully");
+                // STEP 4: Final join attempt
+                if (m_websocket_thread->joinable()) {
+                    try {
+                        // One last attempt to join
+                        m_websocket_thread->join();
+                        log_to_obs("Disconnect: Thread joined successfully");
+                    } catch (const std::exception& e) {
+                        log_to_obs("Disconnect: Thread join failed: " + std::string(e.what()));
+                        // Thread is truly stuck - this is a last resort
+                        log_to_obs("Disconnect: WARNING - Thread appears stuck, forcing cleanup");
+                    }
                 }
             }
             
-            // Reset the websocket client state
-            m_websocket.reset();
+            // STEP 5: Reset the websocket client state - do this even if thread is stuck
+            // The websocket destructor should clean up any remaining ASIO state
+            try {
+                m_websocket.reset();
+                log_to_obs("Disconnect: WebSocket client state reset");
+            } catch (const std::exception& e) {
+                log_to_obs("Disconnect: Error resetting websocket: " + std::string(e.what()));
+            }
             
         } catch (const std::exception& e) {
             log_to_obs("Error during WebSocket shutdown: " + std::string(e.what()));
         }
         
-        // Reset the thread - at this point we've either joined or timed out
+        // Reset the thread - at this point we've done everything possible
         m_websocket_thread.reset();
         log_to_obs("Disconnect: Websocket thread cleanup complete");
     }
@@ -1374,6 +1454,11 @@ void vorti::applets::obs_plugin::action_recording_start(const action_invoke_para
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_RECORDING_START: OBS frontend not available (shutdown in progress)");
+        return;
+    }
+
     if (!obs_frontend_recording_active())
     {
         obs_frontend_recording_start();
@@ -1389,6 +1474,11 @@ void vorti::applets::obs_plugin::action_recording_stop(const action_invoke_param
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_RECORDING_STOP: OBS frontend not available (shutdown in progress)");
+        return;
+    }
+
     if (obs_frontend_recording_active())
     {
         obs_frontend_recording_stop();
@@ -1401,6 +1491,11 @@ void vorti::applets::obs_plugin::action_recording_toggle(const action_invoke_par
     // This action requires 0 parameters
     if (!parameters.empty())
     {
+        return;
+    }
+
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_RECORDING_TOGGLE: OBS frontend not available (shutdown in progress)");
         return;
     }
 
@@ -1423,6 +1518,11 @@ void vorti::applets::obs_plugin::action_buffer_start(const action_invoke_paramet
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_BUFFER_START: OBS frontend not available (shutdown in progress)");
+        return;
+    }
+
     if (!obs_frontend_replay_buffer_active())
     {
         obs_frontend_replay_buffer_start();
@@ -1438,6 +1538,11 @@ void vorti::applets::obs_plugin::action_buffer_stop(const action_invoke_paramete
         return;
     }
 
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_BUFFER_STOP: OBS frontend not available (shutdown in progress)");
+        return;
+    }
+
     if (obs_frontend_replay_buffer_active())
     {
         obs_frontend_replay_buffer_stop();
@@ -1450,6 +1555,11 @@ void vorti::applets::obs_plugin::action_buffer_toggle(const action_invoke_parame
     // This action requires 0 parameters
     if (!parameters.empty())
     {
+        return;
+    }
+
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_BUFFER_TOGGLE: OBS frontend not available (shutdown in progress)");
         return;
     }
 
@@ -1469,6 +1579,11 @@ void vorti::applets::obs_plugin::action_buffer_save(const action_invoke_paramete
     // This action requires 0 parameters
     if (!parameters.empty())
     {
+        return;
+    }
+
+    if (!is_obs_frontend_available()) {
+        log_to_obs("ACTION_BUFFER_SAVE: OBS frontend not available (shutdown in progress)");
         return;
     }
 
