@@ -2592,7 +2592,7 @@ void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parame
             // Give a moment for the toggle to complete, then ensure protection is active
             {
                 std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
-                m_banner_tracking_threads.emplace_back([this]() {
+                m_banner_tracking_threads.emplace_back([]() {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     if (!m_banner_manager_shutdown.load()) {
                         log_to_obs("ACTION_BANNER_TOGGLE: FREE USER - Ensuring protection system is active");
@@ -2795,7 +2795,7 @@ void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_para
                 if (!queue_mode) {
                     // Use managed thread instead of detached to prevent use-after-free
                     std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
-                    m_banner_tracking_threads.emplace_back([this, ad_id, planned_duration_ms]() {
+                    m_banner_tracking_threads.emplace_back([ad_id, planned_duration_ms]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(planned_duration_ms));
                         // Check if banner manager is still valid before calling
                         if (!m_banner_manager_shutdown.load()) {

@@ -73,8 +73,34 @@ elseif(APPLE)
         SUFFIX ""
     )
 else()
-    # This will be used for Linux and others
-    add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
+    # This will be used for Linux and others  
+    # Try to find OBS development files first
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBOBS QUIET libobs)
+    endif()
+    
+    if(LIBOBS_FOUND)
+        # Use pkg-config found libraries
+        set(LIBS ${LIBOBS_LIBRARIES})
+        add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
+        target_include_directories(vorti_applets_obs_plugin PRIVATE ${LIBOBS_INCLUDE_DIRS})
+        target_compile_options(vorti_applets_obs_plugin PRIVATE ${LIBOBS_CFLAGS_OTHER})
+    else()
+        # Fallback: look for system libraries manually
+        find_library(OBS_LIB NAMES obs libobs PATHS /usr/lib /usr/lib/x86_64-linux-gnu)
+        find_path(OBS_INCLUDE_DIR NAMES obs/obs.h PATHS /usr/include)
+        
+        if(OBS_LIB AND OBS_INCLUDE_DIR)
+            set(LIBS ${OBS_LIB})
+            add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
+            target_include_directories(vorti_applets_obs_plugin PRIVATE ${OBS_INCLUDE_DIR})
+        else()
+            # Build without linking to OBS libraries (plugin will use runtime linking)
+            message(WARNING "OBS development libraries not found. Building without explicit linking.")
+            add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
+        endif()
+    endif()
 endif()
 
 get_filename_component(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
