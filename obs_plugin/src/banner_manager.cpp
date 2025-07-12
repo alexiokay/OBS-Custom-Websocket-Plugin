@@ -348,6 +348,11 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
     
+    // CRITICAL: Skip if shutting down
+    if (!manager->is_obs_safe_to_call()) {
+        return;  // Don't process signals during shutdown
+    }
+    
     // CRITICAL: Skip if intentional hide is in progress
     if (manager->m_intentional_hide_in_progress.load()) {
         return;  // Don't interfere with intentional hide operations
@@ -413,6 +418,11 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
     
+    // CRITICAL: Skip if shutting down
+    if (!manager->is_obs_safe_to_call()) {
+        return;  // Don't process signals during shutdown
+    }
+    
     // CRITICAL: Skip if intentional hide is in progress
     if (manager->m_intentional_hide_in_progress.load()) {
         return;  // Don't interfere with intentional hide operations
@@ -473,6 +483,11 @@ void banner_manager::on_item_transform(void* data, calldata_t* calldata)
     
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
+    
+    // CRITICAL: Skip if shutting down
+    if (!manager->is_obs_safe_to_call()) {
+        return;  // Don't process signals during shutdown
+    }
     
     // CRITICAL: Skip if we're currently correcting position (prevents infinite loop)
     if (manager->m_correcting_position.load()) {
@@ -558,6 +573,12 @@ void banner_manager::cleanup_for_scene_collection_change()
 
 void banner_manager::show_banner(bool enable_duration_timer)
 {
+    // CRITICAL: Don't show banner during shutdown
+    if (!is_obs_safe_to_call()) {
+        log_message("SHOW_BANNER: Skipping banner display - shutting down");
+        return;
+    }
+    
     log_message("SHOW_BANNER: Starting banner display process...");
     
     log_message("SHOW_BANNER: User type: " + PremiumStatusHandler::get_user_type_string(this));
@@ -665,6 +686,12 @@ void banner_manager::show_banner(bool enable_duration_timer)
 
 void banner_manager::hide_banner()
 {
+    // CRITICAL: Don't hide banner during shutdown
+    if (!is_obs_safe_to_call()) {
+        log_message("HIDE_BANNER: Skipping banner hide - shutting down");
+        return;
+    }
+    
     log_message("HIDE_BANNER: Starting banner hide process...");
     
     // Check premium status - free users have VERY limited hiding privileges
@@ -1011,6 +1038,12 @@ void banner_manager::banner_menu_callback(void* data)
 
 void banner_manager::create_banner_source(std::string_view content_data, std::string_view content_type)
 {
+    // CRITICAL: Don't create banner sources during shutdown
+    if (!is_obs_safe_to_call()) {
+        log_message("BANNER CREATION: Skipping banner source creation - shutting down");
+        return;
+    }
+    
     log_message(std::format("BANNER CREATION: Starting banner source creation - Type: {}, Data: {}...", content_type, content_data.substr(0, 50)));
     
     // IMPROVEMENT: Check if a banner source already exists with the base name
@@ -1247,6 +1280,12 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
 void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
                                                              std::string_view custom_css, int custom_width, int custom_height, bool css_locked)
 {
+    // CRITICAL: Don't create banner sources during shutdown
+    if (!is_obs_safe_to_call()) {
+        log_message("ENHANCED BANNER CREATION: Skipping banner source creation - shutting down");
+        return;
+    }
+    
     log_message(std::format("ENHANCED BANNER CREATION: Starting banner source creation with custom params - Type: {}, Data: {}...", 
                           content_type, content_data.substr(0, 50)));
     log_message(std::format("ENHANCED BANNER CREATION: Custom CSS: {}, Dimensions: {}x{}", 
@@ -2473,6 +2512,12 @@ void banner_manager::stop_persistence_monitor()
 
 void banner_manager::enforce_banner_visibility()
 {
+    // CRITICAL: Don't enforce during shutdown
+    if (!is_obs_safe_to_call()) {
+        log_message("PERSISTENCE: Skipping enforcement - shutting down");
+        return;
+    }
+    
     // CRITICAL: Don't enforce during intentional hide operations
     if (m_intentional_hide_in_progress.load()) {
         log_message("PERSISTENCE: Skipping enforcement - intentional hide in progress");
