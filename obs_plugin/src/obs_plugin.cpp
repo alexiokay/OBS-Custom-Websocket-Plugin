@@ -79,11 +79,12 @@ bool obs_module_load()
     m_obs_frontend_available = false;
     
     // Start connection in a separate jthread to avoid blocking OBS startup
-    std::jthread([]{
+    // Store the thread properly to ensure it can be joined during shutdown
+    vorti::applets::obs_plugin::m_initialization_thread.reset(new std::jthread([]{
         // Add a small delay to let OBS finish initializing
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        connect();
-    }).detach();
+        vorti::applets::obs_plugin::connect();
+    }));
 
     return true;
 }
@@ -249,89 +250,165 @@ void obs_module_unload()
         return;
     }
 
-    // Called when the module is unloaded.
-    blog(LOG_INFO, "[OBS Plugin] OBS module unloading - setting shutdown flag");
+    // PROPER SHUTDOWN: Stop OBS API access first, then join threads properly
+    blog(LOG_INFO, "[OBS Plugin] *** PROPER SHUTDOWN *** - Stopping OBS API then joining threads");
     
-    // Set shutdown flag FIRST to stop all threads immediately
-    {
-        std::lock_guard<std::mutex> wl(vorti::applets::obs_plugin::m_lock);
-        vorti::applets::obs_plugin::m_shutting_down = true;
-        vorti::applets::obs_plugin::m_obs_frontend_available = false;  // Immediately disable OBS API calls
+    // STEP 1: STOP ALL OBS API ACCESS IMMEDIATELY
+    vorti::applets::obs_plugin::m_shutting_down.store(true);
+    vorti::applets::obs_plugin::m_obs_frontend_available.store(false);
+    
+    // STEP 2: NOTIFY ALL THREADS TO STOP
+    try {
+        vorti::applets::obs_plugin::m_compressor_ready_cv.notify_all();
+        vorti::applets::obs_plugin::m_initialization_cv.notify_all();
+    } catch (...) {
+        blog(LOG_WARNING, "[OBS Plugin] Exception during thread notifications");
     }
-    
-    // Notify all waiting threads to wake up and check shutdown flag
-    vorti::applets::obs_plugin::m_compressor_ready_cv.notify_all();
-    vorti::applets::obs_plugin::m_initialization_cv.notify_all();
 
     vorti::applets::obs_plugin::uninitialize_actions();
 
-    // Cleanup banner functionality FIRST (before removing OBS callbacks)
+    // STEP 3: PROPER BANNER MANAGER SHUTDOWN
     if constexpr (BANNER_MANAGER_ENABLED) {
-        blog(LOG_INFO, "[OBS Plugin] Cleaning up banner manager...");
-        // Set shutdown flag to prevent new banner operations
+        blog(LOG_INFO, "[OBS Plugin] *** PROPER BANNER SHUTDOWN ***");
+        
+        // CRITICAL FIX: Force browser source CEF shutdown FIRST to prevent hanging
+        blog(LOG_INFO, "[OBS Plugin] FORCING browser source CEF shutdown immediately");
+        try {
+            obs_source_t* banner_source = m_banner_manager.get_banner_source();
+            if (banner_source) {
+                obs_data_t* settings = obs_data_create();
+                obs_data_set_bool(settings, "shutdown", true);  // CRITICAL: Force CEF shutdown
+                obs_source_update(banner_source, settings);
+                obs_data_release(settings);
+                blog(LOG_INFO, "[OBS Plugin] Browser source CEF shutdown forced");
+                
+                // Give CEF time to shutdown before thread cleanup
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        } catch (...) {
+            blog(LOG_WARNING, "[OBS Plugin] Exception during browser source CEF shutdown");
+        }
+        
+        // Set shutdown flag to stop OBS API access
         m_banner_manager_shutdown.store(true);
         
-        // Stop and join all banner tracking threads with timeout
-        {
+        // Properly join banner tracking threads
+        try {
             std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
+            
             for (auto& thread : m_banner_tracking_threads) {
                 if (thread.joinable()) {
+                    blog(LOG_INFO, "[OBS Plugin] Joining banner tracking thread");
                     thread.request_stop();
-                    
-                    // Try to join with a timeout
-                    auto timeout_start = std::chrono::steady_clock::now();
-                    const auto timeout_duration = std::chrono::seconds(2);
-                    
-                    bool joined = false;
-                    while (!joined && (std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        if (!thread.joinable()) {
-                            joined = true;
-                            break;
-                        }
-                    }
-                    
-                    if (thread.joinable()) {
-                        try {
-                            thread.join();
-                            blog(LOG_INFO, "[OBS Plugin] Banner tracking thread joined successfully");
-                        } catch (...) {
-                            blog(LOG_WARNING, "[OBS Plugin] Banner tracking thread join failed, detaching");
-                            thread.detach();
-                        }
+                    try {
+                        thread.join();
+                        blog(LOG_INFO, "[OBS Plugin] Banner tracking thread joined successfully");
+                    } catch (const std::exception& e) {
+                        blog(LOG_WARNING, "[OBS Plugin] Exception joining banner thread: %s", e.what());
                     }
                 }
             }
             m_banner_tracking_threads.clear();
-        }
-        
-        // Call explicit cleanup method to stop all threads
-        m_banner_manager.shutdown();
-        
-        // Unregister custom VortiDeck Banner source only if OBS is still available
-        try {
-            vorti::applets::banner_manager::unregister_vortideck_banner_source();
-            blog(LOG_INFO, "[OBS Plugin] VortiDeck Banner source unregistered");
+            blog(LOG_INFO, "[OBS Plugin] All banner threads joined properly");
         } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Failed to unregister VortiDeck Banner source (OBS may have shut down)");
+            blog(LOG_WARNING, "[OBS Plugin] Exception during banner thread shutdown");
         }
         
-        blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
+        // Shutdown banner manager (this will now join threads properly)
+        try {
+            m_banner_manager.shutdown();
+        } catch (...) {
+            blog(LOG_WARNING, "[OBS Plugin] Exception during banner manager shutdown");
+        }
+        
+        blog(LOG_INFO, "[OBS Plugin] Banner shutdown complete");
     }
 
-    // Remove OBS frontend callbacks - these should be safe to call even during shutdown
+    // STEP 4: IMMEDIATE ASIO SHUTDOWN TO PREVENT ACCESS VIOLATIONS
     try {
-        obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
-        obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
-        blog(LOG_INFO, "[OBS Plugin] OBS frontend callbacks removed");
+        blog(LOG_INFO, "[OBS Plugin] *** EMERGENCY ASIO SHUTDOWN *** - Stopping ASIO before thread cleanup");
+        
+        // CRITICAL FIX: Stop ASIO io_context FIRST to prevent access violations
+        try {
+            vorti::applets::obs_plugin::m_websocket.get_io_service().stop();
+            blog(LOG_INFO, "[OBS Plugin] ASIO io_context stopped immediately - prevents c0000005 crashes");
+        } catch (...) {
+            blog(LOG_WARNING, "[OBS Plugin] Exception stopping ASIO io_context");
+        }
+        
+        // Stop websocket immediately after ASIO
+        try {
+            vorti::applets::obs_plugin::m_websocket.stop();
+            blog(LOG_INFO, "[OBS Plugin] Websocket stopped after ASIO shutdown");
+        } catch (...) {
+            blog(LOG_WARNING, "[OBS Plugin] Exception stopping websocket");
+        }
+        
+        // NOW it's safe to handle threads since ASIO is stopped
+        blog(LOG_INFO, "[OBS Plugin] ASIO stopped - now handling thread cleanup safely");
+        
+        // Request stop on all threads
+        if (vorti::applets::obs_plugin::m_websocket_thread) {
+            if (vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
+                vorti::applets::obs_plugin::m_websocket_thread->request_stop();
+            }
+        }
+        
+        if (vorti::applets::obs_plugin::m_loop_thread.joinable()) {
+            vorti::applets::obs_plugin::m_loop_thread_running = false;
+            vorti::applets::obs_plugin::m_loop_thread.request_stop();
+        }
+        
+        // Join initialization thread first if it exists
+        if (vorti::applets::obs_plugin::m_initialization_thread) {
+            if (vorti::applets::obs_plugin::m_initialization_thread->joinable()) {
+                try {
+                    blog(LOG_INFO, "[OBS Plugin] Joining initialization thread");
+                    vorti::applets::obs_plugin::m_initialization_thread->join();
+                    blog(LOG_INFO, "[OBS Plugin] Initialization thread joined successfully");
+                } catch (const std::exception& e) {
+                    blog(LOG_WARNING, "[OBS Plugin] Exception joining initialization thread: %s", e.what());
+                }
+            }
+            vorti::applets::obs_plugin::m_initialization_thread.reset();
+        }
+        
+        // Join websocket thread properly
+        if (vorti::applets::obs_plugin::m_websocket_thread) {
+            if (vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
+                try {
+                    blog(LOG_INFO, "[OBS Plugin] Joining websocket thread");
+                    vorti::applets::obs_plugin::m_websocket_thread->join();
+                    blog(LOG_INFO, "[OBS Plugin] Websocket thread joined successfully");
+                } catch (const std::exception& e) {
+                    blog(LOG_WARNING, "[OBS Plugin] Exception joining websocket thread: %s", e.what());
+                }
+            }
+            vorti::applets::obs_plugin::m_websocket_thread.reset();
+        }
+        
+        // Join loop thread properly
+        if (vorti::applets::obs_plugin::m_loop_thread.joinable()) {
+            try {
+                blog(LOG_INFO, "[OBS Plugin] Joining loop thread");
+                vorti::applets::obs_plugin::m_loop_thread.join();
+                blog(LOG_INFO, "[OBS Plugin] Loop thread joined successfully");
+            } catch (const std::exception& e) {
+                blog(LOG_WARNING, "[OBS Plugin] Exception joining loop thread: %s", e.what());
+            }
+        }
+        
+        blog(LOG_INFO, "[OBS Plugin] Thread cleanup complete after ASIO shutdown");
     } catch (...) {
-        blog(LOG_WARNING, "[OBS Plugin] Failed to remove OBS frontend callbacks (OBS may have shut down)");
+        blog(LOG_WARNING, "[OBS Plugin] Exception during ASIO/thread shutdown");
     }
 
-    // Final websocket disconnect
-    vorti::applets::obs_plugin::disconnect();
+    // STEP 5: SKIP OBS CALLBACK REMOVAL during shutdown (can hang)
+    // Don't call obs_frontend_remove_* during shutdown
     
-    blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
+    // Mark shutdown as complete
+    vorti::applets::obs_plugin::m_shutdown_complete.store(true);
+    blog(LOG_INFO, "[OBS Plugin] *** PROPER SHUTDOWN COMPLETE *** - All threads joined safely");
 }
 
 bool vorti::applets::obs_plugin::is_obs_frontend_available()
@@ -540,77 +617,57 @@ void vorti::applets::obs_plugin::disconnect()
     // Stop the status update loop first
     stop_loop();
 
-    // CRITICAL: Improved websocket shutdown with proper ASIO cleanup
+    // *** PROPER WEBSOCKET SHUTDOWN ***
     if (m_websocket_thread)
     {
         try {
-            log_to_obs("Disconnect: Stopping websocket and ASIO threads");
+            log_to_obs("Disconnect: Starting proper websocket thread shutdown");
             
-            // STEP 1: Stop the websocket event loop - this should interrupt m_websocket.run()
-            m_websocket.stop();
+            // STEP 1: Stop ASIO io_context first to prevent blocking operations
+            try {
+                m_websocket.get_io_service().stop();
+                log_to_obs("Disconnect: ASIO io_context stopped");
+            } catch (...) {
+                log_to_obs("Disconnect: Exception stopping ASIO io_context");
+            }
             
-            // STEP 2: Additional stop operations (websocketpp doesn't expose io_context directly)
-            // The stop() call above should be sufficient to interrupt the event loop
-            
-            // STEP 3: Wait for jthread to finish with timeout to prevent hanging
+            // STEP 2: Request thread stop
             if (m_websocket_thread->joinable())
             {
-                log_to_obs("Disconnect: Requesting thread stop");
+                log_to_obs("Disconnect: Requesting websocket thread stop");
                 m_websocket_thread->request_stop();
                 
-                // Wait up to 5 seconds for graceful shutdown (increased from 3)
-                auto timeout_start = std::chrono::steady_clock::now();
-                const auto timeout_duration = std::chrono::seconds(5);
-                
-                bool thread_finished [[maybe_unused]] = false;
-                while ((std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
-                    if (!m_websocket_thread->joinable()) {
-                        thread_finished = true;
-                        break;
-                    }
-                    
-                    // Try to join with a short timeout
-                    try {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        // Check if thread finished
-                        if (m_websocket_thread->get_stop_token().stop_requested()) {
-                            // Give it a bit more time to clean up
-                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                            break;
-                        }
-                    } catch (...) {
-                        break;
-                    }
-                }
-                
-                // STEP 4: Final join attempt
-                if (m_websocket_thread->joinable()) {
-                    try {
-                        // One last attempt to join
-                        m_websocket_thread->join();
-                        log_to_obs("Disconnect: Thread joined successfully");
-                    } catch (const std::exception& e) {
-                        log_to_obs("Disconnect: Thread join failed: " + std::string(e.what()));
-                        // Thread is truly stuck - this is a last resort
-                        log_to_obs("Disconnect: WARNING - Thread appears stuck, forcing cleanup");
-                    }
+                // STEP 3: Properly join the thread now that ASIO is stopped
+                try {
+                    log_to_obs("Disconnect: Joining websocket thread (ASIO stopped - safe to join)");
+                    m_websocket_thread->join();
+                    log_to_obs("Disconnect: Websocket thread joined successfully");
+                } catch (const std::exception& e) {
+                    log_to_obs("Disconnect: Exception joining websocket thread: " + std::string(e.what()));
                 }
             }
             
-            // STEP 5: Reset the websocket client state - do this even if thread is stuck
-            // The websocket destructor should clean up any remaining ASIO state
+            // STEP 4: Stop websocket after thread is joined
+            try {
+                m_websocket.stop();
+                log_to_obs("Disconnect: WebSocket stopped");
+            } catch (...) {
+                log_to_obs("Disconnect: Exception stopping websocket");
+            }
+            
+            // STEP 5: Reset websocket state
             try {
                 m_websocket.reset();
                 log_to_obs("Disconnect: WebSocket client state reset");
             } catch (const std::exception& e) {
-                log_to_obs("Disconnect: Error resetting websocket: " + std::string(e.what()));
+                log_to_obs("Disconnect: Error resetting websocket (continuing): " + std::string(e.what()));
             }
             
         } catch (const std::exception& e) {
-            log_to_obs("Error during WebSocket shutdown: " + std::string(e.what()));
+            log_to_obs("Error during WebSocket shutdown (continuing): " + std::string(e.what()));
         }
         
-        // Reset the thread - at this point we've done everything possible
+        // Reset the thread pointer
         m_websocket_thread.reset();
         log_to_obs("Disconnect: Websocket thread cleanup complete");
     }
@@ -661,13 +718,47 @@ void vorti::applets::obs_plugin::_run_forever()
             m_websocket.connect(connection);
             
             try {
-                // Run websocket with periodic shutdown checks
-                m_websocket.run();
+                // *** CRITICAL FIX: NON-BLOCKING WEBSOCKET OPERATION ***
+                // Instead of calling m_websocket.run() which blocks indefinitely,
+                // use run_one() with periodic shutdown checks
+                while (!m_shutting_down) {
+                    try {
+                        // Process one event, with timeout
+                        std::size_t handlers_run = m_websocket.run_one();
+                        
+                        // If no handlers were run, add a small delay to prevent busy-waiting
+                        if (handlers_run == 0) {
+                            // Check shutdown status before sleeping
+                            if (m_shutting_down) {
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        }
+                        
+                        // Check stop conditions
+                        if (m_shutting_down) {
+                            log_to_obs("WebSocket loop: Stop requested, exiting");
+                            break;
+                        }
+                        
+                        // Check connection state
+                        {
+                            std::lock_guard<std::mutex> wl(m_lock);
+                            if (!m_websocket_open && !m_shutting_down) {
+                                // Connection lost, break to reconnect
+                                break;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        log_to_obs("Exception in WebSocket run_one: " + std::string(e.what()));
+                        break; // Exit inner loop to reconnect
+                    }
+                }
             } catch (const std::exception& e) {
-                log_to_obs("Exception in WebSocket run: " + std::string(e.what()));
+                log_to_obs("Exception in WebSocket run loop: " + std::string(e.what()));
             }
             
-            // Additional shutdown check after websocket.run() exits
+            // Additional shutdown check after websocket loop exits
             if (m_shutting_down) {
                 log_to_obs("WebSocket run exited due to shutdown");
                 break;
@@ -2459,20 +2550,30 @@ void vorti::applets::obs_plugin::start_loop()
 
 void vorti::applets::obs_plugin::stop_loop()
 {
-    bool is_joining = false;
+    std::lock_guard<std::mutex> wlock(m_thread_lock);
+    
+    if (m_loop_thread.joinable())
     {
-        if (m_loop_thread.joinable())
-        {
-            std::lock_guard<std::mutex> wlock(m_thread_lock);
-            m_loop_thread_running = false;
-            is_joining = true;
-        }
+        log_to_obs("STOP_LOOP: Requesting cooperative thread shutdown...");
+        
+        // Set the running flag to false to signal the thread to exit
+        m_loop_thread_running = false;
+        
+        // Request stop for cooperative cancellation
+        m_loop_thread.request_stop();
+        
+        // Release the lock before joining to avoid deadlocks
     }
-
-    // Stop the jthread
-    if (is_joining)
-    {
-        m_loop_thread.join();
+    
+    // Join outside the lock to prevent deadlocks
+    if (m_loop_thread.joinable()) {
+        try {
+            log_to_obs("STOP_LOOP: Joining loop thread...");
+            m_loop_thread.join();
+            log_to_obs("STOP_LOOP: Loop thread joined successfully");
+        } catch (const std::exception& e) {
+            log_to_obs("STOP_LOOP: Exception during thread join: " + std::string(e.what()));
+        }
     }
 }
 

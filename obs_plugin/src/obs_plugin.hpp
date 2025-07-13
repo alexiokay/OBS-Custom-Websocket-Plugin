@@ -240,6 +240,7 @@ namespace vorti
             const std::string m_subprotocol = "json";
             const websocketpp::frame::opcode::value m_subprotocol_opcode = websocketpp::frame::opcode::text;
             std::unique_ptr<std::jthread> m_websocket_thread;
+            std::unique_ptr<std::jthread> m_initialization_thread;
             uint16_t m_current_port = 9001;
 
             uint32_t m_current_message_id = 1;
