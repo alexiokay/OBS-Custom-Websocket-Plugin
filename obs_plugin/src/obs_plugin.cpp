@@ -244,171 +244,50 @@ void obs_module_post_load()
 
 void obs_module_unload()
 {
-    // Check if shutdown is already complete to prevent double unload
+    // Check if shutdown is already complete
     if (vorti::applets::obs_plugin::m_shutdown_complete.load()) {
-        blog(LOG_INFO, "[OBS Plugin] Module unload called but shutdown already complete");
         return;
     }
 
-    // PROPER SHUTDOWN: Stop OBS API access first, then join threads properly
-    blog(LOG_INFO, "[OBS Plugin] *** PROPER SHUTDOWN *** - Stopping OBS API then joining threads");
+    blog(LOG_INFO, "[OBS Plugin] FAST SHUTDOWN - Detaching all threads immediately");
     
-    // STEP 1: STOP ALL OBS API ACCESS IMMEDIATELY
+    // Set shutdown flags
     vorti::applets::obs_plugin::m_shutting_down.store(true);
     vorti::applets::obs_plugin::m_obs_frontend_available.store(false);
     
-    // STEP 2: NOTIFY ALL THREADS TO STOP
+    // Stop ASIO immediately 
     try {
-        vorti::applets::obs_plugin::m_compressor_ready_cv.notify_all();
-        vorti::applets::obs_plugin::m_initialization_cv.notify_all();
-    } catch (...) {
-        blog(LOG_WARNING, "[OBS Plugin] Exception during thread notifications");
+        vorti::applets::obs_plugin::m_websocket.get_io_service().stop();
+        vorti::applets::obs_plugin::m_websocket.stop();
+    } catch (...) {}
+    
+    // Detach all threads immediately - no waiting
+    if (vorti::applets::obs_plugin::m_websocket_thread && vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
+        vorti::applets::obs_plugin::m_websocket_thread->detach();
     }
-
-    vorti::applets::obs_plugin::uninitialize_actions();
-
-    // STEP 3: PROPER BANNER MANAGER SHUTDOWN
+    if (vorti::applets::obs_plugin::m_loop_thread.joinable()) {
+        vorti::applets::obs_plugin::m_loop_thread.detach();
+    }
+    if (vorti::applets::obs_plugin::m_initialization_thread && vorti::applets::obs_plugin::m_initialization_thread->joinable()) {
+        vorti::applets::obs_plugin::m_initialization_thread->detach();
+    }
+    
+    // Banner manager emergency shutdown
     if constexpr (BANNER_MANAGER_ENABLED) {
-        blog(LOG_INFO, "[OBS Plugin] *** PROPER BANNER SHUTDOWN ***");
-        
-        // CRITICAL FIX: Force browser source CEF shutdown FIRST to prevent hanging
-        blog(LOG_INFO, "[OBS Plugin] FORCING browser source CEF shutdown immediately");
-        try {
-            obs_source_t* banner_source = m_banner_manager.get_banner_source();
-            if (banner_source) {
-                obs_data_t* settings = obs_data_create();
-                obs_data_set_bool(settings, "shutdown", true);  // CRITICAL: Force CEF shutdown
-                obs_source_update(banner_source, settings);
-                obs_data_release(settings);
-                blog(LOG_INFO, "[OBS Plugin] Browser source CEF shutdown forced");
-                
-                // Give CEF time to shutdown before thread cleanup
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Exception during browser source CEF shutdown");
-        }
-        
-        // Set shutdown flag to stop OBS API access
         m_banner_manager_shutdown.store(true);
-        
-        // Properly join banner tracking threads
         try {
             std::lock_guard<std::mutex> lock(m_banner_threads_mutex);
-            
             for (auto& thread : m_banner_tracking_threads) {
                 if (thread.joinable()) {
-                    blog(LOG_INFO, "[OBS Plugin] Joining banner tracking thread");
-                    thread.request_stop();
-                    try {
-                        thread.join();
-                        blog(LOG_INFO, "[OBS Plugin] Banner tracking thread joined successfully");
-                    } catch (const std::exception& e) {
-                        blog(LOG_WARNING, "[OBS Plugin] Exception joining banner thread: %s", e.what());
-                    }
+                    thread.detach();
                 }
             }
             m_banner_tracking_threads.clear();
-            blog(LOG_INFO, "[OBS Plugin] All banner threads joined properly");
-        } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Exception during banner thread shutdown");
-        }
-        
-        // Shutdown banner manager (this will now join threads properly)
-        try {
-            m_banner_manager.shutdown();
-        } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Exception during banner manager shutdown");
-        }
-        
-        blog(LOG_INFO, "[OBS Plugin] Banner shutdown complete");
+        } catch (...) {}
     }
-
-    // STEP 4: IMMEDIATE ASIO SHUTDOWN TO PREVENT ACCESS VIOLATIONS
-    try {
-        blog(LOG_INFO, "[OBS Plugin] *** EMERGENCY ASIO SHUTDOWN *** - Stopping ASIO before thread cleanup");
-        
-        // CRITICAL FIX: Stop ASIO io_context FIRST to prevent access violations
-        try {
-            vorti::applets::obs_plugin::m_websocket.get_io_service().stop();
-            blog(LOG_INFO, "[OBS Plugin] ASIO io_context stopped immediately - prevents c0000005 crashes");
-        } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Exception stopping ASIO io_context");
-        }
-        
-        // Stop websocket immediately after ASIO
-        try {
-            vorti::applets::obs_plugin::m_websocket.stop();
-            blog(LOG_INFO, "[OBS Plugin] Websocket stopped after ASIO shutdown");
-        } catch (...) {
-            blog(LOG_WARNING, "[OBS Plugin] Exception stopping websocket");
-        }
-        
-        // NOW it's safe to handle threads since ASIO is stopped
-        blog(LOG_INFO, "[OBS Plugin] ASIO stopped - now handling thread cleanup safely");
-        
-        // Request stop on all threads
-        if (vorti::applets::obs_plugin::m_websocket_thread) {
-            if (vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
-                vorti::applets::obs_plugin::m_websocket_thread->request_stop();
-            }
-        }
-        
-        if (vorti::applets::obs_plugin::m_loop_thread.joinable()) {
-            vorti::applets::obs_plugin::m_loop_thread_running = false;
-            vorti::applets::obs_plugin::m_loop_thread.request_stop();
-        }
-        
-        // Join initialization thread first if it exists
-        if (vorti::applets::obs_plugin::m_initialization_thread) {
-            if (vorti::applets::obs_plugin::m_initialization_thread->joinable()) {
-                try {
-                    blog(LOG_INFO, "[OBS Plugin] Joining initialization thread");
-                    vorti::applets::obs_plugin::m_initialization_thread->join();
-                    blog(LOG_INFO, "[OBS Plugin] Initialization thread joined successfully");
-                } catch (const std::exception& e) {
-                    blog(LOG_WARNING, "[OBS Plugin] Exception joining initialization thread: %s", e.what());
-                }
-            }
-            vorti::applets::obs_plugin::m_initialization_thread.reset();
-        }
-        
-        // Join websocket thread properly
-        if (vorti::applets::obs_plugin::m_websocket_thread) {
-            if (vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
-                try {
-                    blog(LOG_INFO, "[OBS Plugin] Joining websocket thread");
-                    vorti::applets::obs_plugin::m_websocket_thread->join();
-                    blog(LOG_INFO, "[OBS Plugin] Websocket thread joined successfully");
-                } catch (const std::exception& e) {
-                    blog(LOG_WARNING, "[OBS Plugin] Exception joining websocket thread: %s", e.what());
-                }
-            }
-            vorti::applets::obs_plugin::m_websocket_thread.reset();
-        }
-        
-        // Join loop thread properly
-        if (vorti::applets::obs_plugin::m_loop_thread.joinable()) {
-            try {
-                blog(LOG_INFO, "[OBS Plugin] Joining loop thread");
-                vorti::applets::obs_plugin::m_loop_thread.join();
-                blog(LOG_INFO, "[OBS Plugin] Loop thread joined successfully");
-            } catch (const std::exception& e) {
-                blog(LOG_WARNING, "[OBS Plugin] Exception joining loop thread: %s", e.what());
-            }
-        }
-        
-        blog(LOG_INFO, "[OBS Plugin] Thread cleanup complete after ASIO shutdown");
-    } catch (...) {
-        blog(LOG_WARNING, "[OBS Plugin] Exception during ASIO/thread shutdown");
-    }
-
-    // STEP 5: SKIP OBS CALLBACK REMOVAL during shutdown (can hang)
-    // Don't call obs_frontend_remove_* during shutdown
     
-    // Mark shutdown as complete
     vorti::applets::obs_plugin::m_shutdown_complete.store(true);
-    blog(LOG_INFO, "[OBS Plugin] *** PROPER SHUTDOWN COMPLETE *** - All threads joined safely");
+    blog(LOG_INFO, "[OBS Plugin] FAST SHUTDOWN COMPLETE");
 }
 
 bool vorti::applets::obs_plugin::is_obs_frontend_available()

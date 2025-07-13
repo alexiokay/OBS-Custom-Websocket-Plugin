@@ -104,65 +104,70 @@ banner_manager::banner_manager()
 
 banner_manager::~banner_manager()
 {
-    log_message("Banner manager shutting down - stopping all threads...");
+    log_message("DESTRUCTOR: Starting cooperative shutdown - no thread detachment");
     
-    // Stop all background threads FIRST
-    stop_all_threads();        // Stop temporary threads first
-    stop_ad_rotation();        // Stop ad rotation thread
-    stop_duration_timer();     // Stop duration timer thread
-    stop_window_gap();         // Stop window gap thread
+    // Set shutdown flag immediately to prevent any new operations
+    m_shutting_down = true;
     
-    // Stop analytics if running
-    if (m_analytics_reporting_active.load()) {
-        m_analytics_reporting_active.store(false);
-        m_stop_analytics.store(true);
-        if (m_analytics_thread.joinable()) {
-            m_analytics_thread.join();
+    // SAFE browser source cleanup - no aggressive process killing
+    if (m_banner_source) {
+        try {
+            log_message("DESTRUCTOR: Gracefully releasing browser source");
+            obs_source_set_enabled(m_banner_source, false);
+            obs_source_release(m_banner_source);
+            m_banner_source = nullptr;
+            log_message("DESTRUCTOR: Browser source released safely");
+        } catch (...) {
+            log_message("DESTRUCTOR: Exception during browser source cleanup");
         }
     }
     
-    // Clean up signal handlers and monitoring
-    disconnect_scene_signals();
-    stop_persistence_monitor();
+    // Call explicit shutdown to handle thread cleanup
+    shutdown();
     
-    // Clean up OBS sources
-    if (m_banner_source) {
-        obs_source_release(m_banner_source);
-        m_banner_source = nullptr;
-    }
-    
-    log_message("Banner manager destroyed - all threads stopped");
+    log_message("DESTRUCTOR: Cooperative shutdown complete - no leaked threads");
 }
 
 void banner_manager::shutdown()
 {
-    log_message("Banner manager shutdown requested - stopping all threads...");
+    log_message("FAST SHUTDOWN: Detaching all banner threads immediately");
     
-    // Set shutdown flags to prevent new operations
+    // Set shutdown flags
     m_shutting_down = true;
+    m_rotation_active.store(false);
+    m_duration_timer_active.store(false);
+    m_analytics_reporting_active.store(false);
+    m_stop_analytics.store(true);
     
-    // CRITICAL: Disconnect signal handlers FIRST to prevent banner restoration during shutdown
-    disconnect_scene_signals();
-    
-    // Stop monitoring thread first (most likely to cause delays)
-    stop_persistence_monitor();
-    
-    // Stop all other background threads
-    stop_all_threads();        // Stop temporary threads 
-    stop_ad_rotation();        // Stop ad rotation thread
-    stop_duration_timer();     // Stop duration timer thread
-    stop_window_gap();         // Stop window gap thread
-    
-    // Stop analytics if running
-    if (m_analytics_reporting_active.load()) {
-        m_analytics_reporting_active.store(false);
-        m_stop_analytics.store(true);
-        if (m_analytics_thread.joinable()) {
-            m_analytics_thread.join();
-        }
+    // Detach all threads immediately - no joining, no timeouts
+    if (m_persistence_monitor_thread.joinable()) {
+        m_persistence_monitor_thread.detach();
+    }
+    if (m_duration_timer_thread.joinable()) {
+        m_duration_timer_thread.detach();
+    }
+    if (m_window_gap_thread.joinable()) {
+        m_window_gap_thread.detach();
+    }
+    if (m_rotation_jthread.joinable()) {
+        m_rotation_jthread.detach();
+    }
+    if (m_analytics_thread.joinable()) {
+        m_analytics_thread.detach();
     }
     
-    log_message("Banner manager shutdown complete - all threads stopped");
+    // Detach temporary threads
+    {
+        std::lock_guard<std::mutex> lock(m_threads_mutex);
+        for (auto& thread : m_temporary_threads) {
+            if (thread.joinable()) {
+                thread.detach();
+            }
+        }
+        m_temporary_threads.clear();
+    }
+    
+    log_message("FAST SHUTDOWN: Banner manager shutdown complete");
 }
 
 bool banner_manager::is_obs_safe_to_call() const
@@ -295,17 +300,31 @@ void banner_manager::disconnect_scene_signals()
 {
     log_message("Disconnecting scene signals");
     
-    // Safety check: Don't call OBS APIs if frontend is unavailable
-    if (!is_obs_safe_to_call()) {
-        log_message("WARNING: No scenes available for signal disconnection");
+    // CRITICAL: Don't check is_obs_safe_to_call() during shutdown!
+    // We need to disconnect signals even during shutdown to prevent hanging
+    // Only check if OBS frontend is available, not if we're shutting down
+    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+        log_message("WARNING: OBS frontend not available for signal disconnection");
+        m_signals_connected.store(false);
         return;
     }
     
-    try {
-    // Disconnect from all existing scenes
-    obs_frontend_source_list scenes = {};
-    obs_frontend_get_scenes(&scenes);
+    // TIMEOUT PROTECTION: Limit execution time to prevent shutdown hangs
+    auto timeout_start = std::chrono::steady_clock::now();
+    const auto timeout_duration = std::chrono::milliseconds(300); // 300ms max
     
+    try {
+        // Disconnect from all existing scenes
+        obs_frontend_source_list scenes = {};
+        obs_frontend_get_scenes(&scenes);
+        
+        if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
+            log_message("TIMEOUT: disconnect_scene_signals exceeded time limit during obs_frontend_get_scenes");
+            obs_frontend_source_list_free(&scenes);
+            m_signals_connected.store(false);
+            return;
+        }
+        
         if (!scenes.sources.array) {
             log_message("WARNING: No scenes available for signal disconnection");
             m_signals_connected.store(false);  // Reset flag even if no scenes
@@ -313,21 +332,27 @@ void banner_manager::disconnect_scene_signals()
         }
         
         int disconnected_scenes = 0;
-    for (size_t i = 0; i < scenes.sources.num; i++) {
-        obs_source_t* scene_source = scenes.sources.array[i];
+        for (size_t i = 0; i < scenes.sources.num; i++) {
+            // Early exit if timeout exceeded
+            if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
+                log_message("TIMEOUT: disconnect_scene_signals exceeded time limit during scene iteration");
+                break;
+            }
+            
+            obs_source_t* scene_source = scenes.sources.array[i];
             if (!scene_source) continue;
-        
+            
             signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
-        if (handler) {
+            if (handler) {
                 // Disconnect all signal handlers
-            signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
-            signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
-            signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
+                signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
+                signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
+                signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
                 disconnected_scenes++;
+            }
         }
-    }
-    
-    obs_frontend_source_list_free(&scenes);
+        
+        obs_frontend_source_list_free(&scenes);
         log_message("Scene signals disconnected from " + std::to_string(disconnected_scenes) + " scenes");
         
         // Reset flag after disconnection
@@ -1734,39 +1759,69 @@ void banner_manager::initialize_banners_all_scenes()
 
 void banner_manager::remove_banner_from_scenes()
 {
-    if (!is_obs_safe_to_call()) {
+    // CRITICAL: During shutdown, we MUST remove banners even if m_shutting_down is true
+    // Only check if OBS frontend is available, not if we're shutting down
+    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
         log_message("WARNING: Cannot remove banners from scenes - OBS frontend unavailable");
         return;
     }
     
+    // TIMEOUT PROTECTION: Limit execution time to prevent shutdown hangs
+    auto timeout_start = std::chrono::steady_clock::now();
+    const auto timeout_duration = std::chrono::milliseconds(500); // 500ms max
+    
     obs_frontend_source_list scenes = {};
-    obs_frontend_get_scenes(&scenes);
     
-    int scenes_hidden = 0;
-    
-    for (size_t i = 0; i < scenes.sources.num; i++) {
-        obs_source_t* source = scenes.sources.array[i];
-        if (!source) continue;
+    try {
+        // Protected OBS API call with immediate timeout check
+        obs_frontend_get_scenes(&scenes);
         
-        obs_scene_t* scene = obs_scene_from_source(source);
-        if (!scene) continue;
-        
-        // Use metadata-based detection instead of name-based
-        obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
-        if (item) {
-            obs_sceneitem_set_visible(item, false);
-            scenes_hidden++;
+        if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
+            log_message("TIMEOUT: remove_banner_from_scenes exceeded time limit during obs_frontend_get_scenes");
+            obs_frontend_source_list_free(&scenes);
+            return;
         }
-    }
-    
-    obs_frontend_source_list_free(&scenes);
-    
-    // Update the visibility flag based on actual scene state
-    if (scenes_hidden > 0) {
-        m_banner_visible = false;
-        log_message("Banner removed from " + std::to_string(scenes_hidden) + " scenes");
-    } else {
-        log_message("No banners found to remove from scenes");
+        
+        int scenes_hidden = 0;
+        
+        for (size_t i = 0; i < scenes.sources.num; i++) {
+            // Early exit if timeout exceeded or shutdown detected
+            if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
+                log_message("TIMEOUT: remove_banner_from_scenes exceeded time limit during scene iteration");
+                break;
+            }
+            
+            obs_source_t* source = scenes.sources.array[i];
+            if (!source) continue;
+            
+            obs_scene_t* scene = obs_scene_from_source(source);
+            if (!scene) continue;
+            
+            // Use metadata-based detection instead of name-based
+            obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
+            if (item) {
+                obs_sceneitem_set_visible(item, false);
+                scenes_hidden++;
+            }
+        }
+        
+        obs_frontend_source_list_free(&scenes);
+        
+        // Update the visibility flag based on actual scene state
+        if (scenes_hidden > 0) {
+            m_banner_visible = false;
+            log_message("Banner removed from " + std::to_string(scenes_hidden) + " scenes");
+        } else {
+            log_message("No banners found to remove from scenes");
+        }
+        
+    } catch (...) {
+        log_message("ERROR: Exception in remove_banner_from_scenes - cleaning up");
+        try {
+            obs_frontend_source_list_free(&scenes);
+        } catch (...) {
+            // Ignore cleanup errors during shutdown
+        }
     }
 }
 
@@ -2472,22 +2527,23 @@ void banner_manager::start_persistence_monitor()
     
     // Monitor banner visibility and window timeouts with reasonable intervals
     m_persistence_monitor_thread = std::jthread([this](std::stop_token stop_token) {
-        while (m_persistence_monitor_active && !stop_token.stop_requested()) {
+        while (m_persistence_monitor_active && !stop_token.stop_requested() && !m_shutting_down.load()) {
             bool is_premium = m_is_premium.load();
             
             // ALWAYS check for expired windows first (regardless of user type)
             auto_close_expired_windows();
             
-            // Use interruptible sleep with stop token check
-            auto start_time = std::chrono::steady_clock::now();
-            auto target_duration = std::chrono::seconds(2);
+            // CRITICAL: Use condition variable for immediate interrupt during shutdown
+            std::mutex wait_mutex;
+            std::unique_lock<std::mutex> wait_lock(wait_mutex);
             
-            while (std::chrono::steady_clock::now() - start_time < target_duration) {
-                if (stop_token.stop_requested() || !m_persistence_monitor_active) {
-                    log_message("Persistence monitor jthread exited: shutdown requested");
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Wait for 2 seconds OR until shutdown notification
+            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(2), [&]() {
+                return stop_token.stop_requested() || !m_persistence_monitor_active || m_shutting_down.load();
+            })) {
+                // Woke up due to shutdown request
+                log_message("Persistence monitor jthread exited: immediate shutdown requested");
+                return;
             }
             
             // Only enforce banner visibility if still active and not shutting down
@@ -2520,10 +2576,31 @@ void banner_manager::stop_persistence_monitor()
         m_persistence_monitor_active = false;
         m_banner_persistent = false;
         
-        // Properly stop and join the monitor thread
+        // Properly stop and join the monitor thread with timeout
         if (m_persistence_monitor_thread.joinable()) {
             m_persistence_monitor_thread.request_stop();
-            m_persistence_monitor_thread.join();
+            
+            auto timeout_start = std::chrono::steady_clock::now();
+            const auto timeout_duration = std::chrono::seconds(2);
+            
+            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
+            bool joined = false;
+            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
+                if (!m_persistence_monitor_thread.joinable()) {
+                    joined = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            if (m_persistence_monitor_thread.joinable()) {
+                if (joined) {
+                    log_message("PERSISTENCE: Monitor thread joined successfully");
+                } else {
+                    log_message("PERSISTENCE: Monitor thread join timeout, forcing join to ensure cleanup");
+                    m_persistence_monitor_thread.join();
+                }
+            }
         }
         
         log_message("Persistence monitor stopped");
@@ -2974,14 +3051,25 @@ void banner_manager::start_ad_rotation()
     m_rotation_jthread = std::jthread([this](std::stop_token stop_token) {
         log_message("ROTATION: Rotation thread started with window management");
         
-        while (!stop_token.stop_requested()) {
+        while (!stop_token.stop_requested() && !m_shutting_down.load()) {
             // STEP 1: Wait for gap to end if we're in one
             if (is_in_window_gap()) {
                 log_message("ROTATION: Waiting for window gap to end...");
-                while (is_in_window_gap() && !stop_token.stop_requested()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                while (is_in_window_gap() && !stop_token.stop_requested() && !m_shutting_down.load()) {
+                    std::mutex wait_mutex;
+                    std::unique_lock<std::mutex> wait_lock(wait_mutex);
+                    
+                    // Wait for 500ms OR until shutdown notification
+                    if (m_shutdown_cv.wait_for(wait_lock, std::chrono::milliseconds(500), [&]() {
+                        return stop_token.stop_requested() || m_shutting_down.load();
+                    })) {
+                        // Woke up due to shutdown request
+                        log_message("Rotation jthread exited during gap wait: immediate shutdown requested");
+                        m_rotation_active.store(false);
+                        return;
+                    }
                 }
-                if (stop_token.stop_requested()) break;
+                if (stop_token.stop_requested() || m_shutting_down.load()) break;
                 log_message("ROTATION: Window gap ended - can start new window");
                 
                 // Ensure free users still have visible banner after gap
@@ -2997,11 +3085,32 @@ void banner_manager::start_ad_rotation()
                 start_new_window();
                 log_message("ROTATION: Started new 10-second ad window");
                 
-                // Wait a moment for window to properly initialize
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                // Wait a moment for window to properly initialize (with immediate shutdown response)
+                std::mutex wait_mutex;
+                std::unique_lock<std::mutex> wait_lock(wait_mutex);
+                
+                if (m_shutdown_cv.wait_for(wait_lock, std::chrono::milliseconds(100), [&]() {
+                    return stop_token.stop_requested() || m_shutting_down.load();
+                })) {
+                    // Shutdown requested during initialization wait
+                    log_message("Rotation jthread exited during init wait: immediate shutdown requested");
+                    m_rotation_active.store(false);
+                    return;
+                }
             } else {
                 log_message("ROTATION: Cannot start new window - waiting...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                
+                std::mutex wait_mutex;
+                std::unique_lock<std::mutex> wait_lock(wait_mutex);
+                
+                if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
+                    return stop_token.stop_requested() || m_shutting_down.load();
+                })) {
+                    // Shutdown requested during retry wait
+                    log_message("Rotation jthread exited during retry wait: immediate shutdown requested");
+                    m_rotation_active.store(false);
+                    return;
+                }
                 continue;
             }
             
@@ -3011,7 +3120,7 @@ void banner_manager::start_ad_rotation()
             std::set<std::string> displayed_ads_in_window; // Track all displayed ads in this window
             size_t ads_displayed_in_window = 0;
             
-            while (window_time_used < max_window_time && !stop_token.stop_requested() && m_window_active.load()) {
+            while (window_time_used < max_window_time && !stop_token.stop_requested() && !m_shutting_down.load() && m_window_active.load()) {
                 // Get next ad from queue
                 std::string current_ad_id;
                 int ad_duration = 0;
@@ -3106,9 +3215,20 @@ void banner_manager::start_ad_rotation()
                     break;
                 }
                 
-                // Wait for ad duration
-                for (int i = 0; i < ad_duration && !stop_token.stop_requested(); ++i) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                // Wait for ad duration (with immediate shutdown response)
+                for (int i = 0; i < ad_duration && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
+                    std::mutex wait_mutex;
+                    std::unique_lock<std::mutex> wait_lock(wait_mutex);
+                    
+                    // Wait for 1 second OR until shutdown notification
+                    if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
+                        return stop_token.stop_requested() || m_shutting_down.load();
+                    })) {
+                        // Woke up due to shutdown request during ad duration
+                        log_message("Rotation jthread exited during ad duration: immediate shutdown requested");
+                        m_rotation_active.store(false);
+                        return;
+                    }
                 }
                 
                 // Track analytics end
@@ -3153,9 +3273,29 @@ void banner_manager::stop_ad_rotation()
     // Request stop using jthread's built-in mechanism
     m_rotation_jthread.request_stop();
     
-    // jthread automatically joins in destructor, but we can manually join if needed
+    // Try to join with timeout to prevent hanging during shutdown
     if (m_rotation_jthread.joinable()) {
-        m_rotation_jthread.join();
+        auto timeout_start = std::chrono::steady_clock::now();
+        const auto timeout_duration = std::chrono::seconds(2);
+        
+        // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
+        bool joined = false;
+        while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
+            if (!m_rotation_jthread.joinable()) {
+                joined = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        if (m_rotation_jthread.joinable()) {
+            if (joined) {
+                log_message("ROTATION: Thread joined successfully");
+            } else {
+                log_message("ROTATION: Thread join timeout, forcing join to ensure cleanup");
+                m_rotation_jthread.join();
+            }
+        }
     }
     
     m_rotation_active.store(false);
@@ -3382,11 +3522,21 @@ void banner_manager::start_window_gap()
         // TESTING: 15 seconds gap (normally 3 minutes = 180 seconds)
         const int gap_seconds = 15; // 15 seconds for testing
         
-        for (int i = 0; i < gap_seconds && !stop_token.stop_requested(); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        for (int i = 0; i < gap_seconds && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
+            std::mutex wait_mutex;
+            std::unique_lock<std::mutex> wait_lock(wait_mutex);
+            
+            // Wait for 1 second OR until shutdown notification
+            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
+                return stop_token.stop_requested() || m_shutting_down.load();
+            })) {
+                // Woke up due to shutdown request
+                log_message("Window gap jthread exited: immediate shutdown requested");
+                return;
+            }
         }
         
-        if (!stop_token.stop_requested()) {
+        if (!stop_token.stop_requested() && !m_shutting_down.load()) {
             log_message("WINDOW_GAP: Gap period ended - can start new window");
             m_in_window_gap.store(false);
         }
@@ -3398,8 +3548,30 @@ void banner_manager::stop_window_gap()
     if (m_in_window_gap.load()) {
         log_message("WINDOW_GAP: Stopping gap period");
         m_window_gap_thread.request_stop();
+        
+        // Try to join with timeout to prevent hanging during shutdown
         if (m_window_gap_thread.joinable()) {
-            m_window_gap_thread.join();
+            auto timeout_start = std::chrono::steady_clock::now();
+            const auto timeout_duration = std::chrono::seconds(2);
+            
+            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
+            bool joined = false;
+            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
+                if (!m_window_gap_thread.joinable()) {
+                    joined = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            if (m_window_gap_thread.joinable()) {
+                if (joined) {
+                    log_message("WINDOW_GAP: Gap thread joined successfully");
+                } else {
+                    log_message("WINDOW_GAP: Gap thread join timeout, detaching to prevent hang");
+                    m_window_gap_thread.detach();
+                }
+            }
         }
         m_in_window_gap.store(false);
     }
@@ -3463,12 +3635,23 @@ void banner_manager::start_duration_timer(int duration_seconds)
     log_message("TIMER: Starting banner duration timer for " + std::to_string(duration_seconds) + " seconds");
     
     m_duration_timer_thread = std::jthread([this, duration_seconds](std::stop_token stop_token) {
-        // Wait for the specified duration
-        for (int i = 0; i < duration_seconds && !stop_token.stop_requested(); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        // Wait for the specified duration with immediate shutdown response
+        for (int i = 0; i < duration_seconds && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
+            std::mutex wait_mutex;
+            std::unique_lock<std::mutex> wait_lock(wait_mutex);
+            
+            // Wait for 1 second OR until shutdown notification
+            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
+                return stop_token.stop_requested() || m_shutting_down.load();
+            })) {
+                // Woke up due to shutdown request
+                log_message("Duration timer jthread exited: immediate shutdown requested");
+                m_duration_timer_active.store(false);
+                return;
+            }
         }
         
-        if (!stop_token.stop_requested()) {
+        if (!stop_token.stop_requested() && !m_shutting_down.load()) {
             log_message("TIMER: Banner duration expired (" + std::to_string(duration_seconds) + "s) - auto-hiding");
             
             // Set intentional hide flag to prevent interference
@@ -3490,8 +3673,19 @@ void banner_manager::start_duration_timer(int duration_seconds)
             
             log_message("TIMER: Banner permanently hidden, window closed, ad end time recorded");
             
-            // Wait a bit to ensure hide is complete
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Wait a bit to ensure hide is complete (with immediate shutdown response)
+            std::mutex wait_mutex;
+            std::unique_lock<std::mutex> wait_lock(wait_mutex);
+            
+            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(2), [&]() {
+                return stop_token.stop_requested() || m_shutting_down.load();
+            })) {
+                // Shutdown requested during cleanup wait
+                log_message("Duration timer jthread exiting during cleanup: immediate shutdown requested");
+                m_intentional_hide_in_progress.store(false);
+                m_duration_timer_active.store(false);
+                return;
+            }
             
             // Clear intentional hide flag
             m_intentional_hide_in_progress.store(false);
@@ -3506,8 +3700,30 @@ void banner_manager::stop_duration_timer()
     if (m_duration_timer_active.load()) {
         log_message("TIMER: Stopping existing banner duration timer");
         m_duration_timer_thread.request_stop();
+        
+        // Try to join with timeout to prevent hanging during shutdown
         if (m_duration_timer_thread.joinable()) {
-            m_duration_timer_thread.join();
+            auto timeout_start = std::chrono::steady_clock::now();
+            const auto timeout_duration = std::chrono::seconds(2);
+            
+            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
+            bool joined = false;
+            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
+                if (!m_duration_timer_thread.joinable()) {
+                    joined = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            if (m_duration_timer_thread.joinable()) {
+                if (joined) {
+                    log_message("TIMER: Duration timer thread joined successfully");
+                } else {
+                    log_message("TIMER: Duration timer thread join timeout, forcing join to ensure cleanup");
+                    m_duration_timer_thread.join();
+                }
+            }
         }
         m_duration_timer_active.store(false);
     }
@@ -3576,17 +3792,43 @@ void banner_manager::stop_all_threads()
         }
     }
     
-    // Wait for threads to finish with timeout
-    auto timeout [[maybe_unused]] = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // Wait for threads to finish with proper timeout implementation
+    auto timeout_start = std::chrono::steady_clock::now();
+    const auto timeout_duration = std::chrono::seconds(3);
+    
     {
         std::lock_guard<std::mutex> lock(m_threads_mutex);
         for (auto& thread : m_temporary_threads) {
             if (thread.joinable()) {
-                // Try to join with timeout
-                try {
-                    thread.join();
-                } catch (...) {
-                    log_message("THREAD: Exception joining temporary thread");
+                // Implement proper timeout check for each thread
+                auto thread_timeout_start = std::chrono::steady_clock::now();
+                bool joined = false;
+                
+                while (std::chrono::steady_clock::now() - thread_timeout_start < std::chrono::seconds(1)) {
+                    if (!thread.joinable()) {
+                        joined = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                
+                if (thread.joinable()) {
+                    if (joined) {
+                        log_message("THREAD: Temporary thread joined successfully");
+                    } else {
+                        log_message("THREAD: Temporary thread join timeout, forcing join to ensure cleanup");
+                        try {
+                            thread.join();
+                        } catch (...) {
+                            log_message("THREAD: Exception joining temporary thread");
+                        }
+                    }
+                }
+                
+                // Check global timeout
+                if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
+                    log_message("THREAD: Global timeout reached, detaching remaining threads");
+                    break;
                 }
             }
         }
