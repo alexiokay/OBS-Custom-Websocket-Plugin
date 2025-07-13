@@ -14,6 +14,7 @@ namespace vorti::applets::obs_plugin {
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <future>  // Required for std::async timeout-based thread join
 #include <stdexcept>
 #include <string>
 #include <set>
@@ -104,70 +105,405 @@ banner_manager::banner_manager()
 
 banner_manager::~banner_manager()
 {
-    log_message("DESTRUCTOR: Starting cooperative shutdown - no thread detachment");
+    log_message("DESTRUCTOR: INSTANT shutdown - no sleeps to prevent OBS hanging");
     
-    // Set shutdown flag immediately to prevent any new operations
+    // CRITICAL: Set shutdown flag immediately to prevent any new operations
     m_shutting_down = true;
     
-    // SAFE browser source cleanup - no aggressive process killing
-    if (m_banner_source) {
+    // INSTANT CEF CLEANUP: No waiting during shutdown to fix hanging
+    // CRITICAL: Check if emergency shutdown already released the source
+    if (m_banner_source && !m_browser_shutdown_initiated.load()) {
         try {
-            log_message("DESTRUCTOR: Gracefully releasing browser source");
-            obs_source_set_enabled(m_banner_source, false);
-            obs_source_release(m_banner_source);
+            log_message("CEF CLEANUP: INSTANT browser source cleanup - no waiting");
+            
+            // CRITICAL: Check if OBS is still available before making API calls
+            bool obs_available = vorti::applets::obs_plugin::m_obs_frontend_available.load();
+            auto cleanup_start = std::chrono::steady_clock::now();
+            const auto cleanup_timeout = std::chrono::milliseconds(200);  // Very short timeout
+            
+            // STEP 1: Try to mute and disable source with timeout protection (only if OBS is available)
+            if (obs_available) {
+                try {
+                    auto disable_future = std::async(std::launch::async, [&]() {
+                        // Double-check OBS availability inside async call
+                        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+                            // CRITICAL FIX: Mute audio first to prevent crashes
+                            obs_source_set_muted(m_banner_source, true);
+                            obs_source_set_volume(m_banner_source, 0.0f);
+                            obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
+                            obs_source_set_enabled(m_banner_source, false);
+                        }
+                    });
+                    
+                    if (disable_future.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready) {
+                        log_message("CEF CLEANUP: Browser source muted and disabled");
+                    } else {
+                        log_message("CEF CLEANUP: WARNING - Source disable timeout, continuing with release");
+                    }
+                } catch (...) {
+                    log_message("CEF CLEANUP: Exception disabling source, continuing");
+                }
+            } else {
+                log_message("CEF CLEANUP: Skipping source disable - OBS frontend unavailable");
+            }
+            
+            // STEP 2: REMOVED 1.5s SLEEP - this was causing the slow OBS shutdown!
+            // During shutdown, we prioritize fast exit over graceful CEF cleanup
+            
+            // STEP 3: Force release with timeout protection (only if OBS is available)
+            if (obs_available) {
+                try {
+                    auto release_future = std::async(std::launch::async, [&]() {
+                        // Double-check OBS availability inside async call
+                        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+                            obs_source_release(m_banner_source);
+                        }
+                    });
+                    
+                    if (release_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
+                        log_message("CEF CLEANUP: Browser source released successfully");
+                    } else {
+                        log_message("CEF CLEANUP: CRITICAL - Source release timeout, forcing null pointer");
+                    }
+                } catch (...) {
+                    log_message("CEF CLEANUP: Exception releasing source, forcing null pointer");
+                }
+            } else {
+                log_message("CEF CLEANUP: Skipping source release - OBS frontend unavailable, forcing null pointer");
+            }
+            
+            // Always nullify pointer regardless of release success
             m_banner_source = nullptr;
-            log_message("DESTRUCTOR: Browser source released safely");
+            
+            auto cleanup_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - cleanup_start).count();
+            log_message("CEF CLEANUP: Browser source cleanup completed in " + std::to_string(cleanup_duration) + "ms");
+            
         } catch (...) {
-            log_message("DESTRUCTOR: Exception during browser source cleanup");
+            log_message("CEF CLEANUP: Exception during instant cleanup - forcing null pointer");
+            m_banner_source = nullptr;
         }
     }
     
-    // Call explicit shutdown to handle thread cleanup
+    // Call explicit shutdown - now truly instant
     shutdown();
     
-    log_message("DESTRUCTOR: Cooperative shutdown complete - no leaked threads");
+    log_message("DESTRUCTOR: INSTANT shutdown complete - OBS should exit immediately");
+}
+
+void banner_manager::emergency_shutdown_release_sources()
+{
+    log_message("EMERGENCY SHUTDOWN: Releasing browser sources immediately to prevent crashes");
+    
+    // CRITICAL: Set flags immediately to prevent any operations
+    m_shutting_down = true;
+    m_browser_shutdown_initiated.store(true);
+    
+    // CRITICAL: Release browser source IMMEDIATELY without any delays or waits
+    if (m_banner_source) {
+        try {
+            // CRITICAL FIX: First completely disconnect from audio subsystem
+            // This prevents the WASAPI crash by ensuring no audio callbacks can occur
+            obs_source_set_audio_active(m_banner_source, false);
+            
+            // Mute and disable all audio processing
+            obs_source_set_muted(m_banner_source, true);
+            obs_source_set_volume(m_banner_source, 0.0f);
+            obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
+            
+            // Disable the source entirely
+            obs_source_set_enabled(m_banner_source, false);
+            
+            // CRITICAL: Remove from all scenes BEFORE releasing
+            // This ensures no scene is holding a reference during audio shutdown
+            obs_scene_t* scene = obs_scene_from_source(obs_frontend_get_current_scene());
+            if (scene) {
+                obs_sceneitem_t* item = obs_scene_find_source(scene, obs_source_get_name(m_banner_source));
+                if (item) {
+                    obs_sceneitem_remove(item);
+                }
+                obs_source_release(obs_scene_get_source(scene));
+            }
+            
+            // Give audio subsystem time to fully disconnect
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            log_message("EMERGENCY SHUTDOWN: Browser source audio disabled and removed from scenes");
+            
+            // Now safe to release the source
+            obs_source_release(m_banner_source);
+            m_banner_source = nullptr;
+            
+            log_message("EMERGENCY SHUTDOWN: Browser source released successfully");
+        } catch (...) {
+            log_message("EMERGENCY SHUTDOWN: Exception during source release - forcing null pointer");
+            m_banner_source = nullptr;
+        }
+    }
+    
+    // Stop all monitoring to prevent any attempts to access the source
+    m_persistence_monitor_active = false;
+    m_rotation_active.store(false);
+    m_duration_timer_active.store(false);
+    m_analytics_reporting_active.store(false);
+    
+    // Wake up all threads to stop immediately
+    m_shutdown_cv.notify_all();
+    
+    log_message("EMERGENCY SHUTDOWN: Browser sources released, all operations stopped");
 }
 
 void banner_manager::shutdown()
 {
-    log_message("FAST SHUTDOWN: Detaching all banner threads immediately");
+    log_message("Starting proper banner manager shutdown sequence");
     
-    // Set shutdown flags
+    // Phase 1: Set shutdown flags atomically
     m_shutting_down = true;
     m_rotation_active.store(false);
     m_duration_timer_active.store(false);
     m_analytics_reporting_active.store(false);
     m_stop_analytics.store(true);
     
-    // Detach all threads immediately - no joining, no timeouts
-    if (m_persistence_monitor_thread.joinable()) {
-        m_persistence_monitor_thread.detach();
-    }
-    if (m_duration_timer_thread.joinable()) {
-        m_duration_timer_thread.detach();
-    }
-    if (m_window_gap_thread.joinable()) {
-        m_window_gap_thread.detach();
-    }
-    if (m_rotation_jthread.joinable()) {
-        m_rotation_jthread.detach();
-    }
-    if (m_analytics_thread.joinable()) {
-        m_analytics_thread.detach();
+    // Wake up any threads waiting on condition variables
+    m_shutdown_cv.notify_all();
+    
+    // Phase 2: Disconnect from OBS safely with comprehensive exception handling
+    log_message("Disconnecting from OBS signals and cleaning up banners");
+    try {
+        // Add timeout protection for each OBS operation
+        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+            auto cleanup_future = std::async(std::launch::async, [this]() {
+                try {
+                    disconnect_scene_signals();
+                } catch (const std::exception& e) {
+                    log_message("WARNING: Exception in disconnect_scene_signals: " + std::string(e.what()));
+                } catch (...) {
+                    log_message("WARNING: Unknown exception in disconnect_scene_signals");
+                }
+                
+                try {
+                    remove_banner_from_scenes();
+                } catch (const std::exception& e) {
+                    log_message("WARNING: Exception in remove_banner_from_scenes: " + std::string(e.what()));
+                } catch (...) {
+                    log_message("WARNING: Unknown exception in remove_banner_from_scenes");
+                }
+            });
+            
+            // Wait for cleanup with timeout
+            if (cleanup_future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+                log_message("WARNING: OBS cleanup timeout - continuing with shutdown");
+            }
+        } else {
+            log_message("Skipping OBS cleanup - frontend unavailable");
+        }
+    } catch (const std::exception& e) {
+        log_message("WARNING: Exception during OBS cleanup: " + std::string(e.what()));
+    } catch (...) {
+        log_message("WARNING: Unknown exception during OBS cleanup");
     }
     
-    // Detach temporary threads
+    // Phase 3: Define thread management structure
+    struct ThreadInfo {
+        std::jthread* thread;
+        const char* name;
+    };
+    
+    ThreadInfo threads[] = {
+        {&m_persistence_monitor_thread, "persistence_monitor"},
+        {&m_duration_timer_thread, "duration_timer"},
+        {&m_window_gap_thread, "window_gap"},
+        {&m_rotation_jthread, "rotation"},
+        {&m_analytics_thread, "analytics"}
+    };
+    
+    // Phase 4: Request all threads to stop and wake them up
+    log_message("Requesting all threads to stop");
+    for (auto& info : threads) {
+        if (info.thread->joinable()) {
+            info.thread->request_stop();
+        }
+    }
+    
+    // Wake up all threads waiting on condition variables
+    m_shutdown_cv.notify_all();
+    
+    // Give threads a moment to respond to stop request
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // Phase 5: CRITICAL FIX - Non-blocking thread joins with timeout
+    const auto timeout_ms = std::chrono::milliseconds(300);  // Shorter timeout for shutdown
+    auto join_with_timeout = [&](std::jthread* thread, const char* name) {
+        if (!thread->joinable()) return true;
+        
+        log_message("Attempting to join " + std::string(name) + " thread with timeout");
+        
+        auto start = std::chrono::steady_clock::now();
+        while (thread->joinable() && (std::chrono::steady_clock::now() - start) < timeout_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        
+        if (thread->joinable()) {
+            try {
+                // CRITICAL FIX: Use std::future for timeout-based join
+                auto join_future = std::async(std::launch::async, [&]() {
+                    thread->join();
+                });
+                
+                // Wait for join with very short timeout (100ms)
+                if (join_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
+                    log_message("Successfully joined " + std::string(name) + " thread");
+                    return true;
+                } else {
+                    log_message("CRITICAL: " + std::string(name) + " join timeout, detaching to prevent hang");
+                    thread->detach();  // IMMEDIATE DETACHMENT
+                    return false;
+                }
+            } catch (...) {
+                log_message("WARNING: Join failed for " + std::string(name) + " - detaching to prevent hang");
+                try {
+                    thread->detach();
+                } catch (...) {
+                    log_message("WARNING: Detach failed for " + std::string(name) + " (continuing)");
+                }
+                return false;
+            }
+        }
+        return true;
+    };
+    
+    // Join all main threads
+    for (auto& info : threads) {
+        join_with_timeout(info.thread, info.name);
+    }
+    
+    // Phase 6: Handle temporary threads
     {
         std::lock_guard<std::mutex> lock(m_threads_mutex);
         for (auto& thread : m_temporary_threads) {
             if (thread.joinable()) {
-                thread.detach();
+                thread.request_stop();
+                
+                // Try to join with timeout
+                auto start = std::chrono::steady_clock::now();
+                while (thread.joinable() && (std::chrono::steady_clock::now() - start) < timeout_ms) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                }
+                
+                if (thread.joinable()) {
+                    try {
+                        // CRITICAL FIX: Use std::future for timeout-based join
+                        auto join_future = std::async(std::launch::async, [&]() {
+                            thread.join();
+                        });
+                        
+                        // Wait for join with very short timeout (100ms)
+                        if (join_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
+                            log_message("Successfully joined temporary thread");
+                        } else {
+                            log_message("CRITICAL: Temporary thread join timeout, detaching to prevent hang");
+                            thread.detach();  // IMMEDIATE DETACHMENT
+                        }
+                    } catch (...) {
+                        log_message("WARNING: Temporary thread join failed - detaching to prevent hang");
+                        try {
+                            thread.detach();
+                        } catch (...) {
+                            log_message("WARNING: Temporary thread detach failed (continuing)");
+                        }
+                    }
+                }
             }
         }
         m_temporary_threads.clear();
     }
     
-    log_message("FAST SHUTDOWN: Banner manager shutdown complete");
+    log_message("Banner manager proper shutdown completed");
+}
+
+void banner_manager::disconnect_scene_signals()
+{
+    log_message("SIGNALS: Starting scene signal disconnection...");
+    
+    // CRITICAL: Check if OBS frontend is available before attempting any signal operations
+    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
+        log_message("SIGNALS: OBS frontend unavailable - skipping signal disconnection to prevent access violations");
+        m_signals_connected.store(false);  // Mark as disconnected
+        return;
+    }
+    
+    // Check shutdown flags
+    if (m_shutting_down || vorti::applets::obs_plugin::m_shutting_down.load()) {
+        log_message("SIGNALS: Shutdown in progress - using safe signal disconnection");
+    }
+    
+    if (!m_signals_connected.load()) {
+        log_message("SIGNALS: No signals connected - nothing to disconnect");
+        return;
+    }
+    
+    try {
+        // Add timeout protection for signal disconnection during shutdown
+        auto disconnect_start = std::chrono::steady_clock::now();
+        const auto disconnect_timeout = std::chrono::milliseconds(300);  // Max time for signal cleanup
+        
+        // CRITICAL: Use timeout-protected OBS API calls during shutdown
+        auto disconnect_future = std::async(std::launch::async, [&]() {
+            try {
+                // Get all scenes and disconnect signals
+                obs_frontend_source_list scenes = {};
+                obs_frontend_get_scenes(&scenes);
+                
+                if (scenes.sources.array && scenes.sources.num > 0) {
+                    log_message("SIGNALS: Disconnecting signals from " + std::to_string(scenes.sources.num) + " scenes");
+                    
+                    for (size_t i = 0; i < scenes.sources.num; i++) {
+                        obs_source_t* scene_source = scenes.sources.array[i];
+                        if (!scene_source) continue;
+                        
+                        obs_scene_t* scene = obs_scene_from_source(scene_source);
+                        if (!scene) continue;
+                        
+                        // Disconnect scene signals with protection
+                        // Get signal handler from source, not scene
+                        signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
+                        if (handler) {
+                            try {
+                                signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
+                                signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
+                                signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
+                            } catch (...) {
+                                log_message("SIGNALS: Exception disconnecting signals from scene " + std::to_string(i));
+                            }
+                        }
+                    }
+                }
+                
+                obs_frontend_source_list_free(&scenes);
+                log_message("SIGNALS: Scene signal disconnection completed successfully");
+                
+            } catch (...) {
+                log_message("SIGNALS: Exception during scene signal disconnection");
+                throw;  // Re-throw to be caught by timeout handler
+            }
+        });
+        
+        // Wait for disconnection with timeout
+        if (disconnect_future.wait_for(disconnect_timeout) == std::future_status::ready) {
+            log_message("SIGNALS: All scene signals disconnected successfully");
+        } else {
+            log_message("SIGNALS: CRITICAL - Signal disconnection timeout, may have access violation risk");
+        }
+        
+    } catch (...) {
+        log_message("SIGNALS: Exception during signal disconnection - OBS frontend may be unavailable");
+    }
+    
+    // Always mark signals as disconnected to prevent further attempts
+    m_signals_connected.store(false);
+    
+    // Log completion
+    log_message("SIGNALS: Signal disconnection completed");
 }
 
 bool banner_manager::is_obs_safe_to_call() const
@@ -193,7 +529,17 @@ void banner_manager::initialize_after_obs_ready()
         
         // Try again after a short delay
         start_temporary_thread([this]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
+            if (!m_shutting_down) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            
+            // Skip initialization if shutting down
+            if (m_shutting_down) {
+                log_message("INITIALIZATION: Skipping delayed init - shutdown in progress");
+                return;
+            }
+            
             initialize_after_obs_ready();
         });
         return;
@@ -296,75 +642,7 @@ void banner_manager::connect_scene_signals()
     log_message("Scene signals connected for " + std::to_string(connected_scenes) + " scenes - banner enforcement ACTIVE");
 }
 
-void banner_manager::disconnect_scene_signals()
-{
-    log_message("Disconnecting scene signals");
-    
-    // CRITICAL: Don't check is_obs_safe_to_call() during shutdown!
-    // We need to disconnect signals even during shutdown to prevent hanging
-    // Only check if OBS frontend is available, not if we're shutting down
-    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-        log_message("WARNING: OBS frontend not available for signal disconnection");
-        m_signals_connected.store(false);
-        return;
-    }
-    
-    // TIMEOUT PROTECTION: Limit execution time to prevent shutdown hangs
-    auto timeout_start = std::chrono::steady_clock::now();
-    const auto timeout_duration = std::chrono::milliseconds(300); // 300ms max
-    
-    try {
-        // Disconnect from all existing scenes
-        obs_frontend_source_list scenes = {};
-        obs_frontend_get_scenes(&scenes);
-        
-        if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
-            log_message("TIMEOUT: disconnect_scene_signals exceeded time limit during obs_frontend_get_scenes");
-            obs_frontend_source_list_free(&scenes);
-            m_signals_connected.store(false);
-            return;
-        }
-        
-        if (!scenes.sources.array) {
-            log_message("WARNING: No scenes available for signal disconnection");
-            m_signals_connected.store(false);  // Reset flag even if no scenes
-            return;
-        }
-        
-        int disconnected_scenes = 0;
-        for (size_t i = 0; i < scenes.sources.num; i++) {
-            // Early exit if timeout exceeded
-            if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
-                log_message("TIMEOUT: disconnect_scene_signals exceeded time limit during scene iteration");
-                break;
-            }
-            
-            obs_source_t* scene_source = scenes.sources.array[i];
-            if (!scene_source) continue;
-            
-            signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
-            if (handler) {
-                // Disconnect all signal handlers
-                signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
-                signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
-                signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
-                disconnected_scenes++;
-            }
-        }
-        
-        obs_frontend_source_list_free(&scenes);
-        log_message("Scene signals disconnected from " + std::to_string(disconnected_scenes) + " scenes");
-        
-        // Reset flag after disconnection
-        m_signals_connected.store(false);
-        
-    } catch (...) {
-        log_message("ERROR: Exception during signal disconnection - ignoring");
-        m_signals_connected.store(false);  // Reset flag even if exception
-    }
-}
-
-// REMOVED: Legacy minimal signal handlers - no longer needed
+// Signal handler implementations follow below
 
 void banner_manager::on_item_remove(void* data, calldata_t* calldata)
 {
@@ -734,7 +1012,17 @@ void banner_manager::hide_banner()
         // Schedule auto-restore in only 5 seconds for free users (very limited hiding)
         // BUT don't auto-restore if this is a duration timer hide (permanent until next ad)
         start_temporary_thread([this]() {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
+            if (!m_shutting_down) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+            
+            // Skip all operations if shutting down
+            if (m_shutting_down) {
+                log_message("HIDE_BANNER: Skipping auto-restore - shutdown in progress");
+                return;
+            }
+            
             if (!PremiumStatusHandler::is_premium(this)) {
                 // Only auto-restore if this wasn't a duration timer hide (check if we can show ads)
                 if (can_show_ad_now()) {
@@ -757,7 +1045,17 @@ void banner_manager::hide_banner()
         
         // Also clear the flag after a short delay in case the jthread doesn't work
         start_temporary_thread([this]() {
-            std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
+            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
+            if (!m_shutting_down) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
+            }
+            
+            // Skip all operations if shutting down
+            if (m_shutting_down) {
+                log_message("HIDE_BANNER: Skipping safety timeout - shutdown in progress");
+                return;
+            }
+            
             m_intentional_hide_in_progress.store(false);
             
             // Safety re-enable of protection system
@@ -1162,7 +1460,7 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
              obs_data_set_int(settings, "fps", 30);
              obs_data_set_bool(settings, "reroute_audio", false);
              obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-             obs_data_set_bool(settings, "shutdown", false);
+             obs_data_set_bool(settings, "shutdown", true); // Allow proper CEF cleanup during shutdown
              obs_data_set_string(settings, "css", css_content.c_str());
              
              // Update the browser source
@@ -1236,6 +1534,11 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
     obs_data_release(settings);
     
     if (m_banner_source) {
+        // CRITICAL FIX: Extra safety - ensure source is muted after creation
+        obs_source_set_muted(m_banner_source, true);
+        obs_source_set_volume(m_banner_source, 0.0f);
+        obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
+        
         // Add VortiDeck protection metadata to the browser source
         obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
         obs_data_set_string(private_settings, "vortideck_banner", "true");
@@ -1498,7 +1801,10 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
             obs_data_set_int(settings, "fps", 30);
             obs_data_set_bool(settings, "reroute_audio", false);
             obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-            obs_data_set_bool(settings, "shutdown", false);
+            obs_data_set_bool(settings, "shutdown", true); // Allow proper CEF cleanup during shutdown
+            // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
+            obs_data_set_bool(settings, "mute", true);
+            obs_data_set_double(settings, "volume", 0.0);
             obs_data_set_string(settings, "css", css_content.c_str());
             
             // Update the browser source
@@ -1571,6 +1877,9 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
     obs_data_set_bool(settings, "reroute_audio", false);
     obs_data_set_bool(settings, "restart_when_active", true); // Help with content loading
     obs_data_set_bool(settings, "shutdown", false);
+    // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
+    obs_data_set_bool(settings, "mute", true);
+    obs_data_set_double(settings, "volume", 0.0);
     obs_data_set_string(settings, "css", css_content.c_str());
     
     log_message("ENHANCED BANNER CREATION: Attempting to create browser_source directly...");
@@ -1584,6 +1893,11 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
     obs_data_release(settings);
     
     if (m_banner_source) {
+        // CRITICAL FIX: Extra safety - ensure source is muted after creation
+        obs_source_set_muted(m_banner_source, true);
+        obs_source_set_volume(m_banner_source, 0.0f);
+        obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
+        
         // Add VortiDeck protection metadata to the browser source
         obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
         obs_data_set_string(private_settings, "vortideck_banner", "true");
@@ -1800,7 +2114,13 @@ void banner_manager::remove_banner_from_scenes()
             // Use metadata-based detection instead of name-based
             obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
             if (item) {
-                obs_sceneitem_set_visible(item, false);
+                // CRITICAL: If we're shutting down, remove the item entirely to prevent audio issues
+                if (m_shutting_down || vorti::applets::obs_plugin::m_shutting_down.load()) {
+                    obs_sceneitem_remove(item);
+                    log_message("SHUTDOWN: Removed banner item from scene to prevent audio crashes");
+                } else {
+                    obs_sceneitem_set_visible(item, false);
+                }
                 scenes_hidden++;
             }
         }
@@ -2522,7 +2842,7 @@ void banner_manager::start_persistence_monitor()
     // Stop any existing monitor thread
     if (m_persistence_monitor_thread.joinable()) {
         m_persistence_monitor_thread.request_stop();
-        m_persistence_monitor_thread.join();
+        m_persistence_monitor_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join to prevent hanging
     }
     
     // Monitor banner visibility and window timeouts with reasonable intervals
@@ -2581,7 +2901,7 @@ void banner_manager::stop_persistence_monitor()
             m_persistence_monitor_thread.request_stop();
             
             auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::seconds(2);
+            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
             
             // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
             bool joined = false;
@@ -2597,8 +2917,8 @@ void banner_manager::stop_persistence_monitor()
                 if (joined) {
                     log_message("PERSISTENCE: Monitor thread joined successfully");
                 } else {
-                    log_message("PERSISTENCE: Monitor thread join timeout, forcing join to ensure cleanup");
-                    m_persistence_monitor_thread.join();
+                    log_message("PERSISTENCE: Monitor thread join timeout, detaching to prevent hang");
+                    m_persistence_monitor_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
                 }
             }
         }
@@ -2837,6 +3157,9 @@ void banner_manager::register_vortideck_banner_source()
         obs_data_set_bool(browser_settings, "reroute_audio", false);
         obs_data_set_bool(browser_settings, "restart_when_active", true);
         obs_data_set_bool(browser_settings, "shutdown", false);
+        // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
+        obs_data_set_bool(browser_settings, "mute", true);
+        obs_data_set_double(browser_settings, "volume", 0.0);
         
         // Create the browser source
         obs_source_t* browser_source = obs_source_create("browser_source", obs_source_get_name(source), browser_settings, nullptr);
@@ -3276,7 +3599,7 @@ void banner_manager::stop_ad_rotation()
     // Try to join with timeout to prevent hanging during shutdown
     if (m_rotation_jthread.joinable()) {
         auto timeout_start = std::chrono::steady_clock::now();
-        const auto timeout_duration = std::chrono::seconds(2);
+        const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
         
         // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
         bool joined = false;
@@ -3292,8 +3615,8 @@ void banner_manager::stop_ad_rotation()
             if (joined) {
                 log_message("ROTATION: Thread joined successfully");
             } else {
-                log_message("ROTATION: Thread join timeout, forcing join to ensure cleanup");
-                m_rotation_jthread.join();
+                log_message("ROTATION: Thread join timeout, detaching to prevent hang");
+                m_rotation_jthread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
             }
         }
     }
@@ -3552,7 +3875,7 @@ void banner_manager::stop_window_gap()
         // Try to join with timeout to prevent hanging during shutdown
         if (m_window_gap_thread.joinable()) {
             auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::seconds(2);
+            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
             
             // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
             bool joined = false;
@@ -3704,7 +4027,7 @@ void banner_manager::stop_duration_timer()
         // Try to join with timeout to prevent hanging during shutdown
         if (m_duration_timer_thread.joinable()) {
             auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::seconds(2);
+            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
             
             // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
             bool joined = false;
@@ -3720,8 +4043,8 @@ void banner_manager::stop_duration_timer()
                 if (joined) {
                     log_message("TIMER: Duration timer thread joined successfully");
                 } else {
-                    log_message("TIMER: Duration timer thread join timeout, forcing join to ensure cleanup");
-                    m_duration_timer_thread.join();
+                    log_message("TIMER: Duration timer thread join timeout, detaching to prevent hang");
+                    m_duration_timer_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
                 }
             }
         }
@@ -3816,11 +4139,11 @@ void banner_manager::stop_all_threads()
                     if (joined) {
                         log_message("THREAD: Temporary thread joined successfully");
                     } else {
-                        log_message("THREAD: Temporary thread join timeout, forcing join to ensure cleanup");
+                        log_message("THREAD: Temporary thread join timeout, detaching to prevent hang");
                         try {
-                            thread.join();
+                            thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
                         } catch (...) {
-                            log_message("THREAD: Exception joining temporary thread");
+                            log_message("THREAD: Exception detaching temporary thread");
                         }
                     }
                 }
