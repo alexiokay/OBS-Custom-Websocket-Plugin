@@ -3,6 +3,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <thread>
 #include <libobs/obs.h>
@@ -260,6 +261,8 @@ namespace vorti {
             bool m_banner_persistent;  // True when banner should be unhideable
             bool m_persistence_monitor_active;  // Monitor jthread active flag
             std::atomic<bool> m_shutting_down{false};  // Shutdown flag for thread coordination
+            std::atomic<bool> m_browser_shutdown_initiated{false};  // CRITICAL: Flag to prevent duplicate CEF shutdown
+            std::condition_variable m_shutdown_cv;       // Condition variable for immediate thread wake-up during shutdown
             
             // Thread management for temporary operations
             std::vector<std::jthread> m_temporary_threads;
