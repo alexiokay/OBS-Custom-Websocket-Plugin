@@ -17,6 +17,9 @@ ServiceSelectionDialog::ServiceSelectionDialog(const std::vector<ServiceInfo>& s
 {
     ui->setupUi(this);
     
+    // Ensure Connect button starts disabled until an item is properly selected
+    ui->connectButton->setEnabled(false);
+    
     // Set window behavior - don't stay on top when parent is minimized
     setWindowModality(Qt::ApplicationModal);
     setAttribute(Qt::WA_DeleteOnClose, false);
@@ -99,17 +102,33 @@ void ServiceSelectionDialog::populateServiceList()
     
     // Select the first item by default (preferably the recommended one)
     if (ui->serviceList->count() > 0) {
+        int selectedIndex = 0;
+        
         // Look for recommended service first
         for (int i = 0; i < ui->serviceList->count(); ++i) {
             QListWidgetItem* item = ui->serviceList->item(i);
             int serviceIndex = item->data(Qt::UserRole).toInt();
             if (serviceIndex < static_cast<int>(m_services.size()) && m_services[serviceIndex].port == 9001) {
-                ui->serviceList->setCurrentRow(i);
-                return;
+                selectedIndex = i;
+                break;
             }
         }
-        // Fallback to first item
-        ui->serviceList->setCurrentRow(0);
+        
+        // Properly select the item (not just highlight)
+        QListWidgetItem* itemToSelect = ui->serviceList->item(selectedIndex);
+        if (itemToSelect) {
+            ui->serviceList->setCurrentItem(itemToSelect);
+            itemToSelect->setSelected(true);
+            
+            // Manually update internal state and enable Connect button
+            m_selectedIndex = itemToSelect->data(Qt::UserRole).toInt();
+            ui->connectButton->setEnabled(true);
+            
+            // Trigger selection changed signal to ensure consistency
+            onItemSelectionChanged();
+            
+            qDebug() << "Auto-selected service at index:" << selectedIndex << "with service index:" << m_selectedIndex;
+        }
     }
 }
 
