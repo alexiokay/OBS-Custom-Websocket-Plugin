@@ -2823,15 +2823,6 @@ void vorti::applets::obs_plugin::continuous_discovery_worker()
                             on_service_discovered(service);
                         }
                         
-                        // TEMPORARY: Add hardcoded test service for selection window testing
-                        ServiceInfo test_service;
-                        test_service.name = "vortideck_test._vortideck._tcp.local.";
-                        test_service.ip_address = "192.168.178.253";  // Use same IP as real service
-                        test_service.port = 9002;  // Different port to distinguish from real service
-                        test_service.websocket_url = "ws://192.168.178.253:9002/";
-                        on_service_discovered(test_service);
-                        log_to_obs("TESTING: Added hardcoded VortiDeck test service for selection testing");
-                        
                         // Update last discovery time
                         {
                             std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
