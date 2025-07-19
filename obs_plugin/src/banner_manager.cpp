@@ -1,25 +1,17 @@
 #include "banner_manager.hpp"
-#include <UI/obs-frontend-api/obs-frontend-api.h>
-
-// Forward declarations for OBS plugin shutdown flags
-namespace vorti::applets::obs_plugin {
-    extern std::atomic<bool> m_shutting_down;
-    extern std::atomic<bool> m_obs_frontend_available;
-}
-#include <libobs/obs-module.h>
-#include <libobs/util/platform.h>
+#include <obs-frontend-api.h>
+#include <obs-module.h>
+#include <util/platform.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cmath>
 #include <thread>
 #include <chrono>
-#include <future>  // Required for std::async timeout-based thread join
 #include <stdexcept>
 #include <string>
 #include <set>
-#include <functional>
-// JSON include is already in banner_manager.hpp
+#include <nlohmann/json.hpp>
 
 using namespace vorti::applets;
 
@@ -36,30 +28,27 @@ struct plugin_interface {
 extern plugin_interface* g_obs_plugin_instance;
 
 banner_manager::banner_manager()
-    : m_banner_source_name("VortiDeck Banner")
-    , m_banner_source(nullptr)
+    : m_banner_source(nullptr)
     , m_banner_visible(false)
     , m_banner_persistent(false)
     , m_persistence_monitor_active(false)
     , m_current_banner_content("")
     , m_current_content_type("")
+    , m_banner_source_name("VortiDeck Banner")
 {
     log_message("CONSTRUCTOR: Initializing banner manager...");
     
     // Initialize timestamps
     m_last_premium_update = std::chrono::system_clock::now();
-    m_last_ad_end_time = std::chrono::system_clock::now() - std::chrono::minutes(2); // Allow immediate first ad
     
     // CRITICAL: Initialize FREE USER mode as DEFAULT
     m_is_premium.store(false);  // FREE USER by default
-    m_revenue_share.store(0.05f);  // 5% revenue share for free users
     m_custom_positioning.store(false);  // No custom positioning for free users
-    m_ad_frequency_minutes.store(5);  // 5 minutes ad frequency for free users
     
-    log_message("CONSTRUCTOR: Banner manager initialized - FREE USER MODE (5% revenue share)");
+    log_message("CONSTRUCTOR: Banner manager initialized - FREE USER MODE");
     log_message("CONSTRUCTOR: FREE USER - FORCED banner system - banners MUST be present in ALL scenes");
     log_message("CONSTRUCTOR: FREE USER - Limited banner control - upgrade to premium for complete banner freedom");
-    log_message("CONSTRUCTOR: FREE USER - Banners auto-restore after 10sec hiding, locked positioning");
+    log_message("CONSTRUCTOR: FREE USER - Banners auto-restore after hiding");
     log_message("CONSTRUCTOR: FREE USER - Enhanced protection system ACTIVE - banners protected from removal");
     
     // Basic OBS functionality tests
@@ -105,412 +94,33 @@ banner_manager::banner_manager()
 
 banner_manager::~banner_manager()
 {
-    log_message("DESTRUCTOR: INSTANT shutdown - no sleeps to prevent OBS hanging");
+    log_message("Banner manager shutting down...");
     
-    // CRITICAL: Set shutdown flag immediately to prevent any new operations
-    m_shutting_down = true;
+    // Clean up signal handlers and monitoring
+    disconnect_scene_signals();
+    stop_persistence_monitor();
     
-    // INSTANT CEF CLEANUP: No waiting during shutdown to fix hanging
-    // CRITICAL: Check if emergency shutdown already released the source
-    if (m_banner_source && !m_browser_shutdown_initiated.load()) {
-        try {
-            log_message("CEF CLEANUP: INSTANT browser source cleanup - no waiting");
-            
-            // CRITICAL: Check if OBS is still available before making API calls
-            bool obs_available = vorti::applets::obs_plugin::m_obs_frontend_available.load();
-            auto cleanup_start = std::chrono::steady_clock::now();
-            const auto cleanup_timeout = std::chrono::milliseconds(200);  // Very short timeout
-            
-            // STEP 1: Try to mute and disable source with timeout protection (only if OBS is available)
-            if (obs_available) {
-                try {
-                    auto disable_future = std::async(std::launch::async, [&]() {
-                        // Double-check OBS availability inside async call
-                        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-                            // CRITICAL FIX: Mute audio first to prevent crashes
-                            obs_source_set_muted(m_banner_source, true);
-                            obs_source_set_volume(m_banner_source, 0.0f);
-                            obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
-                            obs_source_set_enabled(m_banner_source, false);
-                        }
-                    });
-                    
-                    if (disable_future.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready) {
-                        log_message("CEF CLEANUP: Browser source muted and disabled");
-                    } else {
-                        log_message("CEF CLEANUP: WARNING - Source disable timeout, continuing with release");
-                    }
-                } catch (...) {
-                    log_message("CEF CLEANUP: Exception disabling source, continuing");
-                }
-            } else {
-                log_message("CEF CLEANUP: Skipping source disable - OBS frontend unavailable");
-            }
-            
-            // STEP 2: REMOVED 1.5s SLEEP - this was causing the slow OBS shutdown!
-            // During shutdown, we prioritize fast exit over graceful CEF cleanup
-            
-            // STEP 3: Force release with timeout protection (only if OBS is available)
-            if (obs_available) {
-                try {
-                    auto release_future = std::async(std::launch::async, [&]() {
-                        // Double-check OBS availability inside async call
-                        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-                            obs_source_release(m_banner_source);
-                        }
-                    });
-                    
-                    if (release_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
-                        log_message("CEF CLEANUP: Browser source released successfully");
-                    } else {
-                        log_message("CEF CLEANUP: CRITICAL - Source release timeout, forcing null pointer");
-                    }
-                } catch (...) {
-                    log_message("CEF CLEANUP: Exception releasing source, forcing null pointer");
-                }
-            } else {
-                log_message("CEF CLEANUP: Skipping source release - OBS frontend unavailable, forcing null pointer");
-            }
-            
-            // Always nullify pointer regardless of release success
-            m_banner_source = nullptr;
-            
-            auto cleanup_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - cleanup_start).count();
-            log_message("CEF CLEANUP: Browser source cleanup completed in " + std::to_string(cleanup_duration) + "ms");
-            
-        } catch (...) {
-            log_message("CEF CLEANUP: Exception during instant cleanup - forcing null pointer");
-            m_banner_source = nullptr;
-        }
-    }
-    
-    // Call explicit shutdown - now truly instant
-    shutdown();
-    
-    log_message("DESTRUCTOR: INSTANT shutdown complete - OBS should exit immediately");
-}
-
-void banner_manager::emergency_shutdown_release_sources()
-{
-    log_message("EMERGENCY SHUTDOWN: Releasing browser sources immediately to prevent crashes");
-    
-    // CRITICAL: Set flags immediately to prevent any operations
-    m_shutting_down = true;
-    m_browser_shutdown_initiated.store(true);
-    
-    // CRITICAL: Release browser source IMMEDIATELY without any delays or waits
+    // Clean up OBS sources
     if (m_banner_source) {
-        try {
-            // CRITICAL FIX: First completely disconnect from audio subsystem
-            // This prevents the WASAPI crash by ensuring no audio callbacks can occur
-            obs_source_set_audio_active(m_banner_source, false);
-            
-            // Mute and disable all audio processing
-            obs_source_set_muted(m_banner_source, true);
-            obs_source_set_volume(m_banner_source, 0.0f);
-            obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
-            
-            // Disable the source entirely
-            obs_source_set_enabled(m_banner_source, false);
-            
-            // CRITICAL: Remove from all scenes BEFORE releasing
-            // This ensures no scene is holding a reference during audio shutdown
-            obs_scene_t* scene = obs_scene_from_source(obs_frontend_get_current_scene());
-            if (scene) {
-                obs_sceneitem_t* item = obs_scene_find_source(scene, obs_source_get_name(m_banner_source));
-                if (item) {
-                    obs_sceneitem_remove(item);
-                }
-                obs_source_release(obs_scene_get_source(scene));
-            }
-            
-            // Give audio subsystem time to fully disconnect
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            log_message("EMERGENCY SHUTDOWN: Browser source audio disabled and removed from scenes");
-            
-            // Now safe to release the source
-            obs_source_release(m_banner_source);
-            m_banner_source = nullptr;
-            
-            log_message("EMERGENCY SHUTDOWN: Browser source released successfully");
-        } catch (...) {
-            log_message("EMERGENCY SHUTDOWN: Exception during source release - forcing null pointer");
-            m_banner_source = nullptr;
-        }
+        obs_source_release(m_banner_source);
+        m_banner_source = nullptr;
     }
     
-    // Stop all monitoring to prevent any attempts to access the source
-    m_persistence_monitor_active = false;
-    m_rotation_active.store(false);
-    m_duration_timer_active.store(false);
-    m_analytics_reporting_active.store(false);
-    
-    // Wake up all threads to stop immediately
-    m_shutdown_cv.notify_all();
-    
-    log_message("EMERGENCY SHUTDOWN: Browser sources released, all operations stopped");
+    log_message("Banner manager destroyed");
 }
 
 void banner_manager::shutdown()
 {
-    log_message("Starting proper banner manager shutdown sequence");
+    log_message("Banner manager shutdown requested...");
     
-    // Phase 1: Set shutdown flags atomically
+    // Set shutdown flags to prevent new operations
     m_shutting_down = true;
-    m_rotation_active.store(false);
-    m_duration_timer_active.store(false);
-    m_analytics_reporting_active.store(false);
-    m_stop_analytics.store(true);
     
-    // Wake up any threads waiting on condition variables
-    m_shutdown_cv.notify_all();
+    // Clean up signal handlers and monitoring
+    disconnect_scene_signals();
+    stop_persistence_monitor();
     
-    // Phase 2: Disconnect from OBS safely with comprehensive exception handling
-    log_message("Disconnecting from OBS signals and cleaning up banners");
-    try {
-        // Add timeout protection for each OBS operation
-        if (vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-            auto cleanup_future = std::async(std::launch::async, [this]() {
-                try {
-                    disconnect_scene_signals();
-                } catch (const std::exception& e) {
-                    log_message("WARNING: Exception in disconnect_scene_signals: " + std::string(e.what()));
-                } catch (...) {
-                    log_message("WARNING: Unknown exception in disconnect_scene_signals");
-                }
-                
-                try {
-                    remove_banner_from_scenes();
-                } catch (const std::exception& e) {
-                    log_message("WARNING: Exception in remove_banner_from_scenes: " + std::string(e.what()));
-                } catch (...) {
-                    log_message("WARNING: Unknown exception in remove_banner_from_scenes");
-                }
-            });
-            
-            // Wait for cleanup with timeout
-            if (cleanup_future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
-                log_message("WARNING: OBS cleanup timeout - continuing with shutdown");
-            }
-        } else {
-            log_message("Skipping OBS cleanup - frontend unavailable");
-        }
-    } catch (const std::exception& e) {
-        log_message("WARNING: Exception during OBS cleanup: " + std::string(e.what()));
-    } catch (...) {
-        log_message("WARNING: Unknown exception during OBS cleanup");
-    }
-    
-    // Phase 3: Define thread management structure
-    struct ThreadInfo {
-        std::jthread* thread;
-        const char* name;
-    };
-    
-    ThreadInfo threads[] = {
-        {&m_persistence_monitor_thread, "persistence_monitor"},
-        {&m_duration_timer_thread, "duration_timer"},
-        {&m_window_gap_thread, "window_gap"},
-        {&m_rotation_jthread, "rotation"},
-        {&m_analytics_thread, "analytics"}
-    };
-    
-    // Phase 4: Request all threads to stop and wake them up
-    log_message("Requesting all threads to stop");
-    for (auto& info : threads) {
-        if (info.thread->joinable()) {
-            info.thread->request_stop();
-        }
-    }
-    
-    // Wake up all threads waiting on condition variables
-    m_shutdown_cv.notify_all();
-    
-    // Give threads a moment to respond to stop request
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    
-    // Phase 5: CRITICAL FIX - Non-blocking thread joins with timeout
-    const auto timeout_ms = std::chrono::milliseconds(300);  // Shorter timeout for shutdown
-    auto join_with_timeout = [&](std::jthread* thread, const char* name) {
-        if (!thread->joinable()) return true;
-        
-        log_message("Attempting to join " + std::string(name) + " thread with timeout");
-        
-        auto start = std::chrono::steady_clock::now();
-        while (thread->joinable() && (std::chrono::steady_clock::now() - start) < timeout_ms) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        
-        if (thread->joinable()) {
-            try {
-                // CRITICAL FIX: Use std::future for timeout-based join
-                auto join_future = std::async(std::launch::async, [&]() {
-                    thread->join();
-                });
-                
-                // Wait for join with very short timeout (100ms)
-                if (join_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
-                    log_message("Successfully joined " + std::string(name) + " thread");
-                    return true;
-                } else {
-                    log_message("CRITICAL: " + std::string(name) + " join timeout, detaching to prevent hang");
-                    thread->detach();  // IMMEDIATE DETACHMENT
-                    return false;
-                }
-            } catch (...) {
-                log_message("WARNING: Join failed for " + std::string(name) + " - detaching to prevent hang");
-                try {
-                    thread->detach();
-                } catch (...) {
-                    log_message("WARNING: Detach failed for " + std::string(name) + " (continuing)");
-                }
-                return false;
-            }
-        }
-        return true;
-    };
-    
-    // Join all main threads
-    for (auto& info : threads) {
-        join_with_timeout(info.thread, info.name);
-    }
-    
-    // Phase 6: Handle temporary threads
-    {
-        std::lock_guard<std::mutex> lock(m_threads_mutex);
-        for (auto& thread : m_temporary_threads) {
-            if (thread.joinable()) {
-                thread.request_stop();
-                
-                // Try to join with timeout
-                auto start = std::chrono::steady_clock::now();
-                while (thread.joinable() && (std::chrono::steady_clock::now() - start) < timeout_ms) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                }
-                
-                if (thread.joinable()) {
-                    try {
-                        // CRITICAL FIX: Use std::future for timeout-based join
-                        auto join_future = std::async(std::launch::async, [&]() {
-                            thread.join();
-                        });
-                        
-                        // Wait for join with very short timeout (100ms)
-                        if (join_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
-                            log_message("Successfully joined temporary thread");
-                        } else {
-                            log_message("CRITICAL: Temporary thread join timeout, detaching to prevent hang");
-                            thread.detach();  // IMMEDIATE DETACHMENT
-                        }
-                    } catch (...) {
-                        log_message("WARNING: Temporary thread join failed - detaching to prevent hang");
-                        try {
-                            thread.detach();
-                        } catch (...) {
-                            log_message("WARNING: Temporary thread detach failed (continuing)");
-                        }
-                    }
-                }
-            }
-        }
-        m_temporary_threads.clear();
-    }
-    
-    log_message("Banner manager proper shutdown completed");
-}
-
-void banner_manager::disconnect_scene_signals()
-{
-    log_message("SIGNALS: Starting scene signal disconnection...");
-    
-    // CRITICAL: Check if OBS frontend is available before attempting any signal operations
-    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-        log_message("SIGNALS: OBS frontend unavailable - skipping signal disconnection to prevent access violations");
-        m_signals_connected.store(false);  // Mark as disconnected
-        return;
-    }
-    
-    // Check shutdown flags
-    if (m_shutting_down || vorti::applets::obs_plugin::m_shutting_down.load()) {
-        log_message("SIGNALS: Shutdown in progress - using safe signal disconnection");
-    }
-    
-    if (!m_signals_connected.load()) {
-        log_message("SIGNALS: No signals connected - nothing to disconnect");
-        return;
-    }
-    
-    try {
-        // Add timeout protection for signal disconnection during shutdown
-        auto disconnect_start = std::chrono::steady_clock::now();
-        const auto disconnect_timeout = std::chrono::milliseconds(300);  // Max time for signal cleanup
-        
-        // CRITICAL: Use timeout-protected OBS API calls during shutdown
-        auto disconnect_future = std::async(std::launch::async, [&]() {
-            try {
-                // Get all scenes and disconnect signals
-                obs_frontend_source_list scenes = {};
-                obs_frontend_get_scenes(&scenes);
-                
-                if (scenes.sources.array && scenes.sources.num > 0) {
-                    log_message("SIGNALS: Disconnecting signals from " + std::to_string(scenes.sources.num) + " scenes");
-                    
-                    for (size_t i = 0; i < scenes.sources.num; i++) {
-                        obs_source_t* scene_source = scenes.sources.array[i];
-                        if (!scene_source) continue;
-                        
-                        obs_scene_t* scene = obs_scene_from_source(scene_source);
-                        if (!scene) continue;
-                        
-                        // Disconnect scene signals with protection
-                        // Get signal handler from source, not scene
-                        signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
-                        if (handler) {
-                            try {
-                                signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
-                                signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
-                                signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
-                            } catch (...) {
-                                log_message("SIGNALS: Exception disconnecting signals from scene " + std::to_string(i));
-                            }
-                        }
-                    }
-                }
-                
-                obs_frontend_source_list_free(&scenes);
-                log_message("SIGNALS: Scene signal disconnection completed successfully");
-                
-            } catch (...) {
-                log_message("SIGNALS: Exception during scene signal disconnection");
-                throw;  // Re-throw to be caught by timeout handler
-            }
-        });
-        
-        // Wait for disconnection with timeout
-        if (disconnect_future.wait_for(disconnect_timeout) == std::future_status::ready) {
-            log_message("SIGNALS: All scene signals disconnected successfully");
-        } else {
-            log_message("SIGNALS: CRITICAL - Signal disconnection timeout, may have access violation risk");
-        }
-        
-    } catch (...) {
-        log_message("SIGNALS: Exception during signal disconnection - OBS frontend may be unavailable");
-    }
-    
-    // Always mark signals as disconnected to prevent further attempts
-    m_signals_connected.store(false);
-    
-    // Log completion
-    log_message("SIGNALS: Signal disconnection completed");
-}
-
-bool banner_manager::is_obs_safe_to_call() const
-{
-    // Check both banner manager shutdown flag AND main plugin shutdown
-    return !m_shutting_down && !vorti::applets::obs_plugin::m_shutting_down.load() && 
-           vorti::applets::obs_plugin::m_obs_frontend_available.load();
+    log_message("Banner manager shutdown complete");
 }
 
 void banner_manager::initialize_after_obs_ready()
@@ -524,24 +134,14 @@ void banner_manager::initialize_after_obs_ready()
     }
     
     // Safety check - ensure OBS is fully initialized
-    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load() || !obs_frontend_get_current_scene()) {
+    if (!obs_frontend_get_current_scene()) {
         log_message("INITIALIZATION: OBS not fully initialized yet - delaying banner initialization");
         
         // Try again after a short delay
-        start_temporary_thread([this]() {
-            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
-            if (!m_shutting_down) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            
-            // Skip initialization if shutting down
-            if (m_shutting_down) {
-                log_message("INITIALIZATION: Skipping delayed init - shutdown in progress");
-                return;
-            }
-            
+        std::jthread([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             initialize_after_obs_ready();
-        });
+        }).detach();
         return;
     }
     
@@ -608,12 +208,6 @@ void banner_manager::connect_scene_signals()
 {
     log_message("Connecting scene signals for banner enforcement");
     
-    // Safety check: Don't call OBS APIs if frontend is unavailable
-    if (!is_obs_safe_to_call()) {
-        log_message("WARNING: Cannot connect scene signals - OBS frontend unavailable");
-        return;
-    }
-    
     // Connect to all existing scenes
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
@@ -642,7 +236,49 @@ void banner_manager::connect_scene_signals()
     log_message("Scene signals connected for " + std::to_string(connected_scenes) + " scenes - banner enforcement ACTIVE");
 }
 
-// Signal handler implementations follow below
+void banner_manager::disconnect_scene_signals()
+{
+    log_message("Disconnecting scene signals");
+    
+    try {
+    // Disconnect from all existing scenes
+    obs_frontend_source_list scenes = {};
+    obs_frontend_get_scenes(&scenes);
+    
+        if (!scenes.sources.array) {
+            log_message("WARNING: No scenes available for signal disconnection");
+            m_signals_connected.store(false);  // Reset flag even if no scenes
+            return;
+        }
+        
+        int disconnected_scenes = 0;
+    for (size_t i = 0; i < scenes.sources.num; i++) {
+        obs_source_t* scene_source = scenes.sources.array[i];
+            if (!scene_source) continue;
+        
+            signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
+        if (handler) {
+                // Disconnect all signal handlers
+            signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
+            signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
+            signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
+                disconnected_scenes++;
+        }
+    }
+    
+    obs_frontend_source_list_free(&scenes);
+        log_message("Scene signals disconnected from " + std::to_string(disconnected_scenes) + " scenes");
+        
+        // Reset flag after disconnection
+        m_signals_connected.store(false);
+        
+    } catch (...) {
+        log_message("ERROR: Exception during signal disconnection - ignoring");
+        m_signals_connected.store(false);  // Reset flag even if exception
+    }
+}
+
+// REMOVED: Legacy minimal signal handlers - no longer needed
 
 void banner_manager::on_item_remove(void* data, calldata_t* calldata)
 {
@@ -650,11 +286,6 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
     
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
-    // CRITICAL: Skip if shutting down
-    if (!manager->is_obs_safe_to_call()) {
-        return;  // Don't process signals during shutdown
-    }
     
     // CRITICAL: Skip if intentional hide is in progress
     if (manager->m_intentional_hide_in_progress.load()) {
@@ -679,33 +310,33 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
             if (!PremiumStatusHandler::is_premium(manager)) {
                 manager->log_message("SIGNAL: FREE USER - Starting banner restoration");
                 
-                start_safe_signal_thread(manager, [](banner_manager* mgr) {
-                    mgr->log_message("SIGNAL: Restoration jthread started");
+                std::jthread([manager]() {
+                    manager->log_message("SIGNAL: Restoration jthread started");
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     
                     // Check again if intentional hide is still in progress
-                    if (!mgr->m_intentional_hide_in_progress.load()) {
-                        mgr->log_message("SIGNAL: Calling enforce_banner_visibility");
-                        mgr->enforce_banner_visibility();
+                    if (!manager->m_intentional_hide_in_progress.load()) {
+                        manager->log_message("SIGNAL: Calling enforce_banner_visibility");
+                        manager->enforce_banner_visibility();
                         
                         // Also trigger cleanup for free users after restoration
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                        mgr->cleanup_banner_names_after_deletion();
+                        manager->cleanup_banner_names_after_deletion();
                     } else {
-                        mgr->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
+                        manager->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
                     }
                     
-                    mgr->log_message("SIGNAL: Restoration jthread completed");
-                });
+                    manager->log_message("SIGNAL: Restoration jthread completed");
+                }).detach();
             } else {
                 // PREMIUM USER: Trigger cleanup after banner deletion
                 PremiumStatusHandler::log_premium_action(manager, "banner deletion", "triggering cleanup");
                 
                 // Trigger cleanup in a jthread to avoid blocking the signal
-                start_safe_signal_thread(manager, [](banner_manager* mgr) {
+                std::jthread([manager]() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    mgr->cleanup_banner_names_after_deletion();
-                });
+                    manager->cleanup_banner_names_after_deletion();
+                }).detach();
             }
         }
         
@@ -720,11 +351,6 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
     
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
-    // CRITICAL: Skip if shutting down
-    if (!manager->is_obs_safe_to_call()) {
-        return;  // Don't process signals during shutdown
-    }
     
     // CRITICAL: Skip if intentional hide is in progress
     if (manager->m_intentional_hide_in_progress.load()) {
@@ -757,20 +383,20 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
                 manager->log_message("SIGNAL: FREE USER - Immediate banner restoration (jthread-based)");
                 
                 // jthread-based restoration for free users - more reliable than direct call
-                start_safe_signal_thread(manager, [item, name](banner_manager* mgr) {
+                std::jthread([manager, item, name]() {
                     try {
                         // Small delay to ensure the visibility change is complete
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         
                         // Check again if intentional hide is still in progress
-                        if (!mgr->m_intentional_hide_in_progress.load()) {
+                        if (!manager->m_intentional_hide_in_progress.load()) {
                             obs_sceneitem_set_visible(item, true);
-                            mgr->log_message("SIGNAL: Banner visibility restored - Name: " + std::string(name));
+                            manager->log_message("SIGNAL: Banner visibility restored - Name: " + std::string(name));
                         }
                     } catch (...) {
-                        mgr->log_message("SIGNAL: Exception in visibility restoration jthread");
+                        manager->log_message("SIGNAL: Exception in visibility restoration jthread");
                     }
-                });
+                }).detach();
             }
         }
         
@@ -786,11 +412,6 @@ void banner_manager::on_item_transform(void* data, calldata_t* calldata)
     
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
-    // CRITICAL: Skip if shutting down
-    if (!manager->is_obs_safe_to_call()) {
-        return;  // Don't process signals during shutdown
-    }
     
     // CRITICAL: Skip if we're currently correcting position (prevents infinite loop)
     if (manager->m_correcting_position.load()) {
@@ -876,37 +497,14 @@ void banner_manager::cleanup_for_scene_collection_change()
 
 void banner_manager::show_banner(bool enable_duration_timer)
 {
-    // CRITICAL: Don't show banner during shutdown
-    if (!is_obs_safe_to_call()) {
-        log_message("SHOW_BANNER: Skipping banner display - shutting down");
-        return;
-    }
-    
     log_message("SHOW_BANNER: Starting banner display process...");
     
     log_message("SHOW_BANNER: User type: " + PremiumStatusHandler::get_user_type_string(this));
     
-    // CHECK AD FREQUENCY LIMITS (free users only)
-    if (!PremiumStatusHandler::is_premium(this) && !can_show_ad_now()) {
-        auto now = std::chrono::system_clock::now();
-        auto time_since_last = std::chrono::duration_cast<std::chrono::seconds>(now - m_last_ad_end_time);
-        int remaining_wait = 60 - static_cast<int>(time_since_last.count());
-        
-        log_message("SHOW_BANNER: FREE USER - Ad frequency limit exceeded. Must wait " + 
-                   std::to_string(remaining_wait) + " more seconds before next ad.");
-        return; // Don't show the banner yet
-    }
+    // AD FREQUENCY LIMITS REMOVED - handled by external application
+    // Premium users can show banners anytime, free users controlled externally
     
-    // STOP ANY EXISTING DURATION TIMER
-    stop_duration_timer();
-    
-    // START WINDOW MANAGEMENT (if not already active)
-    if (!m_window_active.load()) {
-        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        start_ad_window("banner_" + std::to_string(timestamp));
-        log_message("SHOW_BANNER: Started ad window for banner display");
-    }
+    // Window management removed - handled by external application
     
     if (!m_banner_source) {
         log_message("SHOW_BANNER: No banner source exists, creating one...");
@@ -949,19 +547,8 @@ void banner_manager::show_banner(bool enable_duration_timer)
         log_message("SHOW_BANNER: FREE USER - Enforcing banner visibility");
         enforce_banner_visibility();
         
-        // ADD DURATION CONTROL: Auto-hide after time limit for free users (if requested)
-        if (enable_duration_timer) {
-            int custom_duration = m_custom_banner_duration.load();
-            int max_duration = custom_duration > 0 ? 
-                              std::min(custom_duration, get_max_duration_for_user_type()) : 
-                              get_max_duration_for_user_type(); // Respect user type limits
-            log_message("SHOW_BANNER: FREE USER - Starting duration timer for " + std::to_string(max_duration) + 
-                       " seconds" + (custom_duration > 0 ? " (custom duration)" : " (default)"));
-            
-            start_duration_timer(max_duration);
-        } else {
-            log_message("SHOW_BANNER: FREE USER - Duration timer skipped (managed externally)");
-        }
+        // Duration control removed - handled by external application
+        log_message("SHOW_BANNER: FREE USER - Duration managed externally");
     } else {
         // PREMIUM USERS: Complete freedom - NO forced banner initialization
         PremiumStatusHandler::log_premium_action(this, "banner display", "complete freedom mode (no forced banners)");
@@ -969,18 +556,9 @@ void banner_manager::show_banner(bool enable_duration_timer)
         // NO automatic banner creation for premium users
         // They have complete choice whether to have banners or not
         
-        // But if they do show a banner, apply premium duration limits (if requested)
-        if (enable_duration_timer && m_banner_source && m_banner_visible) {
-            int custom_duration = m_custom_banner_duration.load();
-            int max_duration = custom_duration > 0 ? 
-                              std::min(custom_duration, get_max_duration_for_user_type()) : 
-                              get_max_duration_for_user_type(); // Premium users get longer limits
-            log_message("SHOW_BANNER: PREMIUM USER - Starting duration timer for " + std::to_string(max_duration) + 
-                       " seconds" + (custom_duration > 0 ? " (custom duration)" : " (default)"));
-            
-            start_duration_timer(max_duration);
-        } else if (!enable_duration_timer) {
-            log_message("SHOW_BANNER: PREMIUM USER - Duration timer skipped (managed externally)");
+        // Duration control removed - handled by external application
+        if (m_banner_source && m_banner_visible) {
+            log_message("SHOW_BANNER: PREMIUM USER - Duration managed externally");
         }
     }
     
@@ -989,12 +567,6 @@ void banner_manager::show_banner(bool enable_duration_timer)
 
 void banner_manager::hide_banner()
 {
-    // CRITICAL: Don't hide banner during shutdown
-    if (!is_obs_safe_to_call()) {
-        log_message("HIDE_BANNER: Skipping banner hide - shutting down");
-        return;
-    }
-    
     log_message("HIDE_BANNER: Starting banner hide process...");
     
     // Check premium status - free users have VERY limited hiding privileges
@@ -1011,51 +583,28 @@ void banner_manager::hide_banner()
         
         // Schedule auto-restore in only 5 seconds for free users (very limited hiding)
         // BUT don't auto-restore if this is a duration timer hide (permanent until next ad)
-        start_temporary_thread([this]() {
-            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
-            if (!m_shutting_down) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-            }
-            
-            // Skip all operations if shutting down
-            if (m_shutting_down) {
-                log_message("HIDE_BANNER: Skipping auto-restore - shutdown in progress");
-                return;
-            }
-            
+        std::jthread([this]() {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             if (!PremiumStatusHandler::is_premium(this)) {
                 // Only auto-restore if this wasn't a duration timer hide (check if we can show ads)
-                if (can_show_ad_now()) {
-                    log_message("HIDE_BANNER: FREE USER - Auto-restoring banner after 5 seconds");
-                    show_banner();
-                    
-                    // CRITICAL: Re-enable full protection system for free users
-                    log_message("HIDE_BANNER: FREE USER - Re-enabling signal-based protection system");
-                    connect_scene_signals();
-                    start_persistence_monitor();
-                    log_message("HIDE_BANNER: FREE USER - Protection system fully re-enabled");
-                } else {
-                    log_message("HIDE_BANNER: FREE USER - Skipping auto-restore - ad frequency limit active");
-                }
+                // Auto-restore for free users (frequency control handled externally)
+                log_message("HIDE_BANNER: FREE USER - Auto-restoring banner after 5 seconds");
+                show_banner();
+                
+                // CRITICAL: Re-enable full protection system for free users
+                log_message("HIDE_BANNER: FREE USER - Re-enabling signal-based protection system");
+                connect_scene_signals();
+                start_persistence_monitor();
+                log_message("HIDE_BANNER: FREE USER - Protection system fully re-enabled");
             }
             // Clear the flag after the hide period is over
             m_intentional_hide_in_progress.store(false);
             log_message("HIDE_BANNER: FREE USER - Signal protection disabled after hide period");
-        });
+        }).detach();
         
         // Also clear the flag after a short delay in case the jthread doesn't work
-        start_temporary_thread([this]() {
-            // SHUTDOWN FIX: Skip sleep if shutting down to prevent OBS hanging
-            if (!m_shutting_down) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
-            }
-            
-            // Skip all operations if shutting down
-            if (m_shutting_down) {
-                log_message("HIDE_BANNER: Skipping safety timeout - shutdown in progress");
-                return;
-            }
-            
+        std::jthread([this]() {
+            std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
             m_intentional_hide_in_progress.store(false);
             
             // Safety re-enable of protection system
@@ -1065,7 +614,7 @@ void banner_manager::hide_banner()
                 start_persistence_monitor();
             }
             log_message("HIDE_BANNER: FREE USER - Signal protection safety timeout reached");
-        });
+        }).detach();
         
         log_message("HIDE_BANNER: FREE USER - Banner temporarily hidden (5sec auto-restore - upgrade for full control)");
         return;
@@ -1315,11 +864,6 @@ obs_source_t* banner_manager::get_banner_source() const
 
 void banner_manager::add_banner_menu()
 {
-    if (!is_obs_safe_to_call()) {
-        log_message("WARNING: Cannot add banner menu - OBS frontend unavailable");
-        return;
-    }
-    
     // Add VortiDeck banner menu to OBS
     obs_frontend_add_tools_menu_item("VortiDeck Banner", banner_menu_callback, this);
     log_message("VortiDeck Banner menu added to OBS Tools menu");
@@ -1366,12 +910,6 @@ void banner_manager::banner_menu_callback(void* data)
 
 void banner_manager::create_banner_source(std::string_view content_data, std::string_view content_type)
 {
-    // CRITICAL: Don't create banner sources during shutdown
-    if (!is_obs_safe_to_call()) {
-        log_message("BANNER CREATION: Skipping banner source creation - shutting down");
-        return;
-    }
-    
     log_message(std::format("BANNER CREATION: Starting banner source creation - Type: {}, Data: {}...", content_type, content_data.substr(0, 50)));
     
     // IMPROVEMENT: Check if a banner source already exists with the base name
@@ -1460,7 +998,7 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
              obs_data_set_int(settings, "fps", 30);
              obs_data_set_bool(settings, "reroute_audio", false);
              obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-             obs_data_set_bool(settings, "shutdown", true); // Allow proper CEF cleanup during shutdown
+             obs_data_set_bool(settings, "shutdown", false);
              obs_data_set_string(settings, "css", css_content.c_str());
              
              // Update the browser source
@@ -1534,11 +1072,6 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
     obs_data_release(settings);
     
     if (m_banner_source) {
-        // CRITICAL FIX: Extra safety - ensure source is muted after creation
-        obs_source_set_muted(m_banner_source, true);
-        obs_source_set_volume(m_banner_source, 0.0f);
-        obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
-        
         // Add VortiDeck protection metadata to the browser source
         obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
         obs_data_set_string(private_settings, "vortideck_banner", "true");
@@ -1613,12 +1146,6 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
 void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
                                                              std::string_view custom_css, int custom_width, int custom_height, bool css_locked)
 {
-    // CRITICAL: Don't create banner sources during shutdown
-    if (!is_obs_safe_to_call()) {
-        log_message("ENHANCED BANNER CREATION: Skipping banner source creation - shutting down");
-        return;
-    }
-    
     log_message(std::format("ENHANCED BANNER CREATION: Starting banner source creation with custom params - Type: {}, Data: {}...", 
                           content_type, content_data.substr(0, 50)));
     log_message(std::format("ENHANCED BANNER CREATION: Custom CSS: {}, Dimensions: {}x{}", 
@@ -1801,10 +1328,7 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
             obs_data_set_int(settings, "fps", 30);
             obs_data_set_bool(settings, "reroute_audio", false);
             obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-            obs_data_set_bool(settings, "shutdown", true); // Allow proper CEF cleanup during shutdown
-            // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
-            obs_data_set_bool(settings, "mute", true);
-            obs_data_set_double(settings, "volume", 0.0);
+            obs_data_set_bool(settings, "shutdown", false);
             obs_data_set_string(settings, "css", css_content.c_str());
             
             // Update the browser source
@@ -1877,9 +1401,6 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
     obs_data_set_bool(settings, "reroute_audio", false);
     obs_data_set_bool(settings, "restart_when_active", true); // Help with content loading
     obs_data_set_bool(settings, "shutdown", false);
-    // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
-    obs_data_set_bool(settings, "mute", true);
-    obs_data_set_double(settings, "volume", 0.0);
     obs_data_set_string(settings, "css", css_content.c_str());
     
     log_message("ENHANCED BANNER CREATION: Attempting to create browser_source directly...");
@@ -1893,11 +1414,6 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
     obs_data_release(settings);
     
     if (m_banner_source) {
-        // CRITICAL FIX: Extra safety - ensure source is muted after creation
-        obs_source_set_muted(m_banner_source, true);
-        obs_source_set_volume(m_banner_source, 0.0f);
-        obs_source_set_monitoring_type(m_banner_source, OBS_MONITORING_TYPE_NONE);
-        
         // Add VortiDeck protection metadata to the browser source
         obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
         obs_data_set_string(private_settings, "vortideck_banner", "true");
@@ -1925,11 +1441,6 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
 
 void banner_manager::add_banner_to_current_scene()
 {
-    if (!is_obs_safe_to_call()) {
-        log_message("WARNING: Cannot add banner to scene - OBS frontend unavailable");
-        return;
-    }
-    
     if (!m_banner_source) {
         log_message("No banner source to add");
         return;
@@ -1986,11 +1497,6 @@ void banner_manager::add_banner_to_current_scene()
 
 void banner_manager::initialize_banners_all_scenes()
 {
-    if (!is_obs_safe_to_call()) {
-        log_message("WARNING: Cannot initialize banners - OBS frontend unavailable");
-        return;
-    }
-    
     // This function is ONLY for FREE USERS - premium users have complete freedom
     if (PremiumStatusHandler::is_premium(this)) {
         PremiumStatusHandler::log_premium_action(this, "banner initialization", "SKIPPED - complete banner freedom");
@@ -2073,75 +1579,34 @@ void banner_manager::initialize_banners_all_scenes()
 
 void banner_manager::remove_banner_from_scenes()
 {
-    // CRITICAL: During shutdown, we MUST remove banners even if m_shutting_down is true
-    // Only check if OBS frontend is available, not if we're shutting down
-    if (!vorti::applets::obs_plugin::m_obs_frontend_available.load()) {
-        log_message("WARNING: Cannot remove banners from scenes - OBS frontend unavailable");
-        return;
+    obs_frontend_source_list scenes = {};
+    obs_frontend_get_scenes(&scenes);
+    
+    int scenes_hidden = 0;
+    
+    for (size_t i = 0; i < scenes.sources.num; i++) {
+        obs_source_t* source = scenes.sources.array[i];
+        if (!source) continue;
+        
+        obs_scene_t* scene = obs_scene_from_source(source);
+        if (!scene) continue;
+        
+        // Use metadata-based detection instead of name-based
+        obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
+        if (item) {
+            obs_sceneitem_set_visible(item, false);
+            scenes_hidden++;
+        }
     }
     
-    // TIMEOUT PROTECTION: Limit execution time to prevent shutdown hangs
-    auto timeout_start = std::chrono::steady_clock::now();
-    const auto timeout_duration = std::chrono::milliseconds(500); // 500ms max
+    obs_frontend_source_list_free(&scenes);
     
-    obs_frontend_source_list scenes = {};
-    
-    try {
-        // Protected OBS API call with immediate timeout check
-        obs_frontend_get_scenes(&scenes);
-        
-        if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
-            log_message("TIMEOUT: remove_banner_from_scenes exceeded time limit during obs_frontend_get_scenes");
-            obs_frontend_source_list_free(&scenes);
-            return;
-        }
-        
-        int scenes_hidden = 0;
-        
-        for (size_t i = 0; i < scenes.sources.num; i++) {
-            // Early exit if timeout exceeded or shutdown detected
-            if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
-                log_message("TIMEOUT: remove_banner_from_scenes exceeded time limit during scene iteration");
-                break;
-            }
-            
-            obs_source_t* source = scenes.sources.array[i];
-            if (!source) continue;
-            
-            obs_scene_t* scene = obs_scene_from_source(source);
-            if (!scene) continue;
-            
-            // Use metadata-based detection instead of name-based
-            obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
-            if (item) {
-                // CRITICAL: If we're shutting down, remove the item entirely to prevent audio issues
-                if (m_shutting_down || vorti::applets::obs_plugin::m_shutting_down.load()) {
-                    obs_sceneitem_remove(item);
-                    log_message("SHUTDOWN: Removed banner item from scene to prevent audio crashes");
-                } else {
-                    obs_sceneitem_set_visible(item, false);
-                }
-                scenes_hidden++;
-            }
-        }
-        
-        obs_frontend_source_list_free(&scenes);
-        
-        // Update the visibility flag based on actual scene state
-        if (scenes_hidden > 0) {
-            m_banner_visible = false;
-            log_message("Banner removed from " + std::to_string(scenes_hidden) + " scenes");
-        } else {
-            log_message("No banners found to remove from scenes");
-        }
-        
-    } catch (...) {
-        log_message("ERROR: Exception in remove_banner_from_scenes - cleaning up");
-        try {
-            obs_frontend_source_list_free(&scenes);
-        } catch (...) {
-            // Ignore cleanup errors during shutdown
-        }
+    // Update the visibility flag based on actual scene state
+    if (scenes_hidden > 0) {
+        m_banner_visible = false;
+        log_message("Banner removed from " + std::to_string(scenes_hidden) + " scenes");
+    } else {
+        log_message("No banners found to remove from scenes");
     }
 }
 
@@ -2419,358 +1884,6 @@ void banner_manager::log_message(std::string_view message) const
     blog(LOG_INFO, "[Banner Manager] %s", message.data());
 }
 
-// ============================================================================
-// ANALYTICS TRACKING IMPLEMENTATION
-// ============================================================================
-
-void banner_manager::track_ad_display_start(const std::string& ad_id, const std::string& campaign_id, 
-                                           int planned_duration_ms, const std::string& content_type)
-{
-    if (!m_analytics.tracking_enabled.load()) {
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(m_analytics.analytics_mutex);
-    
-    // Store current display info
-    m_current_ad_id = ad_id;
-    m_current_campaign_id = campaign_id;
-    m_current_display_start = std::chrono::system_clock::now();
-    m_current_planned_duration.store(planned_duration_ms);
-    
-    // Create display metrics entry
-    AdDisplayMetrics metrics;
-    metrics.ad_id = ad_id;
-    metrics.campaign_id = campaign_id;
-    metrics.start_time = m_current_display_start;
-    metrics.planned_duration_ms = planned_duration_ms;
-    metrics.actual_duration_ms = 0; // Will be updated on end
-    metrics.viewer_count_at_display = calculate_current_viewer_estimate();
-    metrics.completion_percentage = 0.0;
-    metrics.premium_user = m_is_premium.load();
-    metrics.revenue_share = m_revenue_share.load();
-    metrics.content_type = content_type;
-    metrics.content_size_bytes = 0; // Could be calculated from content
-    
-    // Add to display history
-    m_analytics.display_history.push_back(metrics);
-    
-    // Update totals
-    m_analytics.total_displays.fetch_add(1);
-    
-    log_message("ANALYTICS: Ad display started - ID: " + ad_id + ", Campaign: " + campaign_id + 
-               ", Planned duration: " + std::to_string(planned_duration_ms) + "ms" +
-               ", Viewers: " + std::to_string(metrics.viewer_count_at_display) +
-               ", Premium: " + std::string(metrics.premium_user ? "true" : "false") +
-               ", Revenue share: " + std::to_string(metrics.revenue_share * 100) + "%");
-}
-
-void banner_manager::track_ad_display_end(const std::string& ad_id, int actual_duration_ms)
-{
-    if (!m_analytics.tracking_enabled.load()) {
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(m_analytics.analytics_mutex);
-    
-    // Find the corresponding display metrics
-    AdDisplayMetrics* metrics = find_active_ad_display(ad_id);
-    if (!metrics) {
-        log_message("ANALYTICS: WARNING - Could not find active display for ad ID: " + ad_id);
-        return;
-    }
-    
-    // Update metrics
-    metrics->end_time = std::chrono::system_clock::now();
-    metrics->actual_duration_ms = actual_duration_ms;
-    metrics->completion_percentage = calculate_completion_percentage(actual_duration_ms, metrics->planned_duration_ms);
-    
-    // Update totals
-    m_analytics.total_duration_ms.fetch_add(actual_duration_ms);
-    
-    // Calculate revenue for this display
-    double base_revenue = 0.01; // Base revenue per second (configurable)
-    double revenue_for_this_display = (actual_duration_ms / 1000.0) * base_revenue * metrics->revenue_share;
-    m_analytics.total_revenue.fetch_add(revenue_for_this_display);
-    
-    log_message("ANALYTICS: Ad display ended - ID: " + ad_id + 
-               ", Actual duration: " + std::to_string(actual_duration_ms) + "ms" +
-               ", Completion: " + std::to_string(metrics->completion_percentage) + "%" +
-               ", Revenue: $" + std::to_string(revenue_for_this_display));
-    
-    // Send individual display analytics
-    send_display_analytics(*metrics);
-    
-    // Clear current display tracking
-    m_current_ad_id.clear();
-    m_current_campaign_id.clear();
-    m_current_planned_duration.store(0);
-}
-
-void banner_manager::track_viewer_metrics(int estimated_viewers, double bitrate, double framerate)
-{
-    if (!m_analytics.tracking_enabled.load()) {
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(m_analytics.analytics_mutex);
-    
-    ViewerMetrics metrics;
-    metrics.timestamp = std::chrono::system_clock::now();
-    metrics.estimated_viewers = estimated_viewers;
-    metrics.twitch_viewers = m_current_twitch_viewers.load();
-    metrics.youtube_viewers = m_current_youtube_viewers.load();
-    metrics.facebook_viewers = m_current_facebook_viewers.load();
-    metrics.stream_bitrate = bitrate;
-    metrics.stream_framerate = framerate;
-    metrics.stream_quality_score = (framerate >= 30 && bitrate >= 2000) ? 1.0 : 0.5;
-    
-    // Add to viewer history (keep last 100 entries)
-    m_analytics.viewer_history.push_back(metrics);
-    if (m_analytics.viewer_history.size() > 100) {
-        m_analytics.viewer_history.erase(m_analytics.viewer_history.begin());
-    }
-    
-    // Update estimated total viewers
-    m_estimated_total_viewers.store(estimated_viewers);
-    m_analytics.average_viewer_count.store(estimated_viewers);
-}
-
-void banner_manager::update_platform_viewer_count(const std::string& platform, int viewer_count)
-{
-    if (platform == "twitch") {
-        m_current_twitch_viewers.store(viewer_count);
-    } else if (platform == "youtube") {
-        m_current_youtube_viewers.store(viewer_count);
-    } else if (platform == "facebook") {
-        m_current_facebook_viewers.store(viewer_count);
-    }
-    
-    // Recalculate total estimated viewers
-    int total = m_current_twitch_viewers.load() + m_current_youtube_viewers.load() + m_current_facebook_viewers.load();
-    m_estimated_total_viewers.store(total);
-    
-    log_message("ANALYTICS: Platform viewer update - " + platform + ": " + std::to_string(viewer_count) + 
-               ", Total estimated: " + std::to_string(total));
-}
-
-void banner_manager::send_display_analytics(const AdDisplayMetrics& metrics)
-{
-    // Create analytics report message
-    nlohmann::json analytics_msg = {
-        {"path", "/api/v1/integration/obs/analytics/ad-display"},
-        {"verb", "SET"},
-        {"payload", {
-            {"ad_id", metrics.ad_id},
-            {"campaign_id", metrics.campaign_id},
-            {"display_count", 1},
-            {"display_duration_ms", metrics.actual_duration_ms},
-            {"planned_duration_ms", metrics.planned_duration_ms},
-            {"completion_percentage", metrics.completion_percentage},
-            {"viewer_count", metrics.viewer_count_at_display},
-            {"premium_status", metrics.premium_user ? "true" : "false"},
-            {"revenue_share", metrics.revenue_share},
-            {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(metrics.start_time.time_since_epoch()).count()},
-            {"content_type", metrics.content_type},
-            {"stream_metrics", {
-                {"bitrate", 0}, // Will be populated from current stream data
-                {"framerate", 0},
-                {"resolution", "1920x1080"} // Default, could be detected
-            }}
-        }}
-    };
-    
-    // Send message via WebSocket (need to access obs_plugin instance)
-    log_message("ANALYTICS: Sending display analytics for ad: " + metrics.ad_id);
-    
-    // Send via WebSocket if plugin instance is available
-    if (g_obs_plugin_instance && g_obs_plugin_instance->is_connected()) {
-        if (g_obs_plugin_instance->send_message(analytics_msg)) {
-            log_message("ANALYTICS: Display analytics sent successfully for ad: " + metrics.ad_id);
-        } else {
-            log_message("ANALYTICS: Failed to send display analytics for ad: " + metrics.ad_id);
-        }
-    } else {
-        log_message("ANALYTICS: WebSocket not connected, logging display analytics: " + analytics_msg.dump());
-    }
-}
-
-void banner_manager::send_batch_analytics_report()
-{
-    if (!m_analytics.tracking_enabled.load()) {
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(m_analytics.analytics_mutex);
-    
-    auto now = std::chrono::system_clock::now();
-    auto report_interval = std::chrono::seconds(m_analytics.report_interval_seconds.load());
-    
-    // Check if it's time to send a report
-    if (now - m_analytics.last_report_time < report_interval) {
-        return;
-    }
-    
-    // Calculate report period
-    auto period_start = m_analytics.last_report_time;
-    auto period_end = now;
-    
-    // Count displays in this period
-    int displays_in_period = 0;
-    int total_duration_in_period = 0;
-    double total_revenue_in_period = 0.0;
-    std::map<std::string, int> campaign_displays;
-    
-    for (const auto& display : m_analytics.display_history) {
-        if (display.start_time >= period_start && display.start_time <= period_end) {
-            displays_in_period++;
-            total_duration_in_period += display.actual_duration_ms;
-            
-            // Simple revenue calculation
-            double base_revenue = 0.01; // Base revenue per second
-            double revenue = (display.actual_duration_ms / 1000.0) * base_revenue * display.revenue_share;
-            total_revenue_in_period += revenue;
-            
-            campaign_displays[display.campaign_id]++;
-        }
-    }
-    
-    // Create batch analytics report
-    nlohmann::json batch_report = {
-        {"path", "/api/v1/integration/obs/analytics/batch-report"},
-        {"verb", "SET"},
-        {"payload", {
-            {"report_period_start", std::chrono::duration_cast<std::chrono::milliseconds>(period_start.time_since_epoch()).count()},
-            {"report_period_end", std::chrono::duration_cast<std::chrono::milliseconds>(period_end.time_since_epoch()).count()},
-            {"total_ads_displayed", displays_in_period},
-            {"total_display_time_ms", total_duration_in_period},
-            {"average_viewer_count", m_analytics.average_viewer_count.load()},
-            {"premium_user", m_is_premium.load()},
-            {"revenue_generated", total_revenue_in_period},
-            {"ads_by_campaign", nlohmann::json::array()}
-        }}
-    };
-    
-    // Add campaign breakdown
-    for (const auto& [campaign_id, count] : campaign_displays) {
-        batch_report["payload"]["ads_by_campaign"].push_back({
-            {"campaign_id", campaign_id},
-            {"displays", count},
-            {"total_duration_ms", total_duration_in_period}, // Simplified for now
-            {"completion_rate", 95.0} // Placeholder
-        });
-    }
-    
-    // Update last report time
-    m_analytics.last_report_time = now;
-    
-    log_message("ANALYTICS: Sending batch report - Displays: " + std::to_string(displays_in_period) + 
-               ", Duration: " + std::to_string(total_duration_in_period) + "ms" +
-               ", Revenue: $" + std::to_string(total_revenue_in_period));
-    
-    // Send via WebSocket if plugin instance is available
-    if (g_obs_plugin_instance && g_obs_plugin_instance->is_connected()) {
-        if (g_obs_plugin_instance->send_message(batch_report)) {
-            log_message("ANALYTICS: Batch report sent successfully");
-        } else {
-            log_message("ANALYTICS: Failed to send batch report");
-        }
-    } else {
-        log_message("ANALYTICS: WebSocket not connected, logging batch report: " + batch_report.dump());
-    }
-}
-
-void banner_manager::enable_analytics_tracking(bool enable, int report_interval_seconds)
-{
-    m_analytics.tracking_enabled.store(enable);
-    m_analytics.report_interval_seconds.store(report_interval_seconds);
-    
-    if (enable) {
-        m_analytics.last_report_time = std::chrono::system_clock::now();
-        log_message("ANALYTICS: Tracking enabled - Report interval: " + std::to_string(report_interval_seconds) + " seconds");
-    } else {
-        log_message("ANALYTICS: Tracking disabled");
-    }
-}
-
-banner_manager::AdDisplayMetrics* banner_manager::find_active_ad_display(const std::string& ad_id)
-{
-    for (auto& display : m_analytics.display_history) {
-        if (display.ad_id == ad_id && display.actual_duration_ms == 0) {
-            return &display;
-        }
-    }
-    return nullptr;
-}
-
-int banner_manager::calculate_current_viewer_estimate()
-{
-    // Get real OBS streaming data - only if frontend is available and not shutting down
-    if (!is_obs_safe_to_call()) {
-        return 0;  // Frontend unavailable or shutting down, return 0 viewers
-    }
-    
-    obs_output_t* streaming_output = obs_frontend_get_streaming_output();
-    if (!streaming_output) {
-        // Not streaming, return 0
-        return 0;
-    }
-    
-    // Get actual streaming statistics
-    uint64_t total_bytes = obs_output_get_total_bytes(streaming_output);
-    uint32_t total_frames = obs_output_get_total_frames(streaming_output);
-    uint32_t dropped_frames = obs_output_get_frames_dropped(streaming_output);
-    // float congestion = obs_output_get_congestion(streaming_output); // Not used currently
-    
-    // Calculate bitrate (bytes per second)
-    static auto start_time = std::chrono::steady_clock::now();
-    auto current_time = std::chrono::steady_clock::now();
-    auto duration_seconds = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
-    
-    if (duration_seconds > 0) {
-        uint64_t bitrate = (total_bytes * 8) / duration_seconds; // bits per second
-        
-        // Rough viewer estimation based on bitrate
-        // Higher bitrate usually means more viewers (streamers increase quality for more viewers)
-        int estimated_viewers = 0;
-        
-        if (bitrate > 0) {
-            // Basic estimation: 1 viewer per 1000 bits/second (very rough)
-            estimated_viewers = static_cast<int>(bitrate / 1000);
-            
-            // Apply quality adjustment based on frame drops
-            if (dropped_frames > 0 && total_frames > 0) {
-                float drop_rate = static_cast<float>(dropped_frames) / total_frames;
-                estimated_viewers = static_cast<int>(estimated_viewers * (1.0f - drop_rate));
-            }
-            
-            // Cap at reasonable limits
-            estimated_viewers = std::max(1, std::min(estimated_viewers, 100000));
-        }
-        
-        log_message("REAL DATA: Bitrate: " + std::to_string(bitrate) + " bps, " +
-                   "Frames: " + std::to_string(total_frames) + ", " +
-                   "Dropped: " + std::to_string(dropped_frames) + ", " +
-                   "Estimated viewers: " + std::to_string(estimated_viewers));
-        
-        obs_output_release(streaming_output);
-        return estimated_viewers;
-    }
-    
-    obs_output_release(streaming_output);
-    
-    // Use combined platform viewer counts if available
-    int total_viewers = m_estimated_total_viewers.load();
-    return total_viewers > 0 ? total_viewers : 0;
-}
-
-double banner_manager::calculate_completion_percentage(int actual_duration, int planned_duration)
-{
-    if (planned_duration <= 0) return 0.0;
-    
-    double percentage = (static_cast<double>(actual_duration) / planned_duration) * 100.0;
-    return std::min(percentage, 100.0); // Cap at 100%
-}
 
 // Premium Status and Monetization Functions
 
@@ -2839,48 +1952,29 @@ void banner_manager::start_persistence_monitor()
     
     m_persistence_monitor_active = true;
     
-    // Stop any existing monitor thread
-    if (m_persistence_monitor_thread.joinable()) {
-        m_persistence_monitor_thread.request_stop();
-        m_persistence_monitor_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join to prevent hanging
-    }
-    
     // Monitor banner visibility and window timeouts with reasonable intervals
-    m_persistence_monitor_thread = std::jthread([this](std::stop_token stop_token) {
-        while (m_persistence_monitor_active && !stop_token.stop_requested() && !m_shutting_down.load()) {
+    std::jthread([this]() {
+        while (m_persistence_monitor_active) {
             bool is_premium = m_is_premium.load();
             
-            // ALWAYS check for expired windows first (regardless of user type)
-            auto_close_expired_windows();
+            // Window management removed - handled by external application
             
-            // CRITICAL: Use condition variable for immediate interrupt during shutdown
-            std::mutex wait_mutex;
-            std::unique_lock<std::mutex> wait_lock(wait_mutex);
-            
-            // Wait for 2 seconds OR until shutdown notification
-            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(2), [&]() {
-                return stop_token.stop_requested() || !m_persistence_monitor_active || m_shutting_down.load();
-            })) {
-                // Woke up due to shutdown request
-                log_message("Persistence monitor jthread exited: immediate shutdown requested");
-                return;
-            }
-            
-            // Only enforce banner visibility if still active and not shutting down
-            if (m_persistence_monitor_active && !stop_token.stop_requested() && !m_shutting_down) {
-                if (!is_premium) {
-                    if (m_banner_source && !is_banner_visible()) {
-                        enforce_banner_visibility();
-                    }
-                } else if (m_banner_persistent) {
-                    if (m_banner_source && !is_banner_visible()) {
-                        enforce_banner_visibility();
-                    }
+            if (!is_premium) {
+                std::this_thread::sleep_for(std::chrono::seconds(2)); // Check more frequently for testing
+                if (m_banner_source && !is_banner_visible()) {
+                    enforce_banner_visibility();
                 }
+            } else if (m_banner_persistent) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                if (m_banner_source && !is_banner_visible()) {
+                    enforce_banner_visibility();
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
-        log_message("Persistence monitor jthread exited: monitor loop ended");
-    });
+        log_message("Persistence monitor jthread exited");
+    }).detach();
     
     bool is_premium = m_is_premium.load();
     if (!is_premium) {
@@ -2895,46 +1989,12 @@ void banner_manager::stop_persistence_monitor()
     if (m_persistence_monitor_active) {
         m_persistence_monitor_active = false;
         m_banner_persistent = false;
-        
-        // Properly stop and join the monitor thread with timeout
-        if (m_persistence_monitor_thread.joinable()) {
-            m_persistence_monitor_thread.request_stop();
-            
-            auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
-            
-            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
-            bool joined = false;
-            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
-                if (!m_persistence_monitor_thread.joinable()) {
-                    joined = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            
-            if (m_persistence_monitor_thread.joinable()) {
-                if (joined) {
-                    log_message("PERSISTENCE: Monitor thread joined successfully");
-                } else {
-                    log_message("PERSISTENCE: Monitor thread join timeout, detaching to prevent hang");
-                    m_persistence_monitor_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
-                }
-            }
-        }
-        
         log_message("Persistence monitor stopped");
     }
 }
 
 void banner_manager::enforce_banner_visibility()
 {
-    // CRITICAL: Don't enforce during shutdown
-    if (!is_obs_safe_to_call()) {
-        log_message("PERSISTENCE: Skipping enforcement - shutting down");
-        return;
-    }
-    
     // CRITICAL: Don't enforce during intentional hide operations
     if (m_intentional_hide_in_progress.load()) {
         log_message("PERSISTENCE: Skipping enforcement - intentional hide in progress");
@@ -2942,10 +2002,8 @@ void banner_manager::enforce_banner_visibility()
     }
     
     // Don't enforce if banner is supposed to be hidden due to frequency limits
-    if (!m_is_premium.load() && !can_show_ad_now()) {
-        log_message("PERSISTENCE: Skipping enforcement - ad frequency limit active");
-        return;
-    }
+    // Ad frequency limits removed - handled externally
+    // Persistence enforcement always active for applicable users
     
     bool is_premium = m_is_premium.load();
     
@@ -2973,7 +2031,7 @@ void banner_manager::enforce_banner_visibility()
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
     
-    bool banner_found [[maybe_unused]] = false;
+    bool banner_found = false;
     bool action_taken = false;
     
     for (size_t i = 0; i < scenes.sources.num; i++) {
@@ -3157,9 +2215,6 @@ void banner_manager::register_vortideck_banner_source()
         obs_data_set_bool(browser_settings, "reroute_audio", false);
         obs_data_set_bool(browser_settings, "restart_when_active", true);
         obs_data_set_bool(browser_settings, "shutdown", false);
-        // CRITICAL FIX: Disable all audio output to prevent crashes during shutdown
-        obs_data_set_bool(browser_settings, "mute", true);
-        obs_data_set_double(browser_settings, "volume", 0.0);
         
         // Create the browser source
         obs_source_t* browser_source = obs_source_create("browser_source", obs_source_get_name(source), browser_settings, nullptr);
@@ -3276,781 +2331,28 @@ void banner_manager::unregister_vortideck_banner_source()
 // Custom source callbacks removed - using browser_source directly for full compatibility
 
 // ============================================================================
-// BANNER QUEUE MANAGEMENT IMPLEMENTATION
+// BANNER QUEUE MANAGEMENT IMPLEMENTATION - REMOVED
 // ============================================================================
+// All queue and rotation methods have been removed as they are now handled
+// by the external application
 
-void banner_manager::set_ad_queue(const std::vector<AdWindow>& queue)
-{
-    std::lock_guard<std::mutex> lock(m_ad_queue.queue_mutex);
-    
-    // Stop current rotation
-    stop_ad_rotation();
-    
-    // Clear existing queue and set new one
-    m_ad_queue.banners = queue;
-    m_ad_queue.current_index.store(0);
-    
-    log_message("QUEUE: Set new ad queue with " + std::to_string(queue.size()) + " banners");
-    
-    // Log queue contents
-    for (size_t i = 0; i < queue.size(); ++i) {
-        const auto& ad = queue[i];
-        log_message("QUEUE[" + std::to_string(i) + "]: " + ad.id + " (" + 
-                   std::to_string(ad.duration_seconds) + "s) - " + ad.content_type);
-    }
-    
-    // Start rotation if queue has banners and auto-rotation is enabled
-    if (!queue.empty() && m_ad_queue.auto_rotation.load()) {
-        start_ad_rotation();
-    }
-}
 
-void banner_manager::add_ad_to_queue(const AdWindow& ad)
-{
-    bool should_start_rotation = false;
-    
-    {
-        std::lock_guard<std::mutex> lock(m_ad_queue.queue_mutex);
-        
-        m_ad_queue.banners.push_back(ad);
-        
-        log_message("QUEUE: Added banner '" + ad.id + "' to queue (total: " + 
-                   std::to_string(m_ad_queue.banners.size()) + ")");
-        
-        // DEBUG: Log queue state
-        log_message("QUEUE: Auto-rotation enabled: " + std::string(m_ad_queue.auto_rotation.load() ? "true" : "false"));
-        log_message("QUEUE: Rotation active: " + std::string(m_rotation_active.load() ? "true" : "false"));
-        log_message("QUEUE: Banner details - Duration: " + std::to_string(ad.duration_seconds) + "s, Content: " + ad.content_data.substr(0, 50) + "...");
-        
-        // Check if we should start rotation (do this while still holding the lock)
-        should_start_rotation = m_ad_queue.auto_rotation.load() && !m_rotation_active.load();
-        
-        if (should_start_rotation) {
-            log_message("QUEUE: Will start rotation - auto-rotation enabled, rotation not active");
-        } else {
-            log_message("QUEUE: Not starting rotation - Auto-rotation: " + std::string(m_ad_queue.auto_rotation.load() ? "true" : "false") + 
-                       ", Rotation active: " + std::string(m_rotation_active.load() ? "true" : "false"));
-        }
-    } // Release the mutex by ending the scope
-    
-    // NOW start rotation outside the mutex lock to prevent deadlock
-    if (should_start_rotation) {
-        log_message("QUEUE: Starting rotation outside mutex lock");
-        start_ad_rotation();
-    }
-}
 
-void banner_manager::start_ad_rotation()
-{
-    log_message("ROTATION: start_ad_rotation() called");
-    
-    if (m_rotation_active.load()) {
-        log_message("ROTATION: Already active, ignoring start request");
-        return;
-    }
-    
-    // Check if queue has banners WITHOUT holding mutex (caller already checked)
-    size_t queue_size = 0;
-    std::string first_banner_id;
-    int first_banner_duration = 0;
-    
-    {
-        std::lock_guard<std::mutex> lock(m_ad_queue.queue_mutex);
-        if (m_ad_queue.banners.empty()) {
-            log_message("ROTATION: No banners in queue, cannot start rotation");
-            return;
-        }
-        queue_size = m_ad_queue.banners.size();
-        first_banner_id = m_ad_queue.banners[0].id;
-        first_banner_duration = m_ad_queue.banners[0].duration_seconds;
-    } // Release mutex before starting thread
-    
-    m_rotation_active.store(true);
-    
-    log_message("ROTATION: Starting rotation with " + std::to_string(queue_size) + " banners");
-    log_message("ROTATION: First banner ID: " + first_banner_id + ", Duration: " + std::to_string(first_banner_duration) + "s");
-    
-    // Start rotation thread with proper window management
-    m_rotation_jthread = std::jthread([this](std::stop_token stop_token) {
-        log_message("ROTATION: Rotation thread started with window management");
-        
-        while (!stop_token.stop_requested() && !m_shutting_down.load()) {
-            // STEP 1: Wait for gap to end if we're in one
-            if (is_in_window_gap()) {
-                log_message("ROTATION: Waiting for window gap to end...");
-                while (is_in_window_gap() && !stop_token.stop_requested() && !m_shutting_down.load()) {
-                    std::mutex wait_mutex;
-                    std::unique_lock<std::mutex> wait_lock(wait_mutex);
-                    
-                    // Wait for 500ms OR until shutdown notification
-                    if (m_shutdown_cv.wait_for(wait_lock, std::chrono::milliseconds(500), [&]() {
-                        return stop_token.stop_requested() || m_shutting_down.load();
-                    })) {
-                        // Woke up due to shutdown request
-                        log_message("Rotation jthread exited during gap wait: immediate shutdown requested");
-                        m_rotation_active.store(false);
-                        return;
-                    }
-                }
-                if (stop_token.stop_requested() || m_shutting_down.load()) break;
-                log_message("ROTATION: Window gap ended - can start new window");
-                
-                // Ensure free users still have visible banner after gap
-                if (!is_premium_user()) {
-                    log_message("ROTATION: FREE USER - Preparing banner for new window");
-                    // The banner source should still be visible (transparent content during gap)
-                    // Just continue to show ads in the new window
-                }
-            }
-            
-            // STEP 2: Start new ad window (10 seconds max)
-            if (can_start_new_window()) {
-                start_new_window();
-                log_message("ROTATION: Started new 10-second ad window");
-                
-                // Wait a moment for window to properly initialize (with immediate shutdown response)
-                std::mutex wait_mutex;
-                std::unique_lock<std::mutex> wait_lock(wait_mutex);
-                
-                if (m_shutdown_cv.wait_for(wait_lock, std::chrono::milliseconds(100), [&]() {
-                    return stop_token.stop_requested() || m_shutting_down.load();
-                })) {
-                    // Shutdown requested during initialization wait
-                    log_message("Rotation jthread exited during init wait: immediate shutdown requested");
-                    m_rotation_active.store(false);
-                    return;
-                }
-            } else {
-                log_message("ROTATION: Cannot start new window - waiting...");
-                
-                std::mutex wait_mutex;
-                std::unique_lock<std::mutex> wait_lock(wait_mutex);
-                
-                if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
-                    return stop_token.stop_requested() || m_shutting_down.load();
-                })) {
-                    // Shutdown requested during retry wait
-                    log_message("Rotation jthread exited during retry wait: immediate shutdown requested");
-                    m_rotation_active.store(false);
-                    return;
-                }
-                continue;
-            }
-            
-            // STEP 3: Show ads within the 10-second window
-            int window_time_used = 0;
-            const int max_window_time = 10; // 10 seconds for testing
-            std::set<std::string> displayed_ads_in_window; // Track all displayed ads in this window
-            size_t ads_displayed_in_window = 0;
-            
-            while (window_time_used < max_window_time && !stop_token.stop_requested() && !m_shutting_down.load() && m_window_active.load()) {
-                // Get next ad from queue
-                std::string current_ad_id;
-                int ad_duration = 0;
-                bool has_ad = false;
-                
-                {
-                    std::lock_guard<std::mutex> queue_lock(m_ad_queue.queue_mutex);
-                    if (!m_ad_queue.banners.empty()) {
-                        size_t current_idx = m_ad_queue.current_index.load();
-                        if (current_idx >= m_ad_queue.banners.size()) {
-                            current_idx = 0;
-                            m_ad_queue.current_index.store(current_idx);
-                        }
-                        
-                        const auto& current_ad = m_ad_queue.banners[current_idx];
-                        current_ad_id = current_ad.id;
-                        ad_duration = current_ad.duration_seconds;
-                        
-                        // Smart rotation logic:
-                        // 1. If we have only 1 ad, show it once per window
-                        // 2. If we have multiple ads, show each once per window
-                        // 3. If we've shown all ads in this window, close the window
-                        
-                        if (m_ad_queue.banners.size() == 1) {
-                            // Single ad case: show once per window
-                            if (displayed_ads_in_window.count(current_ad_id) > 0) {
-                                log_message("ROTATION: Single ad already displayed in this window - closing window");
-                                break;
-                            }
-                        } else {
-                            // Multiple ads case: show each ad once per window
-                            if (displayed_ads_in_window.size() >= m_ad_queue.banners.size()) {
-                                log_message("ROTATION: All ads displayed in this window - closing window");
-                                break;
-                            }
-                            
-                            // Skip if this specific ad was already shown in this window
-                            if (displayed_ads_in_window.count(current_ad_id) > 0) {
-                                log_message("ROTATION: Ad " + current_ad_id + " already displayed in this window - rotating to next");
-                                rotate_to_next_ad();
-                                continue;
-                            }
-                        }
-                        
-                        // Check if ad can fit in remaining window time
-                        int remaining_time = max_window_time - window_time_used;
-                        if (ad_duration <= remaining_time) {
-                            has_ad = true;
-                            
-                            log_message("ROTATION: Showing ad " + current_ad_id + " (" + 
-                                       std::to_string(ad_duration) + "s) in window [" + 
-                                       std::to_string(ads_displayed_in_window + 1) + "/" + 
-                                       std::to_string(m_ad_queue.banners.size()) + "]");
-                            
-                            // Set the banner content
-                            set_banner_content_with_custom_params(
-                                current_ad.content_data,
-                                current_ad.content_type,
-                                current_ad.css,
-                                0, 0, false
-                            );
-                            
-                            // Show the banner with correct duration (rotation manages timing)
-                            if (is_premium_user()) {
-                                show_premium_banner();
-                            } else {
-                                show_banner(false); // Don't start duration timer - rotation manages it
-                            }
-                            
-                            // CRITICAL: Start duration timer with queue duration (not default 60s)
-                            log_message("ROTATION: Starting duration timer for " + std::to_string(ad_duration) + " seconds (from queue)");
-                            start_duration_timer(ad_duration);
-                            
-                            // Track analytics
-                            track_ad_display_start(current_ad_id, "queue_campaign", 
-                                                 ad_duration * 1000, current_ad.content_type);
-                            
-                            // Mark this ad as displayed in this window
-                            displayed_ads_in_window.insert(current_ad_id);
-                            ads_displayed_in_window++;
-                        } else {
-                            log_message("ROTATION: Ad " + current_ad_id + " (" + 
-                                       std::to_string(ad_duration) + "s) too long for remaining window time (" + 
-                                       std::to_string(remaining_time) + "s) - closing window");
-                            break; // Close window and start gap
-                        }
-                    }
-                }
-                
-                if (!has_ad) {
-                    log_message("ROTATION: No ads available - closing window");
-                    break;
-                }
-                
-                // Wait for ad duration (with immediate shutdown response)
-                for (int i = 0; i < ad_duration && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
-                    std::mutex wait_mutex;
-                    std::unique_lock<std::mutex> wait_lock(wait_mutex);
-                    
-                    // Wait for 1 second OR until shutdown notification
-                    if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
-                        return stop_token.stop_requested() || m_shutting_down.load();
-                    })) {
-                        // Woke up due to shutdown request during ad duration
-                        log_message("Rotation jthread exited during ad duration: immediate shutdown requested");
-                        m_rotation_active.store(false);
-                        return;
-                    }
-                }
-                
-                // Track analytics end
-                track_ad_display_end(current_ad_id, ad_duration * 1000);
-                
-                // Update window time used
-                window_time_used += ad_duration;
-                m_current_window_used_time.store(window_time_used);
-                
-                // Move to next ad
-                rotate_to_next_ad();
-                
-                log_message("ROTATION: Window time used: " + std::to_string(window_time_used) + 
-                           "/" + std::to_string(max_window_time) + " seconds");
-            }
-            
-            // STEP 4: Close window and start gap (only if still active)
-            if (m_window_active.load()) {
-                log_message("ROTATION: Window time expired - closing window and starting gap");
-                close_current_window(); // This will start the 15-second gap
-                
-                // Handle gap period based on user type
-                hide_banner_with_user_restrictions("window gap period");
-            } else {
-                log_message("ROTATION: Window already closed (likely by duration timer)");
-            }
-        }
-        
-        log_message("ROTATION: Rotation thread stopped");
-        m_rotation_active.store(false);
-    });
-}
 
-void banner_manager::stop_ad_rotation()
-{
-    if (!m_rotation_active.load()) {
-        return;
-    }
-    
-    log_message("ROTATION: Stopping banner rotation");
-    
-    // Request stop using jthread's built-in mechanism
-    m_rotation_jthread.request_stop();
-    
-    // Try to join with timeout to prevent hanging during shutdown
-    if (m_rotation_jthread.joinable()) {
-        auto timeout_start = std::chrono::steady_clock::now();
-        const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
-        
-        // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
-        bool joined = false;
-        while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
-            if (!m_rotation_jthread.joinable()) {
-                joined = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        
-        if (m_rotation_jthread.joinable()) {
-            if (joined) {
-                log_message("ROTATION: Thread joined successfully");
-            } else {
-                log_message("ROTATION: Thread join timeout, detaching to prevent hang");
-                m_rotation_jthread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
-            }
-        }
-    }
-    
-    m_rotation_active.store(false);
-    log_message("ROTATION: Banner rotation stopped");
-}
 
-void banner_manager::rotate_to_next_ad()
-{
-    std::lock_guard<std::mutex> lock(m_ad_queue.queue_mutex);
-    
-    if (m_ad_queue.banners.empty()) {
-        return;
-    }
-    
-    size_t current_idx = m_ad_queue.current_index.load();
-    size_t next_idx = (current_idx + 1) % m_ad_queue.banners.size();
-    
-    m_ad_queue.current_index.store(next_idx);
-    
-    log_message("ROTATION: Advanced to banner " + std::to_string(next_idx + 1) + "/" + 
-               std::to_string(m_ad_queue.banners.size()));
-}
 
-bool banner_manager::is_current_ad_expired() const
-{
-    // Cast away const for mutex - safe since we're only reading data
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_ad_queue.queue_mutex));
-    
-    if (m_ad_queue.banners.empty()) {
-        return false;
-    }
-    
-    size_t current_idx = m_ad_queue.current_index.load();
-    if (current_idx >= m_ad_queue.banners.size()) {
-        return true;
-    }
-    
-    const auto& current_ad = m_ad_queue.banners[current_idx];
-    auto now = std::chrono::system_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - current_ad.start_time);
-    
-    return elapsed.count() >= current_ad.duration_seconds;
-}
 
-void banner_manager::set_ad_duration_limit(int max_seconds)
-{
-    m_max_ad_duration.store(max_seconds);
-    log_message("DURATION: Set maximum ad duration to " + std::to_string(max_seconds) + " seconds");
-}
 
-// Auto-rotation control
-void banner_manager::enable_auto_rotation(bool enable)
-{
-    m_ad_queue.auto_rotation.store(enable);
-    log_message("AUTO_ROTATION: " + std::string(enable ? "Enabled" : "Disabled") + " auto-rotation");
-    
-    // Start rotation if enabled and queue has banners
-    if (enable) {
-        std::lock_guard<std::mutex> lock(m_ad_queue.queue_mutex);
-        if (!m_ad_queue.banners.empty() && !m_rotation_active.load()) {
-            start_ad_rotation();
-        }
-    } else {
-        // Stop rotation if disabled
-        stop_ad_rotation();
-    }
-}
 
-bool banner_manager::is_auto_rotation_enabled() const
-{
-    return m_ad_queue.auto_rotation.load();
-}
 
-// Window lifecycle methods
-void banner_manager::start_ad_window(std::string_view window_id)
-{
-    m_current_window_start = std::chrono::system_clock::now();
-    m_current_window_used_time.store(0);
-    m_window_active.store(true);
-    
-    log_message("WINDOW: Started ad window '" + std::string(window_id) + "'");
-}
 
-void banner_manager::close_ad_window(std::string_view window_id)
-{
-    m_window_active.store(false);
-    
-    int used_time = m_current_window_used_time.load();
-    log_message("WINDOW: Closed ad window '" + std::string(window_id) + "' - Used time: " + 
-               std::to_string(used_time) + " seconds");
-    
-    // Send window summary analytics
-    if (g_obs_plugin_instance && g_obs_plugin_instance->is_connected()) {
-        nlohmann::json window_report = {
-            {"path", "/api/v1/obs/analytics/window-closed"},
-            {"verb", "SET"},
-            {"payload", {
-                {"window_id", std::string(window_id)},
-                {"total_time_used", used_time},
-                {"window_end_time", std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()}
-            }}
-        };
-        
-        g_obs_plugin_instance->send_message(window_report);
-    }
-}
 
-void banner_manager::auto_close_expired_windows()
-{
-    if (!m_window_active.load()) {
-        return;
-    }
-    
-    auto now = std::chrono::system_clock::now();
-    auto window_duration = std::chrono::duration_cast<std::chrono::seconds>(now - m_current_window_start);
-    
-    // TESTING: Close window after 10 seconds (normally 40 seconds)
-    if (window_duration.count() > 10) {
-        log_message("WINDOW_AUTO_CLOSE: Force closing window after " + std::to_string(window_duration.count()) + " seconds");
-        close_ad_window("auto_expired_window_10s");
-    }
-}
 
-// Duration control helpers
-int banner_manager::get_effective_ad_duration(int requested_duration) const
-{
-    int max_duration = get_max_duration_for_user_type();
-    return std::min(requested_duration, max_duration);
-}
 
-int banner_manager::get_max_duration_for_user_type() const
-{
-    if (is_premium_user()) {
-        return 300; // 5 minutes for premium users
-    } else {
-        return 60;  // 1 minute for free users
-    }
-}
 
-bool banner_manager::should_cap_ad_duration(int requested_duration) const
-{
-    return requested_duration > get_max_duration_for_user_type();
-}
+// can_show_ad_now() method removed - frequency control handled externally
 
-// Window management
-bool banner_manager::can_ad_fit_in_current_window(int ad_duration) const
-{
-    if (!m_window_active.load()) {
-        return true; // No window restrictions if window not active
-    }
-    
-    int used_time = m_current_window_used_time.load();
-    // TESTING: 10 seconds window (normally 40 seconds)
-    // PRODUCTION: Change to 40 seconds
-    int max_window_time = 10; // 10 seconds for testing
-    
-    return (used_time + ad_duration) <= max_window_time;
-}
 
-void banner_manager::close_current_window()
-{
-    if (m_window_active.load()) {
-        close_ad_window("manual_close");
-        // Start gap period after closing window
-        start_window_gap();
-    }
-}
-
-void banner_manager::start_new_window()
-{
-    if (m_window_active.load()) {
-        close_current_window();
-        return; // Window closed, gap started - new window will be started after gap
-    }
-    
-    if (!can_start_new_window()) {
-        log_message("WINDOW: Cannot start new window - still in gap period");
-        return;
-    }
-    
-    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    
-    start_ad_window("window_" + std::to_string(timestamp));
-}
-
-int banner_manager::get_remaining_window_time() const
-{
-    if (!m_window_active.load()) {
-        return 10; // 10 seconds for testing window
-    }
-    
-    int used_time = m_current_window_used_time.load();
-    // TESTING: 10 seconds window (normally 40 seconds)
-    int max_window_time = 10; // 10 seconds for testing
-    
-    return std::max(0, max_window_time - used_time);
-}
-
-void banner_manager::reset_window_tracking()
-{
-    m_current_window_used_time.store(0);
-    m_window_active.store(false);
-    
-    log_message("WINDOW: Reset window tracking");
-}
-
-// Gap management between windows
-void banner_manager::start_window_gap()
-{
-    if (m_in_window_gap.load()) {
-        log_message("WINDOW_GAP: Already in gap period - ignoring duplicate start");
-        return;
-    }
-    
-    m_in_window_gap.store(true);
-    m_window_gap_start = std::chrono::system_clock::now();
-    
-    log_message("WINDOW_GAP: Starting 15-second gap between windows (testing mode)");
-    
-    // Start gap timer thread
-    m_window_gap_thread = std::jthread([this](std::stop_token stop_token) {
-        // TESTING: 15 seconds gap (normally 3 minutes = 180 seconds)
-        const int gap_seconds = 15; // 15 seconds for testing
-        
-        for (int i = 0; i < gap_seconds && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
-            std::mutex wait_mutex;
-            std::unique_lock<std::mutex> wait_lock(wait_mutex);
-            
-            // Wait for 1 second OR until shutdown notification
-            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
-                return stop_token.stop_requested() || m_shutting_down.load();
-            })) {
-                // Woke up due to shutdown request
-                log_message("Window gap jthread exited: immediate shutdown requested");
-                return;
-            }
-        }
-        
-        if (!stop_token.stop_requested() && !m_shutting_down.load()) {
-            log_message("WINDOW_GAP: Gap period ended - can start new window");
-            m_in_window_gap.store(false);
-        }
-    });
-}
-
-void banner_manager::stop_window_gap()
-{
-    if (m_in_window_gap.load()) {
-        log_message("WINDOW_GAP: Stopping gap period");
-        m_window_gap_thread.request_stop();
-        
-        // Try to join with timeout to prevent hanging during shutdown
-        if (m_window_gap_thread.joinable()) {
-            auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
-            
-            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
-            bool joined = false;
-            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
-                if (!m_window_gap_thread.joinable()) {
-                    joined = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            
-            if (m_window_gap_thread.joinable()) {
-                if (joined) {
-                    log_message("WINDOW_GAP: Gap thread joined successfully");
-                } else {
-                    log_message("WINDOW_GAP: Gap thread join timeout, detaching to prevent hang");
-                    m_window_gap_thread.detach();
-                }
-            }
-        }
-        m_in_window_gap.store(false);
-    }
-}
-
-bool banner_manager::is_in_window_gap() const
-{
-    return m_in_window_gap.load();
-}
-
-bool banner_manager::can_start_new_window() const
-{
-    return !m_window_active.load() && !m_in_window_gap.load();
-}
-
-void banner_manager::set_custom_banner_duration(int duration_seconds)
-{
-    m_custom_banner_duration.store(duration_seconds);
-    log_message("DURATION: Set custom banner duration to " + std::to_string(duration_seconds) + " seconds");
-}
-
-bool banner_manager::can_show_ad_now() const
-{
-    if (m_is_premium.load()) {
-        return true; // Premium users have no frequency restrictions
-    }
-    
-    // WINDOW SYSTEM: If we're in an active window, ignore frequency limits
-    if (m_window_active.load()) {
-        const_cast<banner_manager*>(this)->log_message("FREQUENCY: In active window - frequency limits bypassed");
-        return true;
-    }
-    
-    // WINDOW SYSTEM: If we're in gap period, no ads allowed
-    if (m_in_window_gap.load()) {
-        const_cast<banner_manager*>(this)->log_message("FREQUENCY: In window gap - no ads allowed");
-        return false;
-    }
-    
-    // Free users must wait between WINDOWS (not individual ads)
-    auto now = std::chrono::system_clock::now();
-    auto time_since_last_ad = std::chrono::duration_cast<std::chrono::seconds>(now - m_last_ad_end_time);
-    
-    const int min_frequency_seconds = 30; // 30 seconds between windows
-    
-    // DEBUG: Log frequency check details (use const_cast for logging in const method)
-    const_cast<banner_manager*>(this)->log_message("FREQUENCY: Time since last window: " + std::to_string(time_since_last_ad.count()) + "s, Required: " + std::to_string(min_frequency_seconds) + "s");
-    
-    bool can_show = time_since_last_ad.count() >= min_frequency_seconds;
-    const_cast<banner_manager*>(this)->log_message("FREQUENCY: Can start new window: " + std::string(can_show ? "true" : "false"));
-    
-    return can_show;
-}
-
-void banner_manager::start_duration_timer(int duration_seconds)
-{
-    // Stop any existing timer first
-    stop_duration_timer();
-    
-    m_duration_timer_active.store(true);
-    log_message("TIMER: Starting banner duration timer for " + std::to_string(duration_seconds) + " seconds");
-    
-    m_duration_timer_thread = std::jthread([this, duration_seconds](std::stop_token stop_token) {
-        // Wait for the specified duration with immediate shutdown response
-        for (int i = 0; i < duration_seconds && !stop_token.stop_requested() && !m_shutting_down.load(); ++i) {
-            std::mutex wait_mutex;
-            std::unique_lock<std::mutex> wait_lock(wait_mutex);
-            
-            // Wait for 1 second OR until shutdown notification
-            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(1), [&]() {
-                return stop_token.stop_requested() || m_shutting_down.load();
-            })) {
-                // Woke up due to shutdown request
-                log_message("Duration timer jthread exited: immediate shutdown requested");
-                m_duration_timer_active.store(false);
-                return;
-            }
-        }
-        
-        if (!stop_token.stop_requested() && !m_shutting_down.load()) {
-            log_message("TIMER: Banner duration expired (" + std::to_string(duration_seconds) + "s) - auto-hiding");
-            
-            // Set intentional hide flag to prevent interference
-            m_intentional_hide_in_progress.store(true);
-            
-            // CRITICAL: Record ad end time BEFORE hiding to prevent auto-restore
-            m_last_ad_end_time = std::chrono::system_clock::now();
-            
-            // NOTE: Don't update window_used_time here - rotation thread handles this
-            
-            // Handle banner based on user type (no auto-restore for duration timer expiration)
-            hide_banner_with_user_restrictions("duration timer expiration");
-            
-            // Close window (this will also start the gap period)
-            close_current_window();
-            
-            // Reset custom duration for next banner
-            m_custom_banner_duration.store(0);
-            
-            log_message("TIMER: Banner permanently hidden, window closed, ad end time recorded");
-            
-            // Wait a bit to ensure hide is complete (with immediate shutdown response)
-            std::mutex wait_mutex;
-            std::unique_lock<std::mutex> wait_lock(wait_mutex);
-            
-            if (m_shutdown_cv.wait_for(wait_lock, std::chrono::seconds(2), [&]() {
-                return stop_token.stop_requested() || m_shutting_down.load();
-            })) {
-                // Shutdown requested during cleanup wait
-                log_message("Duration timer jthread exiting during cleanup: immediate shutdown requested");
-                m_intentional_hide_in_progress.store(false);
-                m_duration_timer_active.store(false);
-                return;
-            }
-            
-            // Clear intentional hide flag
-            m_intentional_hide_in_progress.store(false);
-        }
-        
-        m_duration_timer_active.store(false);
-    });
-}
-
-void banner_manager::stop_duration_timer()
-{
-    if (m_duration_timer_active.load()) {
-        log_message("TIMER: Stopping existing banner duration timer");
-        m_duration_timer_thread.request_stop();
-        
-        // Try to join with timeout to prevent hanging during shutdown
-        if (m_duration_timer_thread.joinable()) {
-            auto timeout_start = std::chrono::steady_clock::now();
-            const auto timeout_duration = std::chrono::milliseconds(200); // FAST: 200ms for quick OBS exit
-            
-            // Use a simple spin-wait with timeout since C++20 jthread doesn't have timed join
-            bool joined = false;
-            while (std::chrono::steady_clock::now() - timeout_start < timeout_duration) {
-                if (!m_duration_timer_thread.joinable()) {
-                    joined = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            
-            if (m_duration_timer_thread.joinable()) {
-                if (joined) {
-                    log_message("TIMER: Duration timer thread joined successfully");
-                } else {
-                    log_message("TIMER: Duration timer thread join timeout, detaching to prevent hang");
-                    m_duration_timer_thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
-                }
-            }
-        }
-        m_duration_timer_active.store(false);
-    }
-}
 
 // Helper function to handle banner hiding with user type restrictions
 void banner_manager::hide_banner_with_user_restrictions(const std::string& reason)
@@ -4066,111 +2368,5 @@ void banner_manager::hide_banner_with_user_restrictions(const std::string& reaso
         set_banner_content("transparent", "transparent");
         // Keep m_banner_visible = true for free users (banner source remains visible)
     }
-}
-
-// Thread management implementation
-void banner_manager::start_temporary_thread(std::function<void()> task)
-{
-    if (m_shutting_down.load()) {
-        log_message("THREAD: Rejected temporary thread start - shutdown in progress");
-        return;
-    }
-    
-    cleanup_finished_threads();
-    
-    std::lock_guard<std::mutex> lock(m_threads_mutex);
-    m_temporary_threads.emplace_back([this, task]() {
-        if (!m_shutting_down.load()) {
-            try {
-                task();
-            } catch (const std::exception& e) {
-                log_message("THREAD: Exception in temporary thread: " + std::string(e.what()));
-            } catch (...) {
-                log_message("THREAD: Unknown exception in temporary thread");
-            }
-        }
-    });
-}
-
-void banner_manager::cleanup_finished_threads()
-{
-    std::lock_guard<std::mutex> lock(m_threads_mutex);
-    m_temporary_threads.erase(
-        std::remove_if(m_temporary_threads.begin(), m_temporary_threads.end(),
-            [](std::jthread& t) { return !t.joinable(); }),
-        m_temporary_threads.end()
-    );
-}
-
-void banner_manager::stop_all_threads()
-{
-    log_message("THREAD: Stopping all temporary threads...");
-    
-    {
-        std::lock_guard<std::mutex> lock(m_threads_mutex);
-        for (auto& thread : m_temporary_threads) {
-            if (thread.joinable()) {
-                thread.request_stop();
-            }
-        }
-    }
-    
-    // Wait for threads to finish with proper timeout implementation
-    auto timeout_start = std::chrono::steady_clock::now();
-    const auto timeout_duration = std::chrono::seconds(3);
-    
-    {
-        std::lock_guard<std::mutex> lock(m_threads_mutex);
-        for (auto& thread : m_temporary_threads) {
-            if (thread.joinable()) {
-                // Implement proper timeout check for each thread
-                auto thread_timeout_start = std::chrono::steady_clock::now();
-                bool joined = false;
-                
-                while (std::chrono::steady_clock::now() - thread_timeout_start < std::chrono::seconds(1)) {
-                    if (!thread.joinable()) {
-                        joined = true;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
-                
-                if (thread.joinable()) {
-                    if (joined) {
-                        log_message("THREAD: Temporary thread joined successfully");
-                    } else {
-                        log_message("THREAD: Temporary thread join timeout, detaching to prevent hang");
-                        try {
-                            thread.detach(); // NUCLEAR SHUTDOWN: detach instead of join
-                        } catch (...) {
-                            log_message("THREAD: Exception detaching temporary thread");
-                        }
-                    }
-                }
-                
-                // Check global timeout
-                if (std::chrono::steady_clock::now() - timeout_start > timeout_duration) {
-                    log_message("THREAD: Global timeout reached, detaching remaining threads");
-                    break;
-                }
-            }
-        }
-        m_temporary_threads.clear();
-    }
-    
-    log_message("THREAD: All temporary threads stopped");
-}
-
-void banner_manager::start_safe_signal_thread(banner_manager* manager, std::function<void(banner_manager*)> task)
-{
-    if (!manager || manager->m_shutting_down.load()) {
-        return;
-    }
-    
-    manager->start_temporary_thread([manager, task]() {
-        if (!manager->m_shutting_down.load()) {
-            task(manager);
-        }
-    });
 }
 

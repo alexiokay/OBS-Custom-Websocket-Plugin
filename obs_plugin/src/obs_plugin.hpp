@@ -10,22 +10,16 @@
     #define _WEBSOCKETPP_CPP11_TYPE_TRAITS_
 #endif
 
-#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4267)
-#endif
-
 #include <nlohmann/json.hpp>
 #include <websocketpp/client.hpp>
 #include <websocketpp/config/asio_no_tls_client.hpp>
-
-#ifdef _MSC_VER
 #pragma warning(pop)
-#endif
 
-// FIX THE OBS INCLUDES TO MATCH THE EXISTING PATTERN IN THE .CPP FILE:
-#include <libobs/obs.h>
-#include <UI/obs-frontend-api/obs-frontend-api.h>
+// OBS includes for the new build system
+#include <obs.h>
+#include <obs-frontend-api.h>
 
 // C++23 Standard Library Headers
 #include <format>
@@ -50,6 +44,7 @@
 #include <vector>
 
 #include "banner_manager.hpp"
+#include "mdns_discovery.hpp"
 
 // C++20 Concepts for better type safety and API design
 namespace vorti::concepts {
@@ -116,8 +111,8 @@ namespace vorti
 
             struct scene_info
             {
-                mixers mixer_list;
-                sources source_list;
+                mixers mixers;
+                sources sources;
             };
 
             using scenes = std::map<std::string, scene_info>;
@@ -137,6 +132,30 @@ namespace vorti
             void reconnect();
             void disconnect();
             bool is_connected();
+
+            // mDNS discovery functions with continuous search
+            bool discover_vortideck_service();
+            bool discover_vortideck_service_async();
+            void on_service_discovered(const ServiceInfo& service);
+            
+            // Continuous discovery functions
+            void start_continuous_discovery();
+            void stop_continuous_discovery();
+            void continuous_discovery_worker();
+            void save_discovered_service_state(const ServiceInfo& service);
+            bool load_last_known_service_state();
+            std::string get_best_available_service_url();
+            void show_service_selection_dialog();
+            std::string select_service_from_dialog(const std::vector<ServiceInfo>& services);
+            
+            // VortiDeck top-level menu
+            void create_vortideck_menu();
+            
+            // Tools menu functions
+            void add_connection_settings_menu();
+            void show_connection_settings_dialog(); // Public method to show dialog
+            static void connection_settings_menu_callback(void* data); // Static callback for OBS menu
+            std::string get_connection_url();
 
             void _run_forever();
             ws_client::connection_ptr _create_connection();
@@ -190,13 +209,7 @@ namespace vorti
             void action_banner_toggle(const action_invoke_parameters &parameters);
             void action_banner_set_data(const action_invoke_parameters &parameters);
             
-            // Essential banner queue and analytics actions
-            void action_banner_set_queue(const action_invoke_parameters &parameters);
-            void action_banner_add_to_queue(const action_invoke_parameters &parameters);
-            void action_analytics_get_report(const action_invoke_parameters &parameters);
-        
-        // Premium status and monetization helper
-        void handle_banner_premium_status_and_ads(const action_invoke_parameters &parameters);
+            // Complex banner actions removed - handled by external application
 
             // OBS menu creation
             void create_obs_menu();
@@ -224,14 +237,9 @@ namespace vorti
             void start_loop();
             void stop_loop();
             void loop_function();
-            
-            // Helper function to check if OBS frontend calls are safe
-            bool is_obs_frontend_available();
 
             std::atomic<bool> m_shutting_down;
             std::atomic<bool> m_collection_locked;
-            std::atomic<bool> m_obs_frontend_available;
-            std::atomic<bool> m_shutdown_complete{false};
 
             std::mutex m_lock;
             ws_client m_websocket;
@@ -240,8 +248,29 @@ namespace vorti
             const std::string m_subprotocol = "json";
             const websocketpp::frame::opcode::value m_subprotocol_opcode = websocketpp::frame::opcode::text;
             std::unique_ptr<std::jthread> m_websocket_thread;
-            std::unique_ptr<std::jthread> m_initialization_thread;
             uint16_t m_current_port = 9001;
+
+            // mDNS discovery for VortiDeck services with continuous searching
+            std::unique_ptr<MDNSDiscovery> m_mdns_discovery;
+            std::string m_discovered_websocket_url;
+            bool m_use_mdns_discovery = true;
+            std::atomic<bool> m_discovery_in_progress{false};
+            
+            // Continuous discovery management
+            std::atomic<bool> m_continuous_discovery_enabled{true};
+            std::jthread m_continuous_discovery_thread;
+            std::mutex m_discovered_services_mutex;
+            std::vector<ServiceInfo> m_discovered_services;
+            std::chrono::steady_clock::time_point m_last_discovery_time;
+            std::atomic<bool> m_service_found{false};
+            std::atomic<bool> m_show_selection_dialog{false};
+            std::atomic<int> m_connection_failure_count{0};
+            std::string m_selected_service_url;
+            
+            // State persistence for reconnection
+            std::string m_last_known_service_url;
+            std::string m_last_known_service_ip;
+            uint16_t m_last_known_service_port = 0;
 
             uint32_t m_current_message_id = 1;
 
@@ -313,10 +342,7 @@ namespace vorti
                 const std::string s_banner_toggle               = "obs_banner_toggle";
                 const std::string s_banner_set_data             = "obs_banner_set_data";
                 
-                // Essential banner queue and analytics actions
-                const std::string s_banner_set_queue             = "obs_banner_set_queue";
-                const std::string s_banner_add_to_queue          = "obs_banner_add_to_queue";
-                const std::string s_analytics_get_report         = "obs_analytics_get_report";
+                // Complex banner actions removed - handled by external application
 
                 namespace messages
                 {
@@ -342,9 +368,6 @@ namespace vorti
 
             // Banner functionality - using separate banner manager class
             banner_manager m_banner_manager;
-            std::atomic<bool> m_banner_manager_shutdown{false};
-            std::vector<std::jthread> m_banner_tracking_threads;
-            std::mutex m_banner_threads_mutex;
             
             // Flag to completely disable banner manager functionality
             // Set to false to completely turn off all banner manager functionality

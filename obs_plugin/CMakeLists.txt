@@ -1,159 +1,113 @@
-add_definitions(-D_KLOG_MODULE_NAME_=vorti_applets_obs_plugin)
-add_definitions(-DUNICODE)
-add_definitions(-D_UNICODE)
-add_definitions(-DWIN32_LEAN_AND_MEAN)
-add_definitions(-D_SCL_SECURE_NO_WARNINGS)
-if(WIN32)
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
-endif()
+cmake_minimum_required(VERSION 3.16...3.26)
+
+project(vorti_obs_plugin VERSION 1.0.0)
+
+# Options for Qt and frontend API
+option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
+option(ENABLE_QT "Use Qt functionality" ON)
 
 # Require C++23 standard for newest features
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Enable additional warnings for better code quality (but don't treat warnings as errors)
+# Add compile definitions
+add_definitions(-D_KLOG_MODULE_NAME_=vorti_applets_obs_plugin)
+add_definitions(-DUNICODE)
+add_definitions(-D_UNICODE)
+add_definitions(-DWIN32_LEAN_AND_MEAN)
+add_definitions(-D_SCL_SECURE_NO_WARNINGS)
+
+# Enable additional warnings for better code quality
 if(MSVC)
     add_compile_options(/W4)
 else()
     add_compile_options(-Wall -Wextra)
 endif()
 
-set(PLUGIN_NAME "vorti_obs")
-set(APPLET_NAME "${PLUGIN_NAME}_plugin")
-set(BUNDLE_NAME "${PLUGIN_NAME}.plugin")
+# Get the parent directory to find dependencies
+get_filename_component(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
 
-set(SOURCES
-    src/obs_plugin.cpp
-    src/banner_manager.cpp)
+# Create the main plugin library as MODULE (following official template)
+add_library(${CMAKE_PROJECT_NAME} MODULE)
 
-set(HEADERS
-    src/obs_plugin.hpp
-    src/banner_manager.hpp)
-
+# Try to find OBS libraries properly first, fallback to manual paths
 if(WIN32)
-    if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8") 
-        set(LIBS 
-            ${CMAKE_CURRENT_SOURCE_DIR}/libs/x64/obs.lib
-            ${CMAKE_CURRENT_SOURCE_DIR}/libs/x64/obs-frontend-api.lib)
+    # Manual library setup for Windows (since we don't have proper OBS install)
+    set(OBS_INCLUDE_DIRS 
+        ${DEPS_DIR}/other/obs-studio
+        ${DEPS_DIR}/other/obs-studio/libobs
+        ${DEPS_DIR}/other/obs-studio/UI)
+    
+    set(OBS_LIBRARIES
+        ${CMAKE_CURRENT_SOURCE_DIR}/libs/x64/obs.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/libs/x64/obs-frontend-api.lib
+        ws2_32
+        iphlpapi)
+    
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OBS_INCLUDE_DIRS})
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OBS_LIBRARIES})
+else()
+    # Use proper find_package on other platforms
+    find_package(libobs REQUIRED)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+    
+    if(ENABLE_FRONTEND_API)
+        find_package(obs-frontend-api REQUIRED)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
     endif()
+endif()
 
+# Qt6 configuration (following official template)
+if(ENABLE_QT)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Core)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+    
+    # Set Qt properties (following official template)
+    set_target_properties(${CMAKE_PROJECT_NAME}
+        PROPERTIES 
+            AUTOMOC ON
+            AUTOUIC ON
+            AUTORCC ON)
+endif()
+
+# Add include directories
+target_include_directories(${CMAKE_PROJECT_NAME} 
+    PRIVATE 
+        ${CMAKE_SOURCE_DIR}/src
+        ${DEPS_DIR}/other/websocketpp
+        ${DEPS_DIR}/other/json/include
+        ${DEPS_DIR}/other/asio/asio/include
+        ${DEPS_DIR}/other/mdns_cpp/include)
+
+# Add source files
+target_sources(${CMAKE_PROJECT_NAME}
+    PRIVATE 
+        src/obs_plugin.cpp
+        src/obs_plugin.hpp
+        src/banner_manager.cpp
+        src/banner_manager.hpp
+        src/mdns_discovery.cpp
+        src/mdns_discovery.hpp
+        src/service_selection_dialog.cpp
+        src/service_selection_dialog.hpp
+        src/ServiceSelectionDialog.ui
+        ${DEPS_DIR}/other/mdns_cpp/src/logger.cpp
+        ${DEPS_DIR}/other/mdns_cpp/src/mdns.cpp
+        ${DEPS_DIR}/other/mdns_cpp/src/utils.cpp)
+
+# Set output name for the plugin
+set_target_properties(${CMAKE_PROJECT_NAME} 
+    PROPERTIES 
+        OUTPUT_NAME "vorti_obs_plugin_x64"
+        PREFIX "")
+
+# Windows-specific configuration
+if(WIN32)
     if(COMMAND generate_product_version)
         generate_product_version(VERSION
         PRODUCT_NAME "VortiDeck OBS Studio Plugin"
         PRODUCT_TYPE "VFT_DLL")
+        target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${VERSION})
     endif()
-    add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
-elseif(APPLE)
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0")
-    set(LIBS 
-        ${CMAKE_CURRENT_SOURCE_DIR}/libs/osx/libobs.dylib
-        ${CMAKE_CURRENT_SOURCE_DIR}/libs/osx/obs-frontend-api.dylib)
-
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--export-all-symbols")
-
-    add_library(vorti_applets_obs_plugin MODULE ${SOURCES} ${HEADERS} ${VERSION})
-
-endif()
-
-
-if(WIN32)
-    # Rename the binary based on the bitness
-    if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
-        set_target_properties(vorti_applets_obs_plugin PROPERTIES OUTPUT_NAME "${APPLET_NAME}_x64")
-    endif()
-elseif(APPLE)
-    set_target_properties(vorti_applets_obs_plugin PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/vorti/applets/ghub-obs-plugin/${BUNDLE_NAME}/Contents/MacOS
-        LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/vorti/applets/ghub-obs-plugin/${BUNDLE_NAME}/Contents/MacOS
-        LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/vorti/applets/ghub-obs-plugin/${BUNDLE_NAME}/Contents/MacOS
-        OUTPUT_NAME "${PLUGIN_NAME}"
-        PREFIX ""
-        SUFFIX ""
-    )
-else()
-    # This will be used for Linux and others  
-    # Try to find OBS development files first
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(LIBOBS QUIET libobs)
-    endif()
-    
-    if(LIBOBS_FOUND)
-        # Use pkg-config found libraries
-        set(LIBS ${LIBOBS_LIBRARIES})
-        add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
-        target_include_directories(vorti_applets_obs_plugin PRIVATE ${LIBOBS_INCLUDE_DIRS})
-        target_compile_options(vorti_applets_obs_plugin PRIVATE ${LIBOBS_CFLAGS_OTHER})
-    else()
-        # Fallback: look for system libraries manually
-        find_library(OBS_LIB NAMES obs libobs PATHS /usr/lib /usr/lib/x86_64-linux-gnu)
-        find_path(OBS_INCLUDE_DIR NAMES obs/obs.h PATHS /usr/include)
-        
-        if(OBS_LIB AND OBS_INCLUDE_DIR)
-            set(LIBS ${OBS_LIB})
-            add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
-            target_include_directories(vorti_applets_obs_plugin PRIVATE ${OBS_INCLUDE_DIR})
-        else()
-            # Build without linking to OBS libraries (plugin will use runtime linking)
-            message(WARNING "OBS development libraries not found. Building without explicit linking.")
-            add_library(vorti_applets_obs_plugin SHARED ${SOURCES} ${HEADERS} ${VERSION})
-        endif()
-    endif()
-endif()
-
-get_filename_component(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
-
-# Debug output to help diagnose path issues
-message(STATUS "Current source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
-message(STATUS "DEPS_DIR: ${DEPS_DIR}")
-message(STATUS "JSON include path: ${DEPS_DIR}/other/json/include")
-message(STATUS "OBS include path: ${DEPS_DIR}/other/obs-studio")
-
-target_include_directories(vorti_applets_obs_plugin
-    PUBLIC
-    include)
-
-# Set include directories with platform-specific handling
-if(WIN32)
-    # For Windows, first try the other/ directory structure
-    if(EXISTS "${DEPS_DIR}/other/json/include")
-        target_include_directories(vorti_applets_obs_plugin
-            PRIVATE
-            ${DEPS_DIR}/other/obs-studio
-            ${DEPS_DIR}/other/obs-studio/libobs
-            ${DEPS_DIR}/other/obs-studio/UI
-            ${DEPS_DIR}/other/websocketpp
-            ${DEPS_DIR}/other/json/include
-            ${DEPS_DIR}/other/asio/asio/include)
-    else()
-        # Fallback: use vcpkg or system-installed dependencies
-        find_package(nlohmann_json QUIET)
-        if(nlohmann_json_FOUND)
-            target_link_libraries(vorti_applets_obs_plugin nlohmann_json::nlohmann_json)
-        endif()
-        
-        # Try to find OBS in standard Windows locations
-        target_include_directories(vorti_applets_obs_plugin
-            PRIVATE
-            "C:/Program Files/obs-studio/include"
-            "C:/obs-studio/include"
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-    endif()
-else()
-    target_include_directories(vorti_applets_obs_plugin
-        SYSTEM PUBLIC
-        ${DEPS_DIR}/other/obs-studio
-        ${DEPS_DIR}/other/websocketpp
-        ${DEPS_DIR}/other/json/include
-        ${DEPS_DIR}/other/asio/asio/include)
-endif()
-
-target_link_libraries(vorti_applets_obs_plugin
-    ${LIBS})
-
-if(LGHUB_BACKEND_TARGET)
-    configure_warning_suppression(vorti_applets_obs_plugin PRIVATE)
 endif()

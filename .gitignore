@@ -30,3 +30,21 @@
 # Misc.
 *.DS_Store
 build
+.titor
+
+
+# Build directories
+build*/
+Build*/
+
+# Visual Studio
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Build artifacts
+*.obj
+*.lib
+*.exp
+*.pdb
+*.dll

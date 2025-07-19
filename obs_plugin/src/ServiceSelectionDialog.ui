@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ServiceSelectionDialog</class>
+ <widget class="QDialog" name="ServiceSelectionDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>650</width>
+    <height>500</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>600</width>
+    <height>450</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>VortiDeck Service Selection</string>
+  </property>
+  <property name="windowIcon">
+   <iconset>
+    <normaloff>.</normaloff>.</iconset>
+  </property>
+  <property name="modal">
+   <bool>true</bool>
+  </property>
+  <property name="styleSheet">
+   <string>QDialog {
+    background-color: #313131;
+    color: #ffffff;
+}</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout">
+   <property name="spacing">
+    <number>15</number>
+   </property>
+   <property name="leftMargin">
+    <number>20</number>
+   </property>
+   <property name="topMargin">
+    <number>20</number>
+   </property>
+   <property name="rightMargin">
+    <number>20</number>
+   </property>
+   <property name="bottomMargin">
+    <number>20</number>
+   </property>
+   <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>VortiDeck Services Found</string>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
+     </property>
+     <property name="styleSheet">
+      <string>QLabel { 
+    color: #ffffff; 
+    font-size: 16px; 
+    font-weight: bold; 
+    margin-bottom: 10px;
+}</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="instructionLabel">
+     <property name="text">
+      <string>Select the VortiDeck service you want to connect to:</string>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <property name="styleSheet">
+      <string>QLabel { 
+    color: #cccccc; 
+    font-size: 12px; 
+    margin-bottom: 10px;
+}</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QListWidget" name="serviceList">
+     <property name="selectionMode">
+      <enum>QAbstractItemView::SingleSelection</enum>
+     </property>
+     <property name="alternatingRowColors">
+      <bool>false</bool>
+     </property>
+     <property name="styleSheet">
+      <string>QListWidget {
+    background-color: #525252;
+    border: 1px solid #464646;
+    color: #ffffff;
+    outline: none;
+    font-size: 13px;
+}
+
+QListWidget::item {
+    background-color: #525252;
+    color: #ffffff;
+    padding: 8px;
+    border: none;
+    min-height: 16px;
+}
+
+QListWidget::item:hover {
+    background-color: #5a5a5a;
+    color: #ffffff;
+}
+
+QListWidget::item:selected {
+    background-color: #267cb2;
+    color: #ffffff;
+}
+
+QListWidget::item:selected:hover {
+    background-color: #2684c4;
+    color: #ffffff;
+}</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="buttonLayout">
+     <item>
+      <spacer name="horizontalSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="cancelButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>30</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Cancel</string>
+       </property>
+       <property name="styleSheet">
+        <string>QPushButton {
+    background-color: #464646;
+    border: 1px solid #525252;
+    color: #ffffff;
+    padding: 6px 12px;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #525252;
+    border: 1px solid #5a5a5a;
+}
+QPushButton:pressed {
+    background-color: #3a3a3a;
+}</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="connectButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>30</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Connect</string>
+       </property>
+       <property name="default">
+        <bool>true</bool>
+       </property>
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="styleSheet">
+        <string>QPushButton {
+    background-color: #267cb2;
+    border: 1px solid #2684c4;
+    color: #ffffff;
+    padding: 6px 12px;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #2684c4;
+    border: 1px solid #2a90d4;
+}
+QPushButton:pressed {
+    background-color: #1f5f8a;
+}
+QPushButton:disabled {
+    background-color: #3a3a3a;
+    border: 1px solid #525252;
+    color: #888888;
+}</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>cancelButton</sender>
+   <signal>clicked()</signal>
+   <receiver>ServiceSelectionDialog</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>485</x>
+     <y>406</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>299</x>
+     <y>224</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

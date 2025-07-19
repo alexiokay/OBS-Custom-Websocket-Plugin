@@ -1,0 +1,1 @@
+if found more mdns services in all networks across all network not only local ip addres of machine, return it to plugin and in plugin opena obs window witn selection to which vortideck we want to connect
