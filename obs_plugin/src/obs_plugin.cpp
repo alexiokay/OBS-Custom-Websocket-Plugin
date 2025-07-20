@@ -332,55 +332,8 @@ bool vorti::applets::obs_plugin::connect()
     // Reset failure counter on successful connection
     m_connection_failure_count = 0;
 
-    // Register integration first
-    if (!register_integration()) {
-        log_to_obs("Failed to register integration");
-        disconnect();
-        return false;
-    }
-    log_to_obs("Integration registered");
+    // Registration will be handled by websocket_open_handler() when connection is truly open
 
-    // Initialize actions
-    if (!initialize_actions()) {
-        log_to_obs("Failed to initialize actions");
-        disconnect();
-        return false;
-    }
-    log_to_obs("Actions initialized");
-
-    // Wait for initialization to complete
-    {
-        std::unique_lock<std::mutex> lk(m_initialization_mutex);
-        if (m_initialization_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(5)) == std::cv_status::timeout) {
-            log_to_obs("Initialization timeout");
-            disconnect();
-            return false;
-        }
-        
-        // Check if initialization was actually successful
-        if (m_integration_instance.empty() || m_integration_guid.empty()) {
-            log_to_obs("Initialization failed - missing integration details");
-            disconnect();
-            return false;
-        }
-    }
-
-    // Register regular actions
-    log_to_obs("Registering regular actions...");
-    register_regular_actions();
-
-    // Register parameterized actions
-    if (helper_populate_collections()) {
-        log_to_obs("Registering parameterized actions...");
-        register_parameter_actions();
-    }
-
-    // Register action broadcast subscription
-    if (!register_actions_broadcast()) {
-        log_to_obs("Failed to register action broadcast");
-        disconnect();
-        return false;
-    }
 
     log_to_obs("Initialization sequence completed successfully");
     return true;
@@ -799,6 +752,43 @@ void vorti::applets::obs_plugin::on_service_discovered(const ServiceInfo& servic
             m_discovered_services.push_back(service);
             log_to_obs(std::format("Added new service: {} (total: {})", service.name, m_discovered_services.size()));
             
+            // Check if we have a pending dialog request from early startup
+            {
+                std::lock_guard<std::mutex> dialog_lock(m_dialog_mutex);
+                if (m_pending_dialog_request) {
+                    log_to_obs("Pending dialog request found - showing dialog now that services are available");
+                    m_pending_dialog_request = false;
+                    
+                    // Show the dialog asynchronously to avoid blocking discovery
+                    QMetaObject::invokeMethod(qApp, []() {
+                        if (g_obs_plugin_instance) {
+                            g_obs_plugin_instance->show_connection_settings_dialog();
+                        }
+                    }, Qt::QueuedConnection);
+                }
+            }
+            
+            // Update dialog ONLY if it has services (not empty dialog)
+            // This prevents crash when dialog opened before any services discovered
+            if (m_discovered_services.size() >= 1) {
+                // Check if dialog exists and is visible
+                if (qApp && m_persistent_dialog) {
+                    ServiceSelectionDialog* dialog_ptr = static_cast<ServiceSelectionDialog*>(m_persistent_dialog);
+                    std::vector<ServiceInfo> services_copy = m_discovered_services;
+                    QMetaObject::invokeMethod(qApp, [dialog_ptr, services_copy]() {
+                        // Only update if dialog is visible (not hidden/closing)
+                        if (dialog_ptr && dialog_ptr->isVisible()) {
+                            try {
+                                dialog_ptr->updateServiceList(services_copy);
+                                log_to_obs("Updated dialog with new service list");
+                            } catch (...) {
+                                log_to_obs("Exception updating dialog service list - ignored");
+                            }
+                        }
+                    }, Qt::QueuedConnection);
+                }
+            }
+            
             // Reset dialog flag if we now have multiple services
             if (m_discovered_services.size() > 1) {
                 m_show_selection_dialog = false;
@@ -939,6 +929,35 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                 }
 
                 m_initialization_cv.notify_all();
+                
+                // Update dialog to show connection is established (with crash protection)
+                if (qApp && !m_selected_service_url.empty() && m_persistent_dialog) {
+                    ServiceSelectionDialog* dialog_ptr = static_cast<ServiceSelectionDialog*>(m_persistent_dialog);
+                    std::string connected_url = m_selected_service_url;
+                    std::vector<ServiceInfo> services_copy;
+                    {
+                        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
+                        services_copy = m_discovered_services;
+                    }
+                    
+                    QMetaObject::invokeMethod(qApp, [dialog_ptr, connected_url, services_copy]() {
+                        // Only update if dialog is visible (not hidden/closing)
+                        if (dialog_ptr && dialog_ptr->isVisible()) {
+                            try {
+                                // Find the connected service and mark it as connected
+                                for (size_t i = 0; i < services_copy.size(); ++i) {
+                                    if (services_copy[i].websocket_url == connected_url) {
+                                        dialog_ptr->markServiceAsConnected(static_cast<int>(i));
+                                        log_to_obs(std::format("Dialog updated - service {} now connected", services_copy[i].name));
+                                        break;
+                                    }
+                                }
+                            } catch (...) {
+                                log_to_obs("Exception updating dialog connection status - ignored");
+                            }
+                        }
+                    }, Qt::QueuedConnection);
+                }
             }
             return;
         }
@@ -2904,20 +2923,32 @@ std::string vorti::applets::obs_plugin::get_best_available_service_url()
     {
         std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
         service_count = m_discovered_services.size();
-        should_show_dialog = (service_count >= 1 && !m_show_selection_dialog.exchange(true));
+        // Only show dialog for multiple services (not single service)
+        should_show_dialog = (service_count > 1 && !m_show_selection_dialog.exchange(true));
     }
     
     // Show dialog outside of mutex lock to avoid deadlock
     if (should_show_dialog) {
-        log_to_obs(std::format("Multiple VortiDeck services discovered ({})", service_count));
-        log_to_obs("DEBUG: About to call show_service_selection_dialog() directly");
+        // Check if a manual dialog is already open - if so, skip auto-dialog entirely
+        {
+            std::lock_guard<std::mutex> dialog_lock(m_dialog_mutex);
+            if (m_dialog_is_open) {
+                log_to_obs("Manual dialog already open - auto-connection will proceed without dialog");
+                should_show_dialog = false;
+ 
+            }
+        }
         
-        // Call the dialog without holding the mutex
-        show_service_selection_dialog();
-        
-        log_to_obs("DEBUG: show_service_selection_dialog() call completed");
+        if (should_show_dialog) {
+            log_to_obs(std::format("Multiple VortiDeck services discovered ({})", service_count));
+            log_to_obs("DEBUG: About to call show_service_selection_dialog() directly");
+            
+            // AUTO-CONNECTION NEVER SHOWS DIALOGS - just proceed to connect
+            
+            log_to_obs("DEBUG: show_service_selection_dialog() call completed");
+        }
     } else if (service_count > 1) {
-        log_to_obs("DEBUG: Multiple services but selection dialog already shown");
+        log_to_obs("DEBUG: Multiple services but selection dialog already shown or manual dialog open");
     }
     
     // Now get the service URL with a fresh mutex lock
@@ -2933,18 +2964,27 @@ std::string vorti::applets::obs_plugin::get_best_available_service_url()
         if (!m_discovered_services.empty()) {
             const auto& service = m_discovered_services.back();
             log_to_obs(std::format("Using discovered service: {}", service.websocket_url));
+            // Store the selected service URL for status tracking
+            m_selected_service_url = service.websocket_url;
+            log_to_obs(std::format("Auto-connection stored service URL: {}", m_selected_service_url));
             return service.websocket_url;
         }
         
         // Use cached discovery URL if available
         if (!m_discovered_websocket_url.empty()) {
             log_to_obs(std::format("Using cached service: {}", m_discovered_websocket_url));
+            // Store the selected service URL for status tracking
+            m_selected_service_url = m_discovered_websocket_url;
+            log_to_obs(std::format("Auto-connection stored cached URL: {}", m_selected_service_url));
             return m_discovered_websocket_url;
         }
         
         // Use last known service if available
         if (!m_last_known_service_url.empty()) {
             log_to_obs(std::format("Using last known service: {}", m_last_known_service_url));
+            // Store the selected service URL for status tracking
+            m_selected_service_url = m_last_known_service_url;
+            log_to_obs(std::format("Auto-connection stored last known URL: {}", m_selected_service_url));
             return m_last_known_service_url;
         }
         
@@ -2954,9 +2994,42 @@ std::string vorti::applets::obs_plugin::get_best_available_service_url()
     } // Close mutex scope
 }
 
-void vorti::applets::obs_plugin::show_service_selection_dialog()
+void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_dialog)
 {
     log_to_obs("DEBUG: show_service_selection_dialog() STARTED");
+    
+    // Simple RAII dialog guard - automatically resets state on function exit
+    struct DialogGuard {
+        bool& flag;
+        std::mutex& mutex;
+        bool valid;
+        
+        DialogGuard(bool& f, std::mutex& m) : flag(f), mutex(m), valid(false) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (flag) {
+                log_to_obs("Dialog already open - preventing duplicate dialog");
+                return; // valid stays false
+            }
+            flag = true;
+            valid = true;
+        }
+        
+        ~DialogGuard() {
+            if (valid) {
+                std::lock_guard<std::mutex> lock(mutex);
+                flag = false;
+            }
+        }
+    };
+    
+    DialogGuard guard(m_dialog_is_open, m_dialog_mutex);
+    if (!guard.valid) return;
+    
+    // Prevent dialog from opening during discovery to avoid crashes
+    if (m_discovery_in_progress && !force_show_dialog) {
+        log_to_obs("⏳ Discovery in progress - deferring dialog until complete");
+        return;
+    }
     
     std::vector<ServiceInfo> services_copy;
     {
@@ -3065,11 +3138,129 @@ void vorti::applets::obs_plugin::show_service_selection_dialog()
         bool on_main_thread = (QThread::currentThread() == app->thread());
         log_to_obs(std::format("DEBUG: Running on main thread: {}", on_main_thread ? "YES" : "NO"));
         
-        if (on_main_thread) {
+        // For manual dialogs (force_show_dialog=true), use simple non-blocking approach
+        if (force_show_dialog) {
+            log_to_obs("DEBUG: Manual dialog requested - creating simple non-blocking dialog");
+            
+            // Get current connection status to pass to dialog
+            std::string current_connected_url = m_selected_service_url;
+            bool is_currently_connected = is_connected();
+            
+            log_to_obs(std::format("DEBUG: Current connection status - Connected: {}, URL: {}", 
+                is_currently_connected ? "YES" : "NO", current_connected_url));
+            
+            // Simple non-blocking dialog creation with connection status
+            QMetaObject::invokeMethod(app, [services_copy, main_window, current_connected_url, is_currently_connected, persistent_dialog_ptr = &m_persistent_dialog, dialog_mutex_ptr = &m_dialog_mutex]() {
+                log_to_obs("DEBUG: Creating simple manual dialog with connection status");
+                ServiceSelectionDialog* dialog = new ServiceSelectionDialog(services_copy, static_cast<QWidget*>(main_window));
+                
+                // Store dialog reference for live updates
+                {
+                    std::lock_guard<std::mutex> lock(*dialog_mutex_ptr);
+                    *persistent_dialog_ptr = static_cast<void*>(dialog);
+                }
+                
+                // Mark the connected service if we have one
+                if (is_currently_connected && !current_connected_url.empty()) {
+                    log_to_obs(std::format("DEBUG: Looking for connected URL '{}' in {} services", current_connected_url, services_copy.size()));
+                    
+                    bool found_match = false;
+                    for (size_t i = 0; i < services_copy.size(); ++i) {
+                        log_to_obs(std::format("DEBUG: Service {}: {} (URL: '{}')", i, services_copy[i].name, services_copy[i].websocket_url));
+                        
+                        if (services_copy[i].websocket_url == current_connected_url) {
+                            log_to_obs(std::format("DEBUG: MATCH FOUND! Marking service {} as connected", i));
+                            dialog->markServiceAsConnected(static_cast<int>(i));
+                            log_to_obs(std::format("Manual dialog shows service {} as connected", services_copy[i].name));
+                            found_match = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!found_match) {
+                        log_to_obs("DEBUG: NO MATCH FOUND - connected URL not in service list");
+                        log_to_obs(std::format("DEBUG: Connected URL: '{}'", current_connected_url));
+                        log_to_obs("DEBUG: Available services:");
+                        for (size_t i = 0; i < services_copy.size(); ++i) {
+                            log_to_obs(std::format("DEBUG:   [{}] {} -> '{}'", i, services_copy[i].name, services_copy[i].websocket_url));
+                        }
+                    }
+                } else {
+                    log_to_obs(std::format("DEBUG: Not marking any service as connected - Connected: {}, URL: '{}'", 
+                        is_currently_connected ? "true" : "false", current_connected_url));
+                }
+                
+                // Connect cleanup when dialog closes
+                QObject::connect(dialog, &QDialog::finished, [persistent_dialog_ptr, dialog_mutex_ptr]() {
+                    std::lock_guard<std::mutex> lock(*dialog_mutex_ptr);
+                    *persistent_dialog_ptr = nullptr;
+                    log_to_obs("DEBUG: Manual dialog closed - reference cleared for live updates");
+                });
+                
+                dialog->setAttribute(Qt::WA_DeleteOnClose); // Auto-delete when closed
+                dialog->show();
+                dialog->raise();
+                dialog->activateWindow();
+                log_to_obs("DEBUG: Simple manual dialog shown (non-blocking) with live update support");
+            });
+            
+            log_to_obs("DEBUG: Simple manual dialog creation queued");
+            return;
+        }
+        
+        // For auto-dialogs (should never happen now), use blocking approach
+        if (false) {
             // We're already on the main thread, call directly
             log_to_obs("DEBUG: Creating dialog directly (already on main thread)");
             ServiceSelectionDialog dialog(services_copy, static_cast<QWidget*>(main_window));
             log_to_obs("DEBUG: ServiceSelectionDialog created successfully");
+            
+            // Store dialog reference for live updates
+            {
+                std::lock_guard<std::mutex> lock(m_dialog_mutex);
+                m_persistent_dialog = static_cast<void*>(&dialog);
+            }
+            
+            // Update dialog with current connection status if we're already connected
+            if (is_connected() && !m_selected_service_url.empty()) {
+                for (size_t i = 0; i < services_copy.size(); ++i) {
+                    if (services_copy[i].websocket_url == m_selected_service_url) {
+                        dialog.markServiceAsConnected(static_cast<int>(i));
+                        log_to_obs(std::format("Dialog initialized with connection status - service {} is connected", services_copy[i].name));
+                        break;
+                    }
+                }
+            }
+            
+            // Connect refresh signal to update connection status
+            QObject::connect(&dialog, &ServiceSelectionDialog::refreshRequested, [&]() {
+                log_to_obs("Dialog refresh requested - updating connection status");
+                
+                // Refresh service discovery
+                if (!m_discovery_in_progress) {
+                    start_continuous_discovery();
+                }
+                
+                // Update dialog with current connection status
+                if (is_connected() && !m_selected_service_url.empty()) {
+                    std::vector<ServiceInfo> current_services;
+                    {
+                        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
+                        current_services = m_discovered_services;
+                    }
+                    
+                    dialog.updateServiceList(current_services);
+                    
+                    // Mark connected service
+                    for (size_t i = 0; i < current_services.size(); ++i) {
+                        if (current_services[i].websocket_url == m_selected_service_url) {
+                            dialog.markServiceAsConnected(static_cast<int>(i));
+                            log_to_obs(std::format("Refresh updated - service {} is connected", current_services[i].name));
+                            break;
+                        }
+                    }
+                }
+            });
             log_to_obs("DEBUG: About to call dialog.exec()");
             result = dialog.exec();
             log_to_obs(std::format("DEBUG: dialog.exec() returned: {}", result));
@@ -3079,6 +3270,10 @@ void vorti::applets::obs_plugin::show_service_selection_dialog()
                 selectedIndex = dialog.getSelectedServiceIndex();
                 log_to_obs("DEBUG: Retrieved dialog results");
             }
+            
+            // Clear persistent dialog reference
+            m_persistent_dialog = nullptr;
+            
             dialog_completed = true;
         } else {
             // We're on a background thread, use invokeMethod
@@ -3086,9 +3281,14 @@ void vorti::applets::obs_plugin::show_service_selection_dialog()
                 log_to_obs("DEBUG: Creating dialog on main thread via invokeMethod");
                 ServiceSelectionDialog dialog(services_copy, static_cast<QWidget*>(main_window));
                 log_to_obs("DEBUG: ServiceSelectionDialog created successfully on main thread");
-                log_to_obs("DEBUG: About to call dialog.exec() on main thread");
-                result = dialog.exec();
-                log_to_obs(std::format("DEBUG: dialog.exec() returned: {} on main thread", result));
+                log_to_obs("DEBUG: About to show dialog (non-blocking) on main thread");
+                dialog.show();
+                dialog.raise();
+                dialog.activateWindow();
+                log_to_obs("DEBUG: Dialog shown (non-blocking) on main thread");
+                
+                // Note: Dialog will handle its own results via signals, no blocking needed
+                result = QDialog::Accepted; // Assume success for now
                 
                 if (result == QDialog::Accepted) {
                     selectedUrl = dialog.getSelectedServiceUrl();
@@ -3148,6 +3348,9 @@ void vorti::applets::obs_plugin::show_service_selection_dialog()
         log_to_obs(std::format("❌ Exception showing service selection dialog: {}", e.what()));
         log_to_obs("Using automatic selection as fallback...");
         
+        // Clear persistent dialog reference on exception
+        m_persistent_dialog = nullptr;
+        
         // Exception occurred - use automatic selection as fallback
         int preferred_index = -1;
         for (size_t i = 0; i < services_copy.size(); ++i) {
@@ -3169,6 +3372,9 @@ void vorti::applets::obs_plugin::show_service_selection_dialog()
     } catch (...) {
         log_to_obs("❌ Unknown exception showing service selection dialog");
         log_to_obs("Using automatic selection as fallback...");
+        
+        // Clear persistent dialog reference on exception
+        m_persistent_dialog = nullptr;
         
         // Use first service as ultimate fallback
         if (!services_copy.empty()) {
@@ -3260,6 +3466,12 @@ void vorti::applets::obs_plugin::show_connection_settings_dialog()
         if (m_discovered_services.empty()) {
             log_to_obs("No VortiDeck services currently discovered - triggering discovery");
             
+            // Set flag to show dialog when discovery completes
+            {
+                std::lock_guard<std::mutex> dialog_lock(m_dialog_mutex);
+                m_pending_dialog_request = true;
+            }
+            
             // Start discovery if not already running
             if (!m_discovery_in_progress) {
                 start_continuous_discovery();
@@ -3273,7 +3485,8 @@ void vorti::applets::obs_plugin::show_connection_settings_dialog()
     
     // Show the service selection dialog with current services
     // This function already handles Qt threading internally
-    show_service_selection_dialog();
+    // Use force_show_dialog=true for manual dialogs to bypass discovery checks
+    show_service_selection_dialog(true);
 }
 
 

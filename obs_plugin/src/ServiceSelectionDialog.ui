@@ -49,53 +49,63 @@
     <number>20</number>
    </property>
    <item>
-    <widget class="QLabel" name="titleLabel">
-     <property name="text">
-      <string>VortiDeck Services Found</string>
+    <widget class="QStackedWidget" name="stackedWidget">
+     <property name="currentIndex">
+      <number>0</number>
      </property>
-     <property name="alignment">
-      <set>Qt::AlignCenter</set>
-     </property>
-     <property name="styleSheet">
-      <string>QLabel { 
+     <widget class="QWidget" name="serviceSelectionPage">
+      <layout class="QVBoxLayout" name="servicePageLayout">
+       <property name="spacing">
+        <number>15</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="titleLabel">
+         <property name="text">
+          <string>VortiDeck Services Found</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
     color: #ffffff; 
     font-size: 16px; 
     font-weight: bold; 
     margin-bottom: 10px;
 }</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLabel" name="instructionLabel">
-     <property name="text">
-      <string>Select the VortiDeck service you want to connect to:</string>
-     </property>
-     <property name="alignment">
-      <set>Qt::AlignCenter</set>
-     </property>
-     <property name="wordWrap">
-      <bool>true</bool>
-     </property>
-     <property name="styleSheet">
-      <string>QLabel { 
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="instructionLabel">
+         <property name="text">
+          <string>Select the VortiDeck service you want to connect to:</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
     color: #cccccc; 
     font-size: 12px; 
     margin-bottom: 10px;
 }</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QListWidget" name="serviceList">
-     <property name="selectionMode">
-      <enum>QAbstractItemView::SingleSelection</enum>
-     </property>
-     <property name="alternatingRowColors">
-      <bool>false</bool>
-     </property>
-     <property name="styleSheet">
-      <string>QListWidget {
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QListWidget" name="serviceList">
+         <property name="selectionMode">
+          <enum>QAbstractItemView::SingleSelection</enum>
+         </property>
+         <property name="alternatingRowColors">
+          <bool>false</bool>
+         </property>
+         <property name="styleSheet">
+          <string>QListWidget {
     background-color: #525252;
     border: 1px solid #464646;
     color: #ffffff;
@@ -125,7 +135,184 @@ QListWidget::item:selected:hover {
     background-color: #2684c4;
     color: #ffffff;
 }</string>
-     </property>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="securityCodePage">
+      <layout class="QVBoxLayout" name="securityPageLayout">
+       <property name="spacing">
+        <number>20</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="securityTitleLabel">
+         <property name="text">
+          <string>Security Code Required</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
+    color: #ffffff; 
+    font-size: 16px; 
+    font-weight: bold; 
+    margin-bottom: 10px;
+}</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="securityInstructionLabel">
+         <property name="text">
+          <string>Enter the 6-digit security code displayed on your VortiDeck device:</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
+    color: #cccccc; 
+    font-size: 12px; 
+    margin-bottom: 20px;
+}</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="codeInputLayout">
+         <item>
+          <spacer name="leftSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="securityCodeInput">
+           <property name="minimumSize">
+            <size>
+             <width>200</width>
+             <height>40</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>200</width>
+             <height>40</height>
+            </size>
+           </property>
+           <property name="maxLength">
+            <number>6</number>
+           </property>
+           <property name="alignment">
+            <set>Qt::AlignCenter</set>
+           </property>
+           <property name="placeholderText">
+            <string>000000</string>
+           </property>
+           <property name="styleSheet">
+            <string>QLineEdit {
+    background-color: #525252;
+    border: 2px solid #464646;
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: bold;
+    letter-spacing: 8px;
+    padding: 8px;
+    border-radius: 4px;
+}
+QLineEdit:focus {
+    border: 2px solid #267cb2;
+}</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="rightSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="securityHelpLabel">
+         <property name="text">
+          <string>Look for the 6-digit code on your VortiDeck device screen or in the VortiDeck app settings.</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
+    color: #888888; 
+    font-size: 11px; 
+    font-style: italic;
+    margin-top: 10px;
+}</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="progressLabel">
+         <property name="text">
+          <string></string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="visible">
+          <bool>false</bool>
+         </property>
+         <property name="styleSheet">
+          <string>QLabel { 
+    color: #267cb2; 
+    font-size: 12px; 
+    font-weight: bold;
+    margin-top: 15px;
+    padding: 8px;
+    background-color: #404040;
+    border-radius: 4px;
+}</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
     </widget>
    </item>
    <item>
@@ -142,6 +329,67 @@ QListWidget::item:selected:hover {
         </size>
        </property>
       </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="refreshButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>30</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Refresh</string>
+       </property>
+       <property name="styleSheet">
+        <string>QPushButton {
+    background-color: #464646;
+    border: 1px solid #525252;
+    color: #ffffff;
+    padding: 6px 12px;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #525252;
+    border: 1px solid #5a5a5a;
+}
+QPushButton:pressed {
+    background-color: #3a3a3a;
+}</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="backButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>30</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Back</string>
+       </property>
+       <property name="visible">
+        <bool>false</bool>
+       </property>
+       <property name="styleSheet">
+        <string>QPushButton {
+    background-color: #464646;
+    border: 1px solid #525252;
+    color: #ffffff;
+    padding: 6px 12px;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #525252;
+    border: 1px solid #5a5a5a;
+}
+QPushButton:pressed {
+    background-color: #3a3a3a;
+}</string>
+       </property>
+      </widget>
      </item>
      <item>
       <widget class="QPushButton" name="cancelButton">

@@ -145,7 +145,7 @@ namespace vorti
             void save_discovered_service_state(const ServiceInfo& service);
             bool load_last_known_service_state();
             std::string get_best_available_service_url();
-            void show_service_selection_dialog();
+            void show_service_selection_dialog(bool force_show_dialog = false);
             std::string select_service_from_dialog(const std::vector<ServiceInfo>& services);
             
             // VortiDeck top-level menu
@@ -266,6 +266,14 @@ namespace vorti
             std::atomic<bool> m_show_selection_dialog{false};
             std::atomic<int> m_connection_failure_count{0};
             std::string m_selected_service_url;
+            std::string m_plugin_secret;  // Security code for authentication
+            
+            // Singleton dialog management to avoid destruction crashes
+            void* m_persistent_dialog = nullptr;  // Never destroyed, reused
+            std::atomic<bool> m_dialog_being_destroyed = false;
+            std::mutex m_dialog_mutex;
+            bool m_dialog_is_open = false;
+            bool m_pending_dialog_request = false;
             
             // State persistence for reconnection
             std::string m_last_known_service_url;
