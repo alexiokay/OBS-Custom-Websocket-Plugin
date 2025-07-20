@@ -50,3 +50,6 @@ Build*/
 *.dll
 
 .deps
+
+# ClaudPoint checkpoint system
+.checkpoints/
