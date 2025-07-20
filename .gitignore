@@ -48,3 +48,5 @@ Build*/
 *.exp
 *.pdb
 *.dll
+
+.deps
