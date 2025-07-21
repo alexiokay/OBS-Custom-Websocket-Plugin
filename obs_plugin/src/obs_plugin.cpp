@@ -210,6 +210,9 @@ void obs_module_post_load()
 
     obs_frontend_add_event_callback(handle_obs_frontend_event, nullptr);
     obs_frontend_add_save_callback(handle_obs_frontend_save, nullptr);
+    
+    // Connect to video reset signals for canvas size sync
+    connect_video_reset_signals();
 
     // Register custom VortiDeck Banner source
     if constexpr (BANNER_MANAGER_ENABLED) {
@@ -250,6 +253,9 @@ void obs_module_unload()
 
     obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
     obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
+    
+    // Disconnect video reset signals
+    disconnect_video_reset_signals();
 
     // Cleanup banner functionality FIRST (before disconnecting)
     if constexpr (BANNER_MANAGER_ENABLED) {
@@ -926,6 +932,10 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                     // Start the status update loop after successful registration
                     log_to_obs("Starting status update loop...");
                     start_loop();
+                    
+                    // Send initial canvas size update
+                    log_to_obs("Sending initial canvas size update...");
+                    send_canvas_size_update();
                 }
 
                 m_initialization_cv.notify_all();
@@ -959,6 +969,14 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                     }, Qt::QueuedConnection);
                 }
             }
+            return;
+        }
+
+        // Handle canvas size request (direct message type)
+        if (message.contains("type") && !message["type"].is_null() &&
+            message["type"].get<std::string>() == "GET_OBS_CANVAS_SIZE") {
+            log_to_obs("Received canvas size request");
+            handle_canvas_size_request(message);
             return;
         }
 
@@ -3487,6 +3505,138 @@ void vorti::applets::obs_plugin::show_connection_settings_dialog()
     // This function already handles Qt threading internally
     // Use force_show_dialog=true for manual dialogs to bypass discovery checks
     show_service_selection_dialog(true);
+}
+
+// ================================
+// Canvas Size Synchronization
+// ================================
+
+nlohmann::json vorti::applets::obs_plugin::get_current_canvas_info()
+{
+    obs_video_info ovi;
+    obs_get_video_info(&ovi);
+    
+    nlohmann::json canvas_info;
+    canvas_info["type"] = "OBS_CANVAS_SIZE_UPDATE";
+    canvas_info["width"] = ovi.base_width;
+    canvas_info["height"] = ovi.base_height;
+    canvas_info["fps_num"] = ovi.fps_num;
+    canvas_info["fps_den"] = ovi.fps_den;
+    canvas_info["timestamp"] = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    canvas_info["source"] = "obs_plugin";
+    
+    return canvas_info;
+}
+
+void vorti::applets::obs_plugin::send_canvas_size_update()
+{
+    try {
+        nlohmann::json canvas_info = get_current_canvas_info();
+        
+        // Check if canvas size actually changed
+        CanvasSizeInfo current_size;
+        current_size.width = canvas_info["width"];
+        current_size.height = canvas_info["height"];
+        current_size.fps_num = canvas_info["fps_num"];
+        current_size.fps_den = canvas_info["fps_den"];
+        
+        // Only proceed if size changed
+        if (current_size.width == m_last_canvas_size.width &&
+            current_size.height == m_last_canvas_size.height &&
+            current_size.fps_num == m_last_canvas_size.fps_num &&
+            current_size.fps_den == m_last_canvas_size.fps_den) {
+            log_to_obs("Canvas size unchanged - skipping update");
+            return;
+        }
+        
+        // Update cached size
+        m_last_canvas_size = current_size;
+        
+        if (!is_connected()) {
+            log_to_obs(std::format("Canvas size changed to {}x{} @ {}/{} fps - will send when VortiDeck connects", 
+                current_size.width, current_size.height, current_size.fps_num, current_size.fps_den));
+            return;
+        }
+        
+        // Send the update
+        if (send_message(canvas_info)) {
+            log_to_obs(std::format("✅ Canvas size update sent: {}x{} @ {}/{} fps", 
+                current_size.width, current_size.height, current_size.fps_num, current_size.fps_den));
+        } else {
+            log_to_obs("❌ Failed to send canvas size update");
+        }
+        
+    } catch (const std::exception& e) {
+        log_to_obs(std::format("Error sending canvas size update: {}", e.what()));
+    }
+}
+
+void vorti::applets::obs_plugin::handle_canvas_size_request(const nlohmann::json& message)
+{
+    try {
+        log_to_obs("Processing canvas size request from VortiDeck");
+        
+        // Always respond with current canvas info
+        nlohmann::json response = get_current_canvas_info();
+        
+        // Add request timestamp if available
+        if (message.contains("timestamp") && !message["timestamp"].is_null()) {
+            response["request_timestamp"] = message["timestamp"];
+        }
+        
+        if (send_message(response)) {
+            log_to_obs("Canvas size response sent successfully");
+        } else {
+            log_to_obs("Failed to send canvas size response");
+        }
+        
+    } catch (const std::exception& e) {
+        log_to_obs(std::format("Error handling canvas size request: {}", e.what()));
+    }
+}
+
+// ================================
+// Video Reset Signal Handlers
+// ================================
+
+void vorti::applets::obs_plugin::handle_video_reset_signal(void *data, calldata_t *cd)
+{
+    log_to_obs("🎥 Video reset signal detected - sending canvas size update");
+    
+    // Send canvas size update when video settings reset
+    send_canvas_size_update();
+}
+
+void vorti::applets::obs_plugin::connect_video_reset_signals()
+{
+    signal_handler_t* obs_signals = obs_get_signal_handler();
+    if (!obs_signals) {
+        log_to_obs("❌ Failed to get OBS signal handler for video reset signals");
+        return;
+    }
+    
+    // Connect to video_reset signal (main OBS video reset)
+    signal_handler_connect(obs_signals, "video_reset", handle_video_reset_signal, nullptr);
+    
+    // Connect to canvas_video_reset signal (canvas video reset)  
+    signal_handler_connect(obs_signals, "canvas_video_reset", handle_video_reset_signal, nullptr);
+    
+    log_to_obs("✅ Connected to OBS video reset signals for canvas size sync");
+}
+
+void vorti::applets::obs_plugin::disconnect_video_reset_signals()
+{
+    signal_handler_t* obs_signals = obs_get_signal_handler();
+    if (!obs_signals) {
+        return;
+    }
+    
+    // Disconnect video reset signals
+    signal_handler_disconnect(obs_signals, "video_reset", handle_video_reset_signal, nullptr);
+    signal_handler_disconnect(obs_signals, "canvas_video_reset", handle_video_reset_signal, nullptr);
+    
+    log_to_obs("Disconnected from OBS video reset signals");
 }
 
 

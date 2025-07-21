@@ -209,6 +209,14 @@ namespace vorti
             void action_banner_toggle(const action_invoke_parameters &parameters);
             void action_banner_set_data(const action_invoke_parameters &parameters);
             
+            // Canvas size synchronization
+            void send_canvas_size_update();
+            void handle_canvas_size_request(const nlohmann::json& message);
+            nlohmann::json get_current_canvas_info();
+            static void handle_video_reset_signal(void *data, calldata_t *cd);
+            void connect_video_reset_signals();
+            void disconnect_video_reset_signals();
+            
             // Complex banner actions removed - handled by external application
 
             // OBS menu creation
@@ -267,6 +275,15 @@ namespace vorti
             std::atomic<int> m_connection_failure_count{0};
             std::string m_selected_service_url;
             std::string m_plugin_secret;  // Security code for authentication
+            
+            // Canvas size tracking
+            struct CanvasSizeInfo {
+                uint32_t width = 0;
+                uint32_t height = 0;
+                uint32_t fps_num = 0;
+                uint32_t fps_den = 1;
+            };
+            CanvasSizeInfo m_last_canvas_size;
             
             // Singleton dialog management to avoid destruction crashes
             void* m_persistent_dialog = nullptr;  // Never destroyed, reused
