@@ -3437,8 +3437,16 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
     QAction* banner_action = vortideck_menu->addAction("Banner Settings");
     QObject::connect(banner_action, &QAction::triggered, []() {
         log_to_obs("VortiDeck Banner Settings clicked from top-level menu");
-        // Call existing banner functionality - you'll need to implement this
-        // For now, just log that it was clicked
+        // Open VortiDeck banner settings page
+        DeepLinkHandler::open_vortideck_with_fallback("banner-settings");
+    });
+    
+    // Add Overlays menu item
+    QAction* overlays_action = vortideck_menu->addAction("Overlays");
+    QObject::connect(overlays_action, &QAction::triggered, []() {
+        log_to_obs("VortiDeck Overlays clicked from top-level menu");
+        // Open VortiDeck overlays page
+        DeepLinkHandler::open_vortideck_with_fallback("overlay");
     });
     
     // Add Connection Settings submenu item  
@@ -3450,7 +3458,17 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
         }
     });
     
-    log_to_obs("✅ VortiDeck top-level menu created with Banner and Connection Settings");
+    // Add separator before test items
+    vortideck_menu->addSeparator();
+    
+    // Add Test Deep Link item
+    QAction* test_deeplink_action = vortideck_menu->addAction("Test Deep Link");
+    QObject::connect(test_deeplink_action, &QAction::triggered, []() {
+        log_to_obs("Test Deep Link clicked from VortiDeck menu");
+        vorti::applets::obs_plugin::test_open_vortideck_deep_link();
+    });
+    
+    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings, Overlays, Connection Settings, and Test Deep Link");
 }
 
 void vorti::applets::obs_plugin::connection_settings_menu_callback(void* data)
@@ -3639,7 +3657,71 @@ void vorti::applets::obs_plugin::disconnect_video_reset_signals()
     log_to_obs("Disconnected from OBS video reset signals");
 }
 
+// ================================
+// Deep Link Implementation
+// ================================
 
+bool DeepLinkHandler::open_url(const std::string& url)
+{
+    if (url.empty()) {
+        log_to_obs("❌ Deep link error: Empty URL provided");
+        return false;
+    }
+    
+    QString qurl = QString::fromStdString(url);
+    bool success = QDesktopServices::openUrl(QUrl(qurl));
+    
+    log_deep_link_result(url, success);
+    return success;
+}
 
+bool DeepLinkHandler::open_vortideck(const std::string& path)
+{
+    std::string url = "vortideck://";
+    if (!path.empty()) {
+        url += "open_page/" + path;
+    }
+    
+    return open_url(url);
+}
 
+bool DeepLinkHandler::open_vortideck_with_fallback(const std::string& path)
+{
+    // First try the deep link
+    if (open_vortideck(path)) {
+        return true;
+    }
+    
+    // If deep link fails, try opening the web version
+    log_to_obs("Deep link failed, trying web fallback...");
+    std::string web_url = "https://vortideck.com";
+    if (!path.empty()) {
+        web_url += "/" + path;
+    }
+    
+    return open_url(web_url);
+}
 
+void DeepLinkHandler::log_deep_link_result(const std::string& url, bool success)
+{
+    std::stringstream ss;
+    ss << (success ? "✅" : "❌") << " Deep link " 
+       << (success ? "opened successfully" : "failed to open") 
+       << ": " << url;
+    log_to_obs(ss.str());
+}
+
+// Test function implementation
+void vorti::applets::obs_plugin::test_open_vortideck_deep_link()
+{
+    log_to_obs("🧪 Testing VortiDeck deep link...");
+    
+    // Test opening VortiDeck dashboard
+    bool success = DeepLinkHandler::open_vortideck_with_fallback("dashboard");
+    
+    if (success) {
+        log_to_obs("✅ Deep link test completed successfully");
+    } else {
+        log_to_obs("❌ Deep link test failed");
+    }
+}

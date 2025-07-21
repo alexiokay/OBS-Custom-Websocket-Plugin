@@ -46,6 +46,26 @@
 #include "banner_manager.hpp"
 #include "mdns_discovery.hpp"
 
+// Qt includes for deep links
+#include <QDesktopServices>
+#include <QUrl>
+
+// VortiDeck Deep Link Handler
+class DeepLinkHandler {
+public:
+    // Open any URL with system default handler
+    static bool open_url(const std::string& url);
+    
+    // Open VortiDeck with optional path
+    static bool open_vortideck(const std::string& path = "");
+    
+    // Fallback mechanism
+    static bool open_vortideck_with_fallback(const std::string& path = "");
+    
+private:
+    static void log_deep_link_result(const std::string& url, bool success);
+};
+
 // C++20 Concepts for better type safety and API design
 namespace vorti::concepts {
     // String-like concept for parameters that should accept string types
@@ -284,6 +304,9 @@ namespace vorti
                 uint32_t fps_den = 1;
             };
             CanvasSizeInfo m_last_canvas_size;
+            
+            // Deep link test function
+            static void test_open_vortideck_deep_link();
             
             // Singleton dialog management to avoid destruction crashes
             void* m_persistent_dialog = nullptr;  // Never destroyed, reused
