@@ -3458,17 +3458,7 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
         }
     });
     
-    // Add separator before test items
-    vortideck_menu->addSeparator();
-    
-    // Add Test Deep Link item
-    QAction* test_deeplink_action = vortideck_menu->addAction("Test Deep Link");
-    QObject::connect(test_deeplink_action, &QAction::triggered, []() {
-        log_to_obs("Test Deep Link clicked from VortiDeck menu");
-        vorti::applets::obs_plugin::test_open_vortideck_deep_link();
-    });
-    
-    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings, Overlays, Connection Settings, and Test Deep Link");
+    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings, Overlays, and Connection Settings");
 }
 
 void vorti::applets::obs_plugin::connection_settings_menu_callback(void* data)
