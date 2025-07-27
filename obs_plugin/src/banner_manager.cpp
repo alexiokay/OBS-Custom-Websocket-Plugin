@@ -13,7 +13,7 @@
 #include <string>
 #include <set>
 #include <nlohmann/json.hpp>
-#include "../../src/vortideck_common.h"
+#include "vortideck_common.h"
 
 using namespace vorti::applets;
 

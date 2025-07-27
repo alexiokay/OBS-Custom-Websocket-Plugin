@@ -89,12 +89,14 @@ target_sources(${CMAKE_PROJECT_NAME}
         src/banner_manager.hpp
         src/mdns_discovery.cpp
         src/mdns_discovery.hpp
-        src/service_selection_dialog.cpp
-        src/service_selection_dialog.hpp
-        src/ServiceSelectionDialog.ui
-        ../src/overlay_source.cpp
-        ../src/overlay_source.h
-        ../src/vortideck_common.h
+        src/ui/service_selection_dialog.cpp
+        src/ui/service_selection_dialog.hpp
+        src/ui/ServiceSelectionDialog.ui
+        src/sources/overlay_source.cpp
+        src/sources/overlay_source.h
+        src/sources/banner_source.cpp
+        src/sources/banner_source.h
+        src/vortideck_common.h
         ${DEPS_DIR}/other/mdns_cpp/src/logger.cpp
         ${DEPS_DIR}/other/mdns_cpp/src/mdns.cpp
         ${DEPS_DIR}/other/mdns_cpp/src/utils.cpp)

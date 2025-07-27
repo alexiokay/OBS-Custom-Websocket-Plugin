@@ -52,14 +52,14 @@ target_sources(${CMAKE_PROJECT_NAME}
         obs_plugin/src/banner_manager.hpp
         obs_plugin/src/mdns_discovery.cpp
         obs_plugin/src/mdns_discovery.hpp
-        obs_plugin/src/service_selection_dialog.cpp
-        obs_plugin/src/service_selection_dialog.hpp
-        obs_plugin/src/ServiceSelectionDialog.ui
-        src/overlay_source.cpp
-        src/overlay_source.h
-        src/banner_source.cpp
-        src/banner_source.h
-        src/vortideck_common.h
+        obs_plugin/src/ui/service_selection_dialog.cpp
+        obs_plugin/src/ui/service_selection_dialog.hpp
+        obs_plugin/src/ui/ServiceSelectionDialog.ui
+        obs_plugin/src/sources/overlay_source.cpp
+        obs_plugin/src/sources/overlay_source.h
+        obs_plugin/src/sources/banner_source.cpp
+        obs_plugin/src/sources/banner_source.h
+        obs_plugin/src/vortideck_common.h
         other/mdns_cpp/src/logger.cpp
         other/mdns_cpp/src/mdns.cpp
         other/mdns_cpp/src/utils.cpp)

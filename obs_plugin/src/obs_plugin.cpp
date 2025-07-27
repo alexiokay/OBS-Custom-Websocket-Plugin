@@ -1,10 +1,11 @@
 #include "obs_plugin.hpp"
-#include "service_selection_dialog.hpp"
-#include "../../src/overlay_source.h"
-#include "../../src/vortideck_common.h"
+#include "ui/service_selection_dialog.hpp"
+#include "sources/overlay_source.h"
+#include "vortideck_common.h"
 
-// Forward declaration for banner_source registration
+// Forward declarations for source registrations
 extern void register_banner_source();
+extern void register_overlay_source();
 #include <QApplication>
 #include <QMetaObject>
 #include <QThread>
