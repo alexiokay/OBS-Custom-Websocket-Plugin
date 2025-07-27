@@ -229,6 +229,12 @@ namespace vorti
             void action_banner_toggle(const action_invoke_parameters &parameters);
             void action_banner_set_data(const action_invoke_parameters &parameters);
             
+            // Overlay action handlers (no restrictions)
+            void action_overlay_set_data(const action_invoke_parameters &parameters);
+            void action_overlay_create(const action_invoke_parameters &parameters);
+            void action_overlay_update(const action_invoke_parameters &parameters);
+            void action_overlay_remove(const action_invoke_parameters &parameters);
+            
             // Canvas size synchronization
             void send_canvas_size_update();
             void handle_canvas_size_request(const nlohmann::json& message);
@@ -384,11 +390,17 @@ namespace vorti
                 const std::string s_mixer_unmute                = "obs_mixer_unmute";
                 const std::string s_mixer_mute_toggle           = "obs_mixer_mute_toggle";
 
-                // Banner actions
+                // Banner actions (ADS)
                 const std::string s_banner_show                 = "obs_banner_show";
                 const std::string s_banner_hide                 = "obs_banner_hide";
                 const std::string s_banner_toggle               = "obs_banner_toggle";
                 const std::string s_banner_set_data             = "obs_banner_set_data";
+                
+                // Overlay actions (no restrictions)
+                const std::string s_overlay_set_data            = "obs_overlay_set_data";
+                const std::string s_overlay_create              = "obs_overlay_create";
+                const std::string s_overlay_update              = "obs_overlay_update";
+                const std::string s_overlay_remove              = "obs_overlay_remove";
                 
                 // Complex banner actions removed - handled by external application
 

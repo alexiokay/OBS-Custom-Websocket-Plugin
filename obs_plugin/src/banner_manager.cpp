@@ -8,10 +8,12 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <set>
 #include <nlohmann/json.hpp>
+#include "../../src/vortideck_common.h"
 
 using namespace vorti::applets;
 
@@ -98,6 +100,7 @@ banner_manager::~banner_manager()
     
     // Clean up signal handlers and monitoring
     disconnect_scene_signals();
+    disconnect_source_signals();
     stop_persistence_monitor();
     
     // Clean up OBS sources
@@ -118,6 +121,7 @@ void banner_manager::shutdown()
     
     // Clean up signal handlers and monitoring
     disconnect_scene_signals();
+    disconnect_source_signals();
     stop_persistence_monitor();
     
     log_message("Banner manager shutdown complete");
@@ -224,16 +228,34 @@ void banner_manager::connect_scene_signals()
         
         signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
         if (handler) {
-            // Connect all three signal handlers
+            const char* scene_name = obs_source_get_name(scene_source);
+            log_message("DEBUG: Connecting signals for scene: " + std::string(scene_name ? scene_name : "unknown"));
+            
+            // Connect all signal handlers
+            signal_handler_connect(handler, "item_add", on_item_add, this);
             signal_handler_connect(handler, "item_remove", on_item_remove, this);
             signal_handler_connect(handler, "item_visible", on_item_visible, this);
             signal_handler_connect(handler, "item_transform", on_item_transform, this);
+            signal_handler_connect(handler, "reorder", on_scene_reorder, this);
+            
+            log_message("DEBUG: Scene signals connected for: " + std::string(scene_name ? scene_name : "unknown"));
             connected_scenes++;
+        } else {
+            const char* scene_name = obs_source_get_name(scene_source);
+            log_message("DEBUG: No signal handler found for scene: " + std::string(scene_name ? scene_name : "unknown"));
         }
     }
     
     obs_frontend_source_list_free(&scenes);
     log_message("Scene signals connected for " + std::to_string(connected_scenes) + " scenes - banner enforcement ACTIVE");
+    
+    // For free users, ensure all banners are locked and positioned correctly
+    if (!m_is_premium.load()) {
+        log_message("DEBUG: Free user detected - enforcing banner locks");
+        enforce_banner_lock_and_position();
+    } else {
+        log_message("DEBUG: Premium user - skipping banner locks");
+    }
 }
 
 void banner_manager::disconnect_scene_signals()
@@ -259,15 +281,21 @@ void banner_manager::disconnect_scene_signals()
             signal_handler_t* handler = obs_source_get_signal_handler(scene_source);
         if (handler) {
                 // Disconnect all signal handlers
+            signal_handler_disconnect(handler, "item_add", on_item_add, this);
             signal_handler_disconnect(handler, "item_remove", on_item_remove, this);
             signal_handler_disconnect(handler, "item_visible", on_item_visible, this);
             signal_handler_disconnect(handler, "item_transform", on_item_transform, this);
+            signal_handler_disconnect(handler, "reorder", on_scene_reorder, this);
+            
+            // Standard signal cleanup
                 disconnected_scenes++;
         }
     }
     
     obs_frontend_source_list_free(&scenes);
         log_message("Scene signals disconnected from " + std::to_string(disconnected_scenes) + " scenes");
+        
+        // No complex signal/timer cleanup needed with prevention approach
         
         // Reset flag after disconnection
         m_signals_connected.store(false);
@@ -278,7 +306,59 @@ void banner_manager::disconnect_scene_signals()
     }
 }
 
-// REMOVED: Legacy minimal signal handlers - no longer needed
+// Signal handler for when items are added to scenes
+void banner_manager::on_item_add(void* data, calldata_t* calldata)
+{
+    if (!data || !calldata) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    try {
+        obs_sceneitem_t* item = (obs_sceneitem_t*)calldata_ptr(calldata, "item");
+        if (!item) return;
+        
+        obs_source_t* source = obs_sceneitem_get_source(item);
+        if (!source) return;
+        
+        const char* name = obs_source_get_name(source);
+        if (!name) return;
+        
+        // If any new item is added, ensure our banner stays on top (for free users)
+        // Also check for any item changes that might affect order
+        if (!manager->m_is_premium.load()) {
+            obs_scene_t* scene = obs_sceneitem_get_scene(item);
+            if (scene) {
+                obs_sceneitem_t* banner_item = manager->find_vortideck_ads_in_scene(scene);
+                if (banner_item) {
+                    // Check if banner is at the top
+                    obs_sceneitem_t* first_item = nullptr;
+                    obs_scene_enum_items(scene, [](obs_scene_t*, obs_sceneitem_t* item, void* param) {
+                        obs_sceneitem_t** first_ptr = static_cast<obs_sceneitem_t**>(param);
+                        if (!*first_ptr) {
+                            *first_ptr = item;
+                        }
+                        return false; // Stop after first item
+                    }, &first_item);
+                    
+                    if (first_item != banner_item) {
+                        manager->log_message("FREE USER: Item change detected - banner not on top, fixing");
+                        
+                        // Set flag to prevent infinite loop
+                        manager->m_correcting_position.store(true);
+                        obs_sceneitem_set_order(banner_item, OBS_ORDER_MOVE_TOP);
+                        manager->m_correcting_position.store(false);
+                        
+                        manager->log_message("FREE USER: Banner moved to top via item_add handler");
+                    }
+                }
+            }
+        }
+        
+    } catch (...) {
+        manager->log_message("SIGNAL: Exception in item_add handler");
+    }
+}
 
 void banner_manager::on_item_remove(void* data, calldata_t* calldata)
 {
@@ -302,8 +382,8 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
         const char* name = obs_source_get_name(source);
         if (!name) return;
         
-        // Check if this is our banner being removed (metadata-based detection)
-        if (manager->is_vortideck_banner_item(item)) {
+        // Check if this is our ADS being removed (metadata-based detection)
+        if (manager->is_vortideck_ads_item(item)) {
             manager->log_message("SIGNAL: Banner removal detected - Name: " + std::string(name) + 
                                ", User: " + PremiumStatusHandler::get_user_type_string(manager));
             
@@ -369,8 +449,8 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
         const char* name = obs_source_get_name(source);
         if (!name) return;
         
-        // Check if this is our banner visibility change (metadata-based detection)
-        if (manager->is_vortideck_banner_item(item)) {
+        // Check if this is our ADS visibility change (metadata-based detection)
+        if (manager->is_vortideck_ads_item(item)) {
             bool is_premium = manager->m_is_premium.load();
             
             // Only log significant changes to reduce spam
@@ -428,8 +508,8 @@ void banner_manager::on_item_transform(void* data, calldata_t* calldata)
     const char* name = obs_source_get_name(source);
     if (!name) return;
     
-        // Check if this is our banner being moved/resized (metadata-based detection)
-        if (manager->is_vortideck_banner_item(item)) {
+        // Check if this is our ADS being moved/resized (metadata-based detection)
+        if (manager->is_vortideck_ads_item(item)) {
         bool is_premium = manager->m_is_premium.load();
         if (!is_premium) {
                 // STEP 5: Check if position actually needs correction (avoid spam)
@@ -471,6 +551,219 @@ void banner_manager::on_item_transform(void* data, calldata_t* calldata)
         // STEP 5: Ensure flag is cleared even if exception occurs
         manager->m_correcting_position.store(false);
     }
+}
+
+// Prevention-based banner enforcement - lock banners so they can't be moved
+void banner_manager::enforce_banner_lock_and_position()
+{
+    log_message("PREVENTION: Enforcing banner lock and position for free users");
+    
+    try {
+        // Get all scenes and ensure banners are locked at top position
+        obs_frontend_source_list scenes = {};
+        obs_frontend_get_scenes(&scenes);
+        
+        for (size_t i = 0; i < scenes.sources.num; i++) {
+            obs_source_t* scene_source = scenes.sources.array[i];
+            if (!scene_source) continue;
+            
+            obs_scene_t* scene = obs_scene_from_source(scene_source);
+            if (!scene) continue;
+            
+            obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
+            if (banner_item) {
+                const char* scene_name = obs_source_get_name(scene_source);
+                log_message("PREVENTION: Found banner in scene: " + std::string(scene_name ? scene_name : "unknown"));
+                
+                // Move to top position first
+                obs_sceneitem_set_order(banner_item, OBS_ORDER_MOVE_TOP);
+                
+                // Lock the banner so it can't be manually moved
+                obs_sceneitem_set_locked(banner_item, true);
+                
+                log_message("PREVENTION: Banner locked at top position");
+            }
+        }
+        
+        obs_frontend_source_list_free(&scenes);
+        log_message("PREVENTION: Banner enforcement complete - banners are now unmovable");
+        
+    } catch (...) {
+        log_message("PREVENTION: Exception during banner lock enforcement");
+    }
+}
+
+// No timer code needed - prevention approach is cleaner
+
+// Source signal handlers for direct visibility monitoring
+void banner_manager::on_source_hide(void* data, calldata_t* calldata)
+{
+    if (!data) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    try {
+        manager->m_source_visible.store(false);
+        manager->log_message("SOURCE SIGNAL: Banner source hidden");
+        
+        // For free users, immediately enforce visibility
+        if (!manager->m_is_premium.load() && !manager->m_intentional_hide_in_progress.load()) {
+            manager->log_message("FREE USER: Banner hidden via source - enforcing visibility");
+            manager->enforce_banner_visibility();
+        }
+    } catch (...) {
+        manager->log_message("SIGNAL: Exception in source_hide handler");
+    }
+}
+
+void banner_manager::on_source_show(void* data, calldata_t* calldata)
+{
+    if (!data) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    try {
+        manager->m_source_visible.store(true);
+        manager->log_message("SOURCE SIGNAL: Banner source shown");
+    } catch (...) {
+        manager->log_message("SIGNAL: Exception in source_show handler");
+    }
+}
+
+void banner_manager::on_source_deactivate(void* data, calldata_t* calldata)
+{
+    if (!data) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    try {
+        manager->log_message("SOURCE SIGNAL: Banner deactivated from stream/recording");
+        
+        // For free users during streaming, enforce visibility
+        if (!manager->m_is_premium.load() && obs_frontend_streaming_active()) {
+            manager->log_message("FREE USER: Banner deactivated during stream - enforcing visibility");
+            manager->enforce_banner_visibility();
+        }
+    } catch (...) {
+        manager->log_message("SIGNAL: Exception in source_deactivate handler");
+    }
+}
+
+void banner_manager::on_source_activate(void* data, calldata_t* calldata)
+{
+    if (!data) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    try {
+        manager->log_message("SOURCE SIGNAL: Banner activated on stream/recording");
+    } catch (...) {
+        manager->log_message("SIGNAL: Exception in source_activate handler");
+    }
+}
+
+// CRITICAL: Scene reorder signal handler - defer banner enforcement to avoid timing issues
+void banner_manager::on_scene_reorder(void* data, calldata_t* calldata)
+{
+    if (!data) return;
+    
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+    
+    // Only for free users - premium users can reorder freely
+    if (manager->m_is_premium.load()) {
+        return;
+    }
+    
+    // Prevent infinite loops during our correction
+    if (manager->m_correcting_position.load()) {
+        return;
+    }
+    
+    try {
+        manager->log_message("REORDER SIGNAL: Scene items reordered - deferring banner enforcement");
+        
+        // Get the scene from calldata
+        obs_scene_t* scene = nullptr;
+        if (calldata_get_ptr(calldata, "scene", (void**)&scene) && scene) {
+            // Defer the correction by 100ms to let the reorder operation complete
+            std::thread([manager, scene]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                
+                obs_sceneitem_t* banner_item = manager->find_vortideck_ads_in_scene(scene);
+                if (banner_item) {
+                    manager->m_correcting_position.store(true);
+                    
+                    // Log current position before correction
+                    obs_source_t* scene_source = obs_scene_get_source(scene);
+                    const char* scene_name = obs_source_get_name(scene_source);
+                    manager->log_message("REORDER: Banner found in scene: " + std::string(scene_name ? scene_name : "unknown"));
+                    
+                    // Try different reorder approaches
+                    obs_sceneitem_set_order(banner_item, OBS_ORDER_MOVE_TOP);
+                    manager->log_message("REORDER: OBS_ORDER_MOVE_TOP called");
+                    
+                    // Check if banner is actually at the top now by enumerating scene items
+                    bool banner_is_first = false;
+                    obs_scene_enum_items(scene, [](obs_scene_t* scene, obs_sceneitem_t* item, void* param) {
+                        bool* is_first = static_cast<bool*>(param);
+                        obs_source_t* source = obs_sceneitem_get_source(item);
+                        const char* source_id = obs_source_get_id(source);
+                        if (source_id && strcmp(source_id, "vortideck_ads") == 0) {
+                            *is_first = true;
+                        }
+                        return false; // Stop after first item (which should be at top)
+                    }, &banner_is_first);
+                    
+                    manager->log_message("REORDER: Banner is now at top: " + std::string(banner_is_first ? "YES" : "NO"));
+                    
+                    manager->m_correcting_position.store(false);
+                }
+            }).detach();
+        }
+    } catch (...) {
+        manager->log_message("REORDER SIGNAL: Exception in scene reorder handler");
+        manager->m_correcting_position.store(false);
+    }
+}
+
+void banner_manager::connect_source_signals()
+{
+    if (!m_banner_source) return;
+    
+    signal_handler_t* handler = obs_source_get_signal_handler(m_banner_source);
+    if (!handler) return;
+    
+    // Connect visibility signals
+    signal_handler_connect(handler, "hide", on_source_hide, this);
+    signal_handler_connect(handler, "show", on_source_show, this);
+    signal_handler_connect(handler, "deactivate", on_source_deactivate, this);
+    signal_handler_connect(handler, "activate", on_source_activate, this);
+    
+    // Set initial visibility state
+    m_source_visible.store(obs_source_showing(m_banner_source));
+    
+    log_message("Connected source visibility signals for banner");
+}
+
+void banner_manager::disconnect_source_signals()
+{
+    if (!m_banner_source) return;
+    
+    signal_handler_t* handler = obs_source_get_signal_handler(m_banner_source);
+    if (!handler) return;
+    
+    // Disconnect visibility signals
+    signal_handler_disconnect(handler, "hide", on_source_hide, this);
+    signal_handler_disconnect(handler, "show", on_source_show, this);
+    signal_handler_disconnect(handler, "deactivate", on_source_deactivate, this);
+    signal_handler_disconnect(handler, "activate", on_source_activate, this);
+    
+    log_message("Disconnected source visibility signals for banner");
 }
 
 void banner_manager::cleanup_for_scene_collection_change()
@@ -537,15 +830,21 @@ void banner_manager::show_banner(bool enable_duration_timer)
         log_message("SHOW_BANNER: FREE USER - Banner display complete with restrictions");
         log_message("SHOW_BANNER: FREE USER - Limited hiding (5sec auto-restore), no positioning control");
         
-        // For free users, automatically start enhanced monitoring (ALWAYS)
-        if (!m_persistence_monitor_active) {
-            log_message("SHOW_BANNER: FREE USER - Starting banner protection monitoring");
-            start_persistence_monitor();
+        // For free users, signals will handle visibility monitoring
+        log_message("SHOW_BANNER: FREE USER - Using signal-based protection (no polling)");
+        
+        // Ensure source signals are connected
+        if (m_banner_source) {
+            connect_source_signals();
         }
         
         // FORCE immediate enforcement for FREE USERS
         log_message("SHOW_BANNER: FREE USER - Enforcing banner visibility");
         enforce_banner_visibility();
+        
+        // CRITICAL: Also enforce banner lock and position
+        log_message("SHOW_BANNER: FREE USER - Enforcing banner lock and position");
+        enforce_banner_lock_and_position();
         
         // Duration control removed - handled by external application
         log_message("SHOW_BANNER: FREE USER - Duration managed externally");
@@ -594,8 +893,8 @@ void banner_manager::hide_banner()
                 // CRITICAL: Re-enable full protection system for free users
                 log_message("HIDE_BANNER: FREE USER - Re-enabling signal-based protection system");
                 connect_scene_signals();
-                start_persistence_monitor();
-                log_message("HIDE_BANNER: FREE USER - Protection system fully re-enabled");
+                connect_source_signals();
+                log_message("HIDE_BANNER: FREE USER - Signal protection fully re-enabled");
             }
             // Clear the flag after the hide period is over
             m_intentional_hide_in_progress.store(false);
@@ -611,7 +910,7 @@ void banner_manager::hide_banner()
             if (!PremiumStatusHandler::is_premium(this)) {
                 log_message("HIDE_BANNER: FREE USER - Safety re-enabling protection system");
                 connect_scene_signals();
-                start_persistence_monitor();
+                connect_source_signals();
             }
             log_message("HIDE_BANNER: FREE USER - Signal protection safety timeout reached");
         }).detach();
@@ -685,10 +984,11 @@ void banner_manager::set_banner_content(std::string_view content_data, std::stri
             log_message("FREE USER: Content changed - updating banners across ALL scenes");
             initialize_banners_all_scenes();
             
-            // EXTRA SECURITY: Re-enable protection monitoring for free users
-            if (!m_persistence_monitor_active) {
-                log_message("FREE USER: SECURITY - Re-enabling protection monitoring after content update");
-                start_persistence_monitor();
+            // EXTRA SECURITY: Ensure signal protection is active for free users
+            log_message("FREE USER: SECURITY - Ensuring signal-based protection is active after content update");
+            connect_scene_signals();
+            if (m_banner_source) {
+                connect_source_signals();
             }
         } else {
             // PREMIUM USERS: Content change only affects current scene (if they choose)
@@ -748,7 +1048,7 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
                 obs_scene_t* scene = obs_scene_from_source(scene_source);
                 if (!scene) continue;
                 
-                obs_sceneitem_t* banner_item = find_vortideck_banner_in_scene(scene);
+                obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
                 if (banner_item) {
                     lock_banner_item(banner_item);
                 }
@@ -757,10 +1057,11 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
             
             log_message("FREE USER: SECURITY - All banners re-locked after content update");
             
-            // CRITICAL: Re-enable protection monitoring for free users
-            if (!m_persistence_monitor_active) {
-                log_message("FREE USER: SECURITY - Re-enabling protection monitoring after content update");
-                start_persistence_monitor();
+            // CRITICAL: Ensure signal protection is active for free users
+            log_message("FREE USER: SECURITY - Ensuring signal-based protection is active after content update");
+            connect_scene_signals();
+            if (m_banner_source) {
+                connect_source_signals();
             }
         } else {
             // PREMIUM USERS: Content change only affects current scene (if they choose)
@@ -784,10 +1085,11 @@ void banner_manager::set_banner_content_with_custom_params(std::string_view cont
             enable_signal_connections_when_safe();
         }
         
-        // Force re-enable persistence monitoring if needed  
-        if (!m_persistence_monitor_active) {
-            log_message("FREE USER: WARNING - Persistence monitor inactive, re-enabling");
-            start_persistence_monitor();
+        // Ensure signal protection is active for free users
+        log_message("FREE USER: SECURITY - Ensuring signal-based protection is active");
+        connect_scene_signals();
+        if (m_banner_source) {
+            connect_source_signals();
         }
         
         log_message("FREE USER: SECURITY - Protection systems verified active after content update");
@@ -824,6 +1126,13 @@ bool banner_manager::is_banner_visible() const
         return false;
     }
     
+    // PERFORMANCE IMPROVEMENT: Use cached source visibility from signals
+    // This eliminates the need to iterate through all scenes every time
+    if (m_source_visible.load()) {
+        return true;
+    }
+    
+    // Fallback: Check scene items for precise visibility (rare case)
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
     
@@ -837,7 +1146,7 @@ bool banner_manager::is_banner_visible() const
         if (!scene) continue;
         
         // Use metadata-based detection instead of name-based
-        obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
+        obs_sceneitem_t* item = find_vortideck_ads_in_scene(scene);
         if (item && obs_sceneitem_visible(item)) {
             found_visible = true;
             break;
@@ -954,10 +1263,11 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
                                      default_css, element_tag, content_data, extra_attrs, element_tag);
              css_content = ""; // CSS is now embedded in HTML
          }
-     } else if (is_url(content_data)) {
+     } else if (content_type == "url" || is_url(content_data)) {
          // Direct URL - use as is
          url_content = content_data;
          css_content = "";
+         log_message(std::format("BANNER CREATION: Using direct URL: {}", content_data));
      } else {
          // Default fallback - treat as text
          url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
@@ -1067,7 +1377,7 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
      log_message(std::format("BANNER CREATION: Dimensions: {}x{} (Full Canvas)", canvas_width, canvas_height));
      
      // Create browser_source directly - simple and reliable
-     m_banner_source = obs_source_create("browser_source", m_banner_source_name.c_str(), settings, nullptr);
+     m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
     
     obs_data_release(settings);
     
@@ -1078,6 +1388,9 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
         obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
         obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
         obs_data_release(private_settings);
+        
+        // Connect source signals for visibility monitoring
+        connect_source_signals();
         
         log_message(std::format("BANNER CREATION: Successfully created browser_source with VortiDeck protection - Type: {}", content_type));
         
@@ -1124,7 +1437,7 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
         obs_data_set_int(color_settings, "height", 100);
         
         // Try to create a color source as fallback
-        m_banner_source = obs_source_create("color_source", m_banner_source_name.c_str(), color_settings, nullptr);
+        m_banner_source = obs_source_create_private("color_source", m_banner_source_name.c_str(), color_settings);
         
         obs_data_release(color_settings);
         
@@ -1409,7 +1722,7 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
     log_message(std::format("ENHANCED BANNER CREATION: CSS: {}", (custom_css.empty() ? "default" : "custom")));
     
     // Create browser_source directly - simple and reliable
-    m_banner_source = obs_source_create("browser_source", m_banner_source_name.c_str(), settings, nullptr);
+    m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
     
     obs_data_release(settings);
     
@@ -1420,6 +1733,9 @@ void banner_manager::create_banner_source_with_custom_params(std::string_view co
         obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
         obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
         obs_data_release(private_settings);
+        
+        // Connect source signals for visibility monitoring
+        connect_source_signals();
         
         log_message(std::format("ENHANCED BANNER CREATION: Successfully created browser_source with VortiDeck protection - Type: {}", content_type));
         
@@ -1463,7 +1779,7 @@ void banner_manager::add_banner_to_current_scene()
     int banner_count = count_vortideck_banners_in_scene(scene);
     if (banner_count > 0) {
         // Banner(s) already exist - just ensure first one is visible and properly configured
-        obs_sceneitem_t* existing_item = find_vortideck_banner_in_scene(scene);
+        obs_sceneitem_t* existing_item = find_vortideck_ads_in_scene(scene);
     if (existing_item) {
         obs_sceneitem_set_visible(existing_item, true);
         lock_banner_item(existing_item);
@@ -1534,7 +1850,7 @@ void banner_manager::initialize_banners_all_scenes()
         
         if (banner_count > 0) {
             // Banner(s) already exist - just ensure first one is visible and properly configured
-            obs_sceneitem_t* existing_item = find_vortideck_banner_in_scene(scene);
+            obs_sceneitem_t* existing_item = find_vortideck_ads_in_scene(scene);
         if (existing_item) {
             obs_sceneitem_set_visible(existing_item, true);
             lock_banner_item(existing_item);
@@ -1575,6 +1891,10 @@ void banner_manager::initialize_banners_all_scenes()
     log_message("FREE USER: Banner initialization complete - " + std::to_string(scenes_initialized) + " scenes initialized, " + 
                 std::to_string(scenes_already_covered) + " scenes already covered (" + 
                 std::to_string(total_scenes) + " total scenes)");
+    
+    // CRITICAL: After all banners are initialized, enforce lock and position for ALL scenes
+    log_message("FREE USER: Enforcing banner lock and position after initialization");
+    enforce_banner_lock_and_position();
 }
 
 void banner_manager::remove_banner_from_scenes()
@@ -1592,7 +1912,7 @@ void banner_manager::remove_banner_from_scenes()
         if (!scene) continue;
         
         // Use metadata-based detection instead of name-based
-        obs_sceneitem_t* item = find_vortideck_banner_in_scene(scene);
+        obs_sceneitem_t* item = find_vortideck_ads_in_scene(scene);
         if (item) {
             obs_sceneitem_set_visible(item, false);
             scenes_hidden++;
@@ -1617,6 +1937,9 @@ void banner_manager::lock_banner_item(obs_sceneitem_t* item)
         
         // Always lock for positioning (free users can't move banners)
         obs_sceneitem_set_locked(item, true);
+        
+        // Always move banner to top (above all other sources)
+        obs_sceneitem_set_order(item, OBS_ORDER_MOVE_TOP);
         
         if (!is_premium) {
             // Free users: Lock position and prevent manipulation
@@ -1662,13 +1985,14 @@ void banner_manager::make_banner_persistent()
     
     log_message("Banner persistence mode ENABLED - will be maintained across scenes");
     
-    // Start monitoring to enforce visibility (with 2-second intervals)
-    start_persistence_monitor();
+    // Signal-based monitoring handles persistence automatically
+    log_message("Banner made persistent - signal-based protection active (no polling needed)");
     
-    // NO immediate enforcement check - this was causing the banner explosion
-    // Let the monitoring jthread handle it gradually
-    
-    log_message("Banner made persistent - monitoring every 2 seconds (not aggressive creation)");
+    // Ensure signals are connected for persistence
+    connect_scene_signals();
+    if (m_banner_source) {
+        connect_source_signals();
+    }
 }
 
 bool banner_manager::is_url(std::string_view content)
@@ -1707,7 +2031,7 @@ bool banner_manager::is_video_content(std::string_view content_type)
 }
 
 // METADATA-BASED BANNER DETECTION (Better than name-based)
-bool banner_manager::is_vortideck_banner_name(const char* name) const
+bool banner_manager::is_vortideck_ads_name(const char* name) const
 {
     if (!name) return false;
     
@@ -1716,7 +2040,7 @@ bool banner_manager::is_vortideck_banner_name(const char* name) const
     return strstr(name, "VortiDeck Banner") != nullptr;
 }
 
-bool banner_manager::is_vortideck_banner_by_metadata(obs_source_t* source) const
+bool banner_manager::is_vortideck_ads_by_metadata(obs_source_t* source) const
 {
     if (!source) return false;
     
@@ -1743,7 +2067,7 @@ bool banner_manager::is_vortideck_banner_by_metadata(obs_source_t* source) const
     return is_banner;
 }
 
-bool banner_manager::is_vortideck_banner_item(obs_sceneitem_t* item) const
+bool banner_manager::is_vortideck_ads_item(obs_sceneitem_t* item) const
 {
     if (!item) return false;
     
@@ -1751,16 +2075,16 @@ bool banner_manager::is_vortideck_banner_item(obs_sceneitem_t* item) const
     if (!source) return false;
     
     // Method 1: Check metadata first (most reliable)
-    if (is_vortideck_banner_by_metadata(source)) {
+    if (is_vortideck_ads_by_metadata(source)) {
         return true;
     }
     
     // Method 2: Fallback to name-based detection (for existing banners without metadata)
     const char* source_name = obs_source_get_name(source);
-    return is_vortideck_banner_name(source_name);
+    return is_vortideck_ads_name(source_name);
 }
 
-obs_sceneitem_t* banner_manager::find_vortideck_banner_in_scene(obs_scene_t* scene) const
+obs_sceneitem_t* banner_manager::find_vortideck_ads_in_scene(obs_scene_t* scene) const
 {
     if (!scene) return nullptr;
     
@@ -1774,7 +2098,7 @@ obs_sceneitem_t* banner_manager::find_vortideck_banner_in_scene(obs_scene_t* sce
     // Enumerate all scene items to find our banner
     obs_scene_enum_items(scene, [](obs_scene_t* /*scene*/, obs_sceneitem_t* item, void* data) {
         find_data* fd = static_cast<find_data*>(data);
-        if (fd->manager->is_vortideck_banner_item(item)) {
+        if (fd->manager->is_vortideck_ads_item(item)) {
             fd->found_item = item;
             return false; // Stop enumeration
         }
@@ -1798,7 +2122,7 @@ int banner_manager::count_vortideck_banners_in_scene(obs_scene_t* scene) const
     // Enumerate all scene items to count our banners
     obs_scene_enum_items(scene, [](obs_scene_t* /*scene*/, obs_sceneitem_t* item, void* data) {
         count_data* cd = static_cast<count_data*>(data);
-        if (cd->manager->is_vortideck_banner_item(item)) {
+        if (cd->manager->is_vortideck_ads_item(item)) {
             cd->count++;
         }
         return true; // Continue enumeration
@@ -1943,54 +2267,15 @@ float banner_manager::get_revenue_share() const
 
 
 
-void banner_manager::start_persistence_monitor()
-{
-    if (m_persistence_monitor_active) {
-        log_message("Persistence monitor already running - ignoring duplicate start request");
-        return; // Already running
-    }
-    
-    m_persistence_monitor_active = true;
-    
-    // Monitor banner visibility and window timeouts with reasonable intervals
-    std::jthread([this]() {
-        while (m_persistence_monitor_active) {
-            bool is_premium = m_is_premium.load();
-            
-            // Window management removed - handled by external application
-            
-            if (!is_premium) {
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // Check more frequently for testing
-                if (m_banner_source && !is_banner_visible()) {
-                    enforce_banner_visibility();
-                }
-            } else if (m_banner_persistent) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                if (m_banner_source && !is_banner_visible()) {
-                    enforce_banner_visibility();
-                }
-            } else {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-            }
-        }
-        log_message("Persistence monitor jthread exited");
-    }).detach();
-    
-    bool is_premium = m_is_premium.load();
-    if (!is_premium) {
-        log_message("FREE USER: Banner monitoring started - Checking every 10 seconds");
-    } else {
-        log_message("PREMIUM USER: Banner monitoring started - Checking every 15 seconds");
-    }
-}
+// REMOVED: Deprecated polling monitor - now using signal-based monitoring only
+// Signals provide instant reaction and better performance
 
 void banner_manager::stop_persistence_monitor()
 {
-    if (m_persistence_monitor_active) {
-        m_persistence_monitor_active = false;
-        m_banner_persistent = false;
-        log_message("Persistence monitor stopped");
-    }
+    // Legacy function kept for compatibility - no longer creates polling threads
+    m_persistence_monitor_active = false;
+    m_banner_persistent = false;
+    log_message("Legacy persistence monitor stopped (now using signals)");
 }
 
 void banner_manager::enforce_banner_visibility()
@@ -2042,7 +2327,7 @@ void banner_manager::enforce_banner_visibility()
         if (!scene) continue;
         
         // Use metadata-based detection instead of name-based
-        obs_sceneitem_t* banner_item = find_vortideck_banner_in_scene(scene);
+        obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
         if (banner_item) {
             banner_found = true;
             
@@ -2150,7 +2435,7 @@ void banner_manager::force_refresh_banner_visibility()
         if (!scene) continue;
         
         // Find any VortiDeck banners in this scene
-        obs_sceneitem_t* banner_item = find_vortideck_banner_in_scene(scene);
+        obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
         if (banner_item) {
             // Double-check visibility and force refresh
             bool is_visible = obs_sceneitem_visible(banner_item);
@@ -2178,15 +2463,15 @@ void banner_manager::force_refresh_banner_visibility()
 
 void banner_manager::register_vortideck_banner_source()
 {
-    // Register VortiDeck Banner as a custom source type that creates browser sources internally
+    // Register VortiDeck ADS as a custom source type that creates browser sources internally
     struct obs_source_info vortideck_banner_info = {};
-    vortideck_banner_info.id = "vortideck_banner";
+    vortideck_banner_info.id = vortideck::SOURCE_ID_ADS;
     vortideck_banner_info.type = OBS_SOURCE_TYPE_INPUT;
     vortideck_banner_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE;
     
     vortideck_banner_info.get_name = [](void* unused) -> const char* {
         UNUSED_PARAMETER(unused);
-        return "VortiDeck Banner";
+        return "VortiDeck ADS";
     };
     
     vortideck_banner_info.create = [](obs_data_t* settings, obs_source_t* source) -> void* {
@@ -2223,12 +2508,13 @@ void banner_manager::register_vortideck_banner_source()
         if (browser_source) {
             // Add VortiDeck metadata
             obs_data_t* private_settings = obs_source_get_private_settings(browser_source);
-    obs_data_set_string(private_settings, "vortideck_banner", "true");
-    obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
+            obs_data_set_string(private_settings, "vortideck_banner", "true");
+            obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
             obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
-    obs_data_release(private_settings);
+            obs_data_set_string(private_settings, vortideck::META_TYPE, "ads");
+            obs_data_release(private_settings);
     
-            log_to_obs("VortiDeck Banner: Created browser source wrapper");
+            log_to_obs("VortiDeck ADS: Created browser source wrapper");
         }
         
         return browser_source;  // Return the browser source as our internal data
@@ -2271,7 +2557,7 @@ void banner_manager::register_vortideck_banner_source()
             obs_source_update(browser_source, browser_settings);
             obs_data_release(browser_settings);
             
-            log_to_obs("VortiDeck Banner: Updated browser source settings");
+            log_to_obs("VortiDeck ADS: Updated browser source settings");
         }
     };
     
@@ -2319,7 +2605,7 @@ void banner_manager::register_vortideck_banner_source()
     };
     
     obs_register_source(&vortideck_banner_info);
-    log_to_obs("VortiDeck Banner: Registered as custom source (creates browser sources internally)");
+    log_to_obs("VortiDeck ADS: Registered as custom source (creates browser sources internally)");
 }
 
 void banner_manager::unregister_vortideck_banner_source()

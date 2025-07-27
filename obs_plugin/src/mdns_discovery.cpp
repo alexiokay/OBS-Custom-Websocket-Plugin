@@ -336,8 +336,8 @@ namespace vorti {
                                         }
                                         
                                         service.websocket_url = context->tls_enabled 
-                                            ? "wss://" + service.ip_address + ":" + std::to_string(service.port) + "/"
-                                            : "ws://" + service.ip_address + ":" + std::to_string(service.port) + "/";
+                                            ? "wss://" + service.ip_address + ":" + std::to_string(service.port) + "/ws"
+                                            : "ws://" + service.ip_address + ":" + std::to_string(service.port) + "/ws";
                                         
                                         // Add to results
                                         std::lock_guard<std::mutex> lock(context->services_mutex);
@@ -374,8 +374,8 @@ namespace vorti {
             ) {
                 // Build the WebSocket URL
                 std::string websocket_url = context->tls_enabled 
-                    ? "wss://" + ip_address + ":" + std::to_string(port) + "/"
-                    : "ws://" + ip_address + ":" + std::to_string(port) + "/";
+                    ? "wss://" + ip_address + ":" + std::to_string(port) + "/ws"
+                    : "ws://" + ip_address + ":" + std::to_string(port) + "/ws";
 
                 ServiceInfo service_info(service_name, websocket_url, ip_address, port);
                 

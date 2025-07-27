@@ -1,5 +1,10 @@
 #include "obs_plugin.hpp"
 #include "service_selection_dialog.hpp"
+#include "../../src/overlay_source.h"
+#include "../../src/vortideck_common.h"
+
+// Forward declaration for banner_source registration
+extern void register_banner_source();
 #include <QApplication>
 #include <QMetaObject>
 #include <QThread>
@@ -40,6 +45,91 @@
 #include <sstream>
 
 using namespace vorti::applets::obs_plugin;
+
+// Forward declaration
+void log_to_obs(std::string_view message);
+
+// Note: Since obs_plugin is a namespace, we don't need a global instance pointer
+
+// Global function to access banner_manager from banner_source
+vorti::applets::banner_manager& get_global_banner_manager()
+{
+    return vorti::applets::obs_plugin::m_banner_manager;
+}
+
+// Global function to get WebSocket connection URL for banner defaults
+std::string get_global_websocket_url()
+{
+    try {
+        // Use the selected service URL if available
+        if (!m_selected_service_url.empty()) {
+            return m_selected_service_url;
+        }
+        // Fallback to discovered URL
+        if (!m_discovered_websocket_url.empty()) {
+            return m_discovered_websocket_url;
+        }
+        // Call get_connection_url function
+        return get_connection_url();
+    } catch (...) {
+        return "https://vortideck.com"; // Fallback if not connected
+    }
+}
+
+// Function to update all existing overlay URLs when connected to a new service
+void update_all_overlay_urls_to_connected_server()
+{
+    std::string websocket_url = get_global_websocket_url();
+    if (websocket_url == "https://vortideck.com") {
+        return; // Not connected to a real service
+    }
+    
+    // Build the overlay URL
+    std::string overlay_url;
+    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
+        std::string base_url;
+        if (websocket_url.starts_with("ws://")) {
+            base_url = "http://" + websocket_url.substr(5);
+        } else {
+            base_url = "https://" + websocket_url.substr(6);
+        }
+        // Remove /ws path if present since that's WebSocket-only
+        if (base_url.ends_with("/ws")) {
+            base_url = base_url.substr(0, base_url.length() - 3);
+        }
+        // Ensure no double slashes
+        if (base_url.ends_with("/")) {
+            overlay_url = base_url + "overlay.html";
+        } else {
+            overlay_url = base_url + "/overlay.html";
+        }
+    } else {
+        overlay_url = websocket_url + "/overlay.html";
+    }
+    
+    // Update all existing overlay sources
+    obs_enum_sources([](void* data, obs_source_t* source) {
+        std::string url = *(std::string*)data;
+        
+        // Check if this is a VortiDeck overlay source
+        const char* source_id = obs_source_get_id(source);
+        if (source_id && strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) == 0) {
+            // Update the overlay URL
+            obs_data_t* settings = obs_source_get_settings(source);
+            obs_data_set_string(settings, "url", url.c_str());
+            obs_source_update(source, settings);
+            obs_data_release(settings);
+            
+            const char* name = obs_source_get_name(source);
+            blog(LOG_INFO, "Auto-updated overlay '%s' to connected server: %s", 
+                 name ? name : "unnamed", url.c_str());
+        }
+        return true; // Continue enumeration
+    }, &overlay_url);
+    
+    log_to_obs("Auto-updated all overlay URLs to connected server: " + overlay_url);
+}
+
 
 
 // Simple plugin interface for banner manager
@@ -96,6 +186,8 @@ bool obs_module_load()
 {
     // Called when the module is loaded.
     m_shutting_down = false;
+    
+    // obs_plugin is a namespace, so no instance to set
     
     blog(LOG_INFO, "VortiDeck OBS Plugin loaded successfully");
     return true;
@@ -214,9 +306,10 @@ void obs_module_post_load()
     // Connect to video reset signals for canvas size sync
     connect_video_reset_signals();
 
-    // Register custom VortiDeck Banner source
+    // Register custom VortiDeck sources
     if constexpr (BANNER_MANAGER_ENABLED) {
-        vorti::applets::banner_manager::register_vortideck_banner_source();
+        register_banner_source();   // Banner source (menu integration)
+        register_overlay_source();  // Overlay source
     }
 
     // Initialize banner functionality
@@ -264,7 +357,7 @@ void obs_module_unload()
         m_banner_manager.shutdown();
         
         // Unregister custom VortiDeck Banner source
-        vorti::applets::banner_manager::unregister_vortideck_banner_source();
+        // vorti::applets::banner_manager::unregister_vortideck_banner_source(); // REMOVED - Banner handled internally
         blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
     }
 
@@ -849,6 +942,9 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
         return;
     }
     log_to_obs("Registration message sent");
+    
+    // Auto-update all existing overlay URLs to use the connected server
+    update_all_overlay_urls_to_connected_server();
 }
 
 
@@ -1165,6 +1261,23 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
         {
             action_banner_set_data(parameters);
         }
+        // Overlay action handlers (no restrictions)
+        else if (action_id == actions::s_overlay_set_data)
+        {
+            action_overlay_set_data(parameters);
+        }
+        else if (action_id == actions::s_overlay_create)
+        {
+            action_overlay_create(parameters);
+        }
+        else if (action_id == actions::s_overlay_update)
+        {
+            action_overlay_update(parameters);
+        }
+        else if (action_id == actions::s_overlay_remove)
+        {
+            action_overlay_remove(parameters);
+        }
         // Complex banner actions removed - handled by external application
     }
                             else
@@ -1390,6 +1503,77 @@ void vorti::applets::obs_plugin::register_regular_actions()
         banner_params.push_back(width_param);
         banner_params.push_back(height_param);
         actions.push_back(register_action(actions::s_banner_set_data, "APPLET_OBS_BANNER_SET_DATA", banner_params));
+    }
+    
+    // Register overlay actions (always available, no restrictions)
+    {
+        // Main overlay set data action (like banner_set_data)
+        action_parameters overlay_set_data_params;
+        nlohmann::json url_param_main = {
+            {"name", "url"},
+            {"displayName", "URL"},
+            {"description", "URL for the overlay content"}
+        };
+        overlay_set_data_params.push_back(url_param_main);
+        actions.push_back(register_action(actions::s_overlay_set_data, "APPLET_OBS_OVERLAY_SET_DATA", overlay_set_data_params));
+        
+        // Overlay create action
+        action_parameters overlay_create_params;
+        nlohmann::json overlay_id_param = {
+            {"name", "overlay_id"},
+            {"displayName", "Overlay ID"},
+            {"description", "Unique identifier for the overlay"}
+        };
+        nlohmann::json url_param_create = {
+            {"name", "url"},
+            {"displayName", "URL"},
+            {"description", "URL for the overlay content"}
+        };
+        nlohmann::json name_param = {
+            {"name", "name"},
+            {"displayName", "Source Name"},
+            {"description", "Optional custom name for the source"}
+        };
+        nlohmann::json scene_param = {
+            {"name", "scene_name"},
+            {"displayName", "Scene Name"},
+            {"description", "Optional scene to add the overlay to"}
+        };
+        nlohmann::json width_param_overlay = {
+            {"name", "width"},
+            {"displayName", "Width"},
+            {"description", "Optional width in pixels (default: 1920)"}
+        };
+        nlohmann::json height_param_overlay = {
+            {"name", "height"},
+            {"displayName", "Height"},
+            {"description", "Optional height in pixels (default: 1080)"}
+        };
+        overlay_create_params.push_back(overlay_id_param);
+        overlay_create_params.push_back(url_param_create);
+        overlay_create_params.push_back(name_param);
+        overlay_create_params.push_back(scene_param);
+        overlay_create_params.push_back(width_param_overlay);
+        overlay_create_params.push_back(height_param_overlay);
+        actions.push_back(register_action(actions::s_overlay_create, "APPLET_OBS_OVERLAY_CREATE", overlay_create_params));
+        
+        // Overlay update action
+        action_parameters overlay_update_params;
+        nlohmann::json source_name_param = {
+            {"name", "source_name"},
+            {"displayName", "Source Name"},
+            {"description", "Name of the overlay source to update"}
+        };
+        overlay_update_params.push_back(source_name_param);
+        overlay_update_params.push_back(url_param_create);
+        overlay_update_params.push_back(width_param_overlay);
+        overlay_update_params.push_back(height_param_overlay);
+        actions.push_back(register_action(actions::s_overlay_update, "APPLET_OBS_OVERLAY_UPDATE", overlay_update_params));
+        
+        // Overlay remove action
+        action_parameters overlay_remove_params;
+        overlay_remove_params.push_back(source_name_param);
+        actions.push_back(register_action(actions::s_overlay_remove, "APPLET_OBS_OVERLAY_REMOVE", overlay_remove_params));
     }
 
     // Complex banner actions removed - simplified banner system
@@ -2786,7 +2970,280 @@ void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_para
     }
 }
 
+// ============================================================================
+// OVERLAY ACTION HANDLERS (NO RESTRICTIONS)
+// ============================================================================
 
+void vorti::applets::obs_plugin::action_overlay_set_data(const action_invoke_parameters &parameters)
+{
+    auto url_it = parameters.find("url");
+    
+    if (url_it != parameters.end()) {
+        std::string url = url_it->second;
+        
+        // Update ALL existing overlay sources with the new URL
+        obs_enum_sources([](void* data, obs_source_t* source) {
+            std::string url = *(std::string*)data;
+            
+            // Check if this is a VortiDeck overlay source
+            const char* source_id = obs_source_get_id(source);
+            if (source_id && strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) == 0) {
+                // Update the overlay URL
+                obs_data_t* settings = obs_source_get_settings(source);
+                obs_data_set_string(settings, "url", url.c_str());
+                obs_source_update(source, settings);
+                obs_data_release(settings);
+                
+                const char* name = obs_source_get_name(source);
+                blog(LOG_INFO, "ACTION_OVERLAY_SET_DATA: Updated overlay '%s' with new URL", 
+                     name ? name : "unnamed");
+            }
+            return true; // Continue enumeration
+        }, &url);
+        
+        log_to_obs("ACTION_OVERLAY_SET_DATA: Updated all existing overlays with URL: " + url);
+        
+        std::string overlay_name = "VortiDeck Overlay";
+        
+        // Find or create the main overlay source
+        obs_source_t* overlay_source = obs_get_source_by_name(overlay_name.c_str());
+        
+        if (!overlay_source) {
+            // Create main overlay source (full canvas size)
+            obs_data_t* settings = obs_data_create();
+            obs_data_set_string(settings, "url", url.c_str());
+            
+            // Full canvas dimensions
+            auto canvas_info = get_current_canvas_info();
+            int canvas_width = 1920;  // Default
+            int canvas_height = 1080; // Default
+            
+            if (canvas_info.contains("width")) {
+                canvas_width = canvas_info["width"];
+            }
+            if (canvas_info.contains("height")) {
+                canvas_height = canvas_info["height"];
+            }
+            
+            obs_data_set_int(settings, "width", canvas_width);
+            obs_data_set_int(settings, "height", canvas_height);
+            obs_data_set_string(settings, "overlay_id", "main_overlay");
+            obs_data_set_bool(settings, "auto_resize", true); // Enable auto-resize for main overlay
+            
+            overlay_source = obs_source_create(vortideck::SOURCE_ID_OVERLAY, overlay_name.c_str(), settings, nullptr);
+            obs_data_release(settings);
+            
+            if (overlay_source) {
+                log_to_obs("ACTION_OVERLAY_SET_DATA: Created main overlay source (full canvas)");
+                
+                // Add to all scenes like banner system
+                obs_frontend_source_list scenes = {};
+                obs_frontend_get_scenes(&scenes);
+                
+                for (size_t i = 0; i < scenes.sources.num; i++) {
+                    obs_source_t* scene_source = scenes.sources.array[i];
+                    if (!scene_source) continue;
+                    
+                    obs_scene_t* scene = obs_scene_from_source(scene_source);
+                    if (!scene) continue;
+                    
+                    obs_sceneitem_t* scene_item = obs_scene_add(scene, overlay_source);
+                    if (scene_item) {
+                        // Position at 0,0 (full screen overlay)
+                        vec2 pos = {0.0f, 0.0f};
+                        obs_sceneitem_set_pos(scene_item, &pos);
+                        
+                        // Set bounds to canvas size for stretching
+                        vec2 bounds = {(float)canvas_width, (float)canvas_height};
+                        obs_sceneitem_set_bounds(scene_item, &bounds);
+                        obs_sceneitem_set_bounds_type(scene_item, OBS_BOUNDS_STRETCH);
+                        obs_sceneitem_set_bounds_alignment(scene_item, 0); // Top-left
+                        
+                        // Lock the main overlay to prevent user manipulation
+                        obs_sceneitem_set_locked(scene_item, true);
+                        
+                        // Move to bottom so ADS stays on top
+                        obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_BOTTOM);
+                    }
+                }
+                
+                obs_frontend_source_list_free(&scenes);
+            } else {
+                log_to_obs("ACTION_OVERLAY_SET_DATA: ERROR - Failed to create overlay source");
+                return;
+            }
+        } else {
+            // Update existing overlay URL and ensure auto-resize stays enabled
+            obs_data_t* settings = obs_source_get_settings(overlay_source);
+            obs_data_set_string(settings, "url", url.c_str());
+            obs_data_set_bool(settings, "auto_resize", true); // Ensure auto-resize stays enabled
+            
+            // Update canvas size
+            auto canvas_info = get_current_canvas_info();
+            if (canvas_info.contains("width") && canvas_info.contains("height")) {
+                obs_data_set_int(settings, "width", canvas_info["width"]);
+                obs_data_set_int(settings, "height", canvas_info["height"]);
+            }
+            
+            obs_source_update(overlay_source, settings);
+            obs_data_release(settings);
+            
+            log_to_obs("ACTION_OVERLAY_SET_DATA: Updated main overlay URL and ensured auto-resize");
+        }
+        
+        if (overlay_source) {
+            obs_source_release(overlay_source);
+        }
+        
+        log_to_obs("ACTION_OVERLAY_SET_DATA: Overlay data set successfully - URL: " + url);
+    } else {
+        log_to_obs("ACTION_OVERLAY_SET_DATA: ERROR - Missing required parameter (url)");
+    }
+}
+
+void vorti::applets::obs_plugin::action_overlay_create(const action_invoke_parameters &parameters)
+{
+    auto overlay_id_it = parameters.find("overlay_id");
+    auto url_it = parameters.find("url");
+    auto width_it = parameters.find("width");
+    auto height_it = parameters.find("height");
+    auto name_it = parameters.find("name");
+    auto scene_name_it = parameters.find("scene_name");
+    
+    if (overlay_id_it != parameters.end() && url_it != parameters.end()) {
+        std::string overlay_id = overlay_id_it->second;
+        std::string url = url_it->second;
+        std::string source_name = name_it != parameters.end() ? name_it->second : ("VortiDeck Overlay " + overlay_id);
+        std::string scene_name = scene_name_it != parameters.end() ? scene_name_it->second : "";
+        
+        int width = width_it != parameters.end() ? std::stoi(width_it->second) : 1920;
+        int height = height_it != parameters.end() ? std::stoi(height_it->second) : 1080;
+        
+        // Create overlay source settings
+        obs_data_t* settings = obs_data_create();
+        obs_data_set_string(settings, "overlay_id", overlay_id.c_str());
+        obs_data_set_string(settings, "url", url.c_str());
+        obs_data_set_int(settings, "width", width);
+        obs_data_set_int(settings, "height", height);
+        
+        // Create the overlay source
+        obs_source_t* overlay_source = obs_source_create(vortideck::SOURCE_ID_OVERLAY, source_name.c_str(), settings, nullptr);
+        
+        if (overlay_source) {
+            // Add to scene if specified
+            if (!scene_name.empty()) {
+                obs_source_t* scene = obs_get_source_by_name(scene_name.c_str());
+                if (scene) {
+                    obs_scene_t* obs_scene = obs_scene_from_source(scene);
+                    if (obs_scene) {
+                        obs_sceneitem_t* scene_item = obs_scene_add(obs_scene, overlay_source);
+                        if (scene_item) {
+                            log_to_obs("ACTION_OVERLAY_CREATE: Created overlay '" + source_name + "' and added to scene '" + scene_name + "'");
+                        }
+                    }
+                    obs_source_release(scene);
+                }
+            } else {
+                log_to_obs("ACTION_OVERLAY_CREATE: Created overlay source '" + source_name + "'");
+            }
+            obs_source_release(overlay_source);
+        } else {
+            log_to_obs("ACTION_OVERLAY_CREATE: ERROR - Failed to create overlay source");
+        }
+        
+        obs_data_release(settings);
+    } else {
+        log_to_obs("ACTION_OVERLAY_CREATE: ERROR - Missing required parameters (overlay_id and url)");
+    }
+}
+
+void vorti::applets::obs_plugin::action_overlay_update(const action_invoke_parameters &parameters)
+{
+    auto source_name_it = parameters.find("source_name");
+    auto url_it = parameters.find("url");
+    auto width_it = parameters.find("width");
+    auto height_it = parameters.find("height");
+    
+    if (source_name_it != parameters.end()) {
+        std::string source_name = source_name_it->second;
+        obs_source_t* source = obs_get_source_by_name(source_name.c_str());
+        
+        if (source && strcmp(obs_source_get_id(source), vortideck::SOURCE_ID_OVERLAY) == 0) {
+            obs_data_t* settings = obs_source_get_settings(source);
+            
+            // Check if dimensions are changing (indicates VortiDeck resolution update)
+            bool dimensions_changed = false;
+            if (width_it != parameters.end() || height_it != parameters.end()) {
+                int current_width = (int)obs_data_get_int(settings, "width");
+                int current_height = (int)obs_data_get_int(settings, "height");
+                
+                int new_width = (width_it != parameters.end()) ? std::stoi(width_it->second) : current_width;
+                int new_height = (height_it != parameters.end()) ? std::stoi(height_it->second) : current_height;
+                
+                log_to_obs("ACTION_OVERLAY_UPDATE: Comparing dimensions - current: " + std::to_string(current_width) + "x" + std::to_string(current_height) + 
+                          ", new: " + std::to_string(new_width) + "x" + std::to_string(new_height));
+                
+                if (new_width != current_width || new_height != current_height) {
+                    dimensions_changed = true;
+                    log_to_obs("ACTION_OVERLAY_UPDATE: Dimensions changing from " + std::to_string(current_width) + "x" + std::to_string(current_height) + 
+                              " to " + std::to_string(new_width) + "x" + std::to_string(new_height));
+                } else {
+                    log_to_obs("ACTION_OVERLAY_UPDATE: No dimension change detected, but forcing recreation anyway for VortiDeck content update");
+                    dimensions_changed = true; // Force recreation even without dimension change for content updates
+                }
+            }
+            
+            if (url_it != parameters.end()) {
+                obs_data_set_string(settings, "url", url_it->second.c_str());
+            }
+            if (width_it != parameters.end()) {
+                obs_data_set_int(settings, "width", std::stoi(width_it->second));
+            }
+            if (height_it != parameters.end()) {
+                obs_data_set_int(settings, "height", std::stoi(height_it->second));
+            }
+            
+            // Add flag to trigger browser source recreation for dimension changes
+            if (dimensions_changed) {
+                obs_data_set_bool(settings, "force_browser_recreation", true);
+                log_to_obs("ACTION_OVERLAY_UPDATE: Flagging for browser source recreation");
+            }
+            
+            obs_source_update(source, settings);
+            obs_data_release(settings);
+            
+            log_to_obs("ACTION_OVERLAY_UPDATE: Updated overlay source '" + source_name + "'" + 
+                      (dimensions_changed ? " (recreating browser)" : ""));
+        } else {
+            log_to_obs("ACTION_OVERLAY_UPDATE: ERROR - Source '" + source_name + "' not found or not a VortiDeck overlay");
+        }
+        
+        if (source) obs_source_release(source);
+    } else {
+        log_to_obs("ACTION_OVERLAY_UPDATE: ERROR - Missing required parameter (source_name)");
+    }
+}
+
+void vorti::applets::obs_plugin::action_overlay_remove(const action_invoke_parameters &parameters)
+{
+    auto source_name_it = parameters.find("source_name");
+    
+    if (source_name_it != parameters.end()) {
+        std::string source_name = source_name_it->second;
+        obs_source_t* source = obs_get_source_by_name(source_name.c_str());
+        
+        if (source && strcmp(obs_source_get_id(source), vortideck::SOURCE_ID_OVERLAY) == 0) {
+            obs_source_remove(source);
+            log_to_obs("ACTION_OVERLAY_REMOVE: Removed overlay source '" + source_name + "'");
+        } else {
+            log_to_obs("ACTION_OVERLAY_REMOVE: ERROR - Source '" + source_name + "' not found or not a VortiDeck overlay");
+        }
+        
+        if (source) obs_source_release(source);
+    } else {
+        log_to_obs("ACTION_OVERLAY_REMOVE: ERROR - Missing required parameter (source_name)");
+    }
+}
 
 // ============================================================================
 // CONTINUOUS mDNS DISCOVERY IMPLEMENTATION
@@ -3434,17 +3891,20 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
     QMenu* vortideck_menu = menu_bar->addMenu("VortiDeck");
     
     // Add Banner Settings submenu item
-    QAction* banner_action = vortideck_menu->addAction("Banner Settings");
+    QAction* banner_action = vortideck_menu->addAction("Banner Settings (ADS)");
     QObject::connect(banner_action, &QAction::triggered, []() {
-        log_to_obs("VortiDeck Banner Settings clicked from top-level menu");
+        log_to_obs("VortiDeck Banner Settings (ADS) clicked from top-level menu");
         // Open VortiDeck banner settings page
         DeepLinkHandler::open_vortideck_with_fallback("banner-settings");
     });
     
-    // Add Overlays menu item
-    QAction* overlays_action = vortideck_menu->addAction("Overlays");
+    // Add separator
+    vortideck_menu->addSeparator();
+    
+    // Add Overlays menu item (no restrictions)
+    QAction* overlays_action = vortideck_menu->addAction("Overlays (Free)");
     QObject::connect(overlays_action, &QAction::triggered, []() {
-        log_to_obs("VortiDeck Overlays clicked from top-level menu");
+        log_to_obs("VortiDeck Overlays (Free) clicked from top-level menu");
         // Open VortiDeck overlays page
         DeepLinkHandler::open_vortideck_with_fallback("overlay");
     });
@@ -3458,7 +3918,7 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
         }
     });
     
-    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings, Overlays, and Connection Settings");
+    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings (ADS), Overlays (Free), and Connection Settings");
 }
 
 void vorti::applets::obs_plugin::connection_settings_menu_callback(void* data)

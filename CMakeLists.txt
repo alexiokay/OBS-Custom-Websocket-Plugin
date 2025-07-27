@@ -55,6 +55,11 @@ target_sources(${CMAKE_PROJECT_NAME}
         obs_plugin/src/service_selection_dialog.cpp
         obs_plugin/src/service_selection_dialog.hpp
         obs_plugin/src/ServiceSelectionDialog.ui
+        src/overlay_source.cpp
+        src/overlay_source.h
+        src/banner_source.cpp
+        src/banner_source.h
+        src/vortideck_common.h
         other/mdns_cpp/src/logger.cpp
         other/mdns_cpp/src/mdns.cpp
         other/mdns_cpp/src/utils.cpp)

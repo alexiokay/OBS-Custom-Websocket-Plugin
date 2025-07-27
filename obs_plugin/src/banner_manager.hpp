@@ -89,10 +89,25 @@ namespace vorti {
 
             // Signal-based immediate enforcement (ACTIVE implementation)
             void connect_scene_signals();
-            void disconnect_scene_signals(); 
+            void disconnect_scene_signals();
+            void connect_source_signals();
+            void disconnect_source_signals(); 
+            static void on_item_add(void* data, calldata_t* calldata);
             static void on_item_remove(void* data, calldata_t* calldata);
             static void on_item_visible(void* data, calldata_t* calldata);
             static void on_item_transform(void* data, calldata_t* calldata);
+            
+            // Source signal handlers (for banner source itself)
+            static void on_source_hide(void* data, calldata_t* calldata);
+            static void on_source_show(void* data, calldata_t* calldata);
+            static void on_source_deactivate(void* data, calldata_t* calldata);
+            static void on_source_activate(void* data, calldata_t* calldata);
+            
+            // Scene item order monitoring (for free users)
+            static void on_scene_reorder(void* data, calldata_t* calldata);
+            
+            // Prevention-based banner enforcement (better than correction)
+            void enforce_banner_lock_and_position();
             
             // Internal operations
                     void create_banner_source(std::string_view content_data, std::string_view content_type);
@@ -110,10 +125,10 @@ namespace vorti {
             bool is_video_content(std::string_view content_type);
             
             // Better banner detection using metadata + fallback to name checking
-            bool is_vortideck_banner_name(const char* name) const;
-            bool is_vortideck_banner_by_metadata(obs_source_t* source) const;
-            bool is_vortideck_banner_item(obs_sceneitem_t* item) const;
-            obs_sceneitem_t* find_vortideck_banner_in_scene(obs_scene_t* scene) const;
+            bool is_vortideck_ads_name(const char* name) const;
+            bool is_vortideck_ads_by_metadata(obs_source_t* source) const;
+            bool is_vortideck_ads_item(obs_sceneitem_t* item) const;
+            obs_sceneitem_t* find_vortideck_ads_in_scene(obs_scene_t* scene) const;
             int count_vortideck_banners_in_scene(obs_scene_t* scene) const;
             
             // Banner cleanup after deletion
@@ -189,7 +204,8 @@ namespace vorti {
             obs_source_t* m_banner_source;
             bool m_banner_visible;
             bool m_banner_persistent;  // True when banner should be unhideable
-            bool m_persistence_monitor_active;  // Monitor jthread active flag
+            bool m_persistence_monitor_active;  // Monitor jthread active flag (to be removed)
+            std::atomic<bool> m_source_visible{false};  // Cached visibility state from signals
             std::atomic<bool> m_shutting_down{false};  // Shutdown flag for thread coordination
             std::string m_current_banner_content;
             std::string m_current_content_type;
@@ -215,6 +231,10 @@ namespace vorti {
             
             // Add flag to temporarily disable signal handling during intentional operations
             std::atomic<bool> m_intentional_hide_in_progress{false};
+            
+            // Timer-based banner enforcement
+            std::atomic<bool> m_enforcement_timer_active{false};
+            obs_weak_source_t* m_timer_source{nullptr};
             
             // Analytics structures removed - handled by external application
             
