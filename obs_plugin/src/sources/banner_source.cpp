@@ -40,7 +40,7 @@ static void* banner_source_create(obs_data_t* settings, obs_source_t* source)
         // Build default URL from connected WebSocket server
         std::string websocket_url = get_global_websocket_url();
         if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
-            // Convert WebSocket URL to HTTP URL and add /banners.html
+            // Convert WebSocket URL to HTTP URL and add /banners
             std::string base_url;
             if (websocket_url.starts_with("ws://")) {
                 base_url = "http://" + websocket_url.substr(5);
@@ -53,13 +53,13 @@ static void* banner_source_create(obs_data_t* settings, obs_source_t* source)
             }
             // Ensure no double slashes
             if (base_url.ends_with("/")) {
-                final_url = base_url + "banners.html";
+                final_url = base_url + "banners";
             } else {
-                final_url = base_url + "/banners.html";
+                final_url = base_url + "/banners";
             }
         } else {
             // Fallback if not a proper WebSocket URL
-            final_url = websocket_url + "/banners.html";
+            final_url = websocket_url + "/banners";
         }
         url = final_url.c_str();
     }
@@ -67,11 +67,11 @@ static void* banner_source_create(obs_data_t* settings, obs_source_t* source)
     // Trigger banner_manager through global access function
     try {
         auto& banner_mgr = get_global_banner_manager();
-        banner_mgr.set_banner_content(url, "url");
+        banner_mgr.set_banner_url(final_url);  // Use direct URL like overlays
         banner_mgr.show_banner();
         context->triggered_banner_manager = true;
         
-        blog(LOG_INFO, "[VortiDeck Banner Menu] Triggered banner_manager with URL: %s", url);
+        blog(LOG_INFO, "[VortiDeck Banner Menu] Triggered banner_manager with URL: %s", final_url.c_str());
         
         // IMPORTANT: Remove this wrapper source from scenes after triggering banner_manager
         // The banner_manager will create its own private source
@@ -120,12 +120,12 @@ static void banner_source_update(void* data, obs_data_t* settings)
 {
     struct banner_source* context = (struct banner_source*)data;
     
-    // Update banner content through banner_manager
+    // Update banner URL through banner_manager (simplified like overlays)
     const char* new_url = obs_data_get_string(settings, "url");
     if (new_url) {
         try {
             auto& banner_mgr = get_global_banner_manager();
-            banner_mgr.set_banner_content(new_url, "url");
+            banner_mgr.set_banner_url(new_url);  // Use simplified URL method
             blog(LOG_INFO, "[VortiDeck Banner Menu] Updated banner URL: %s", new_url);
         } catch (...) {
             blog(LOG_WARNING, "[VortiDeck Banner Menu] Failed to update banner via banner_manager");
@@ -140,7 +140,7 @@ static void banner_source_defaults(obs_data_t* settings)
     std::string default_url;
     
     if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
-        // Convert WebSocket URL to HTTP URL and add /banners.html
+        // Convert WebSocket URL to HTTP URL and add /banners
         std::string base_url;
         if (websocket_url.starts_with("ws://")) {
             base_url = "http://" + websocket_url.substr(5);
@@ -153,13 +153,13 @@ static void banner_source_defaults(obs_data_t* settings)
         }
         // Ensure no double slashes
         if (base_url.ends_with("/")) {
-            default_url = base_url + "banners.html";
+            default_url = base_url + "banners";
         } else {
-            default_url = base_url + "/banners.html";
+            default_url = base_url + "/banners";
         }
     } else {
         // Fallback if not a proper WebSocket URL
-        default_url = websocket_url + "/banners.html";
+        default_url = websocket_url + "/banners";
     }
     
     obs_data_set_default_string(settings, "url", default_url.c_str());

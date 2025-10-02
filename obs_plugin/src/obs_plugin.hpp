@@ -223,11 +223,10 @@ namespace vorti
             void action_mixer_unmute(const action_invoke_parameters &parameters);
             void action_mixer_mute_toggle(const action_invoke_parameters &parameters);
 
-            // Banner action handlers (ADD THESE)
+            // Banner action handlers (simplified - no data setting)
             void action_banner_show(const action_invoke_parameters &parameters);
             void action_banner_hide(const action_invoke_parameters &parameters);
             void action_banner_toggle(const action_invoke_parameters &parameters);
-            void action_banner_set_data(const action_invoke_parameters &parameters);
             
             // Overlay action handlers (no restrictions)
             void action_overlay_set_data(const action_invoke_parameters &parameters);
@@ -394,7 +393,6 @@ namespace vorti
                 const std::string s_banner_show                 = "obs_banner_show";
                 const std::string s_banner_hide                 = "obs_banner_hide";
                 const std::string s_banner_toggle               = "obs_banner_toggle";
-                const std::string s_banner_set_data             = "obs_banner_set_data";
                 
                 // Overlay actions (no restrictions)
                 const std::string s_overlay_set_data            = "obs_overlay_set_data";

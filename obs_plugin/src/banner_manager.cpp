@@ -160,9 +160,9 @@ void banner_manager::initialize_after_obs_ready()
         // FREE USERS: Initialize banners after OBS is fully loaded
         log_message("INITIALIZATION: FREE USER - Starting automatic banner initialization");
         
-        // Create default transparent banner content for FREE USERS
-        log_message("INITIALIZATION: Creating default transparent banner content");
-        set_banner_content("transparent", "transparent");  // Transparent banner
+        // Create banner using connected service URL like overlays
+        log_message("INITIALIZATION: Creating banner with connected service URL");
+        create_banner_source();
         
         // Verify banner source was created
         if (m_banner_source) {
@@ -802,13 +802,9 @@ void banner_manager::show_banner(bool enable_duration_timer)
     if (!m_banner_source) {
         log_message("SHOW_BANNER: No banner source exists, creating one...");
         
-        if (!m_current_banner_content.empty()) {
-            log_message("SHOW_BANNER: Using existing content: " + m_current_content_type + " - " + m_current_banner_content.substr(0, 50) + "...");
-            create_banner_source(m_current_banner_content, m_current_content_type);
-        } else {
-            log_message("SHOW_BANNER: No banner content set - creating transparent placeholder");
-            set_banner_content("transparent", "transparent");  // Create transparent banner
-        }
+        // Always use connected service URL like overlays (no more content types)
+        log_message("SHOW_BANNER: Creating banner with connected service URL");
+        create_banner_source();
         
         // Verify banner source creation
         if (m_banner_source) {
@@ -951,154 +947,105 @@ void banner_manager::toggle_banner()
     log_message("TOGGLE_BANNER: Toggle operation completed");
 }
 
-void banner_manager::set_banner_content(std::string_view content_data, std::string_view content_type)
+void banner_manager::set_banner_url(const std::string& url)
 {
-    m_current_banner_content = content_data;
-    m_current_content_type = content_type;
+    log_message("BANNER URL: Setting banner to direct URL like overlays: " + url);
     
-    // CRITICAL SECURITY FIX: Preserve visibility state during content update to prevent security bypass
-    bool was_visible_before_update = m_banner_visible;
-    log_message("BANNER CONTENT: SECURITY - Preserving visibility state during update - Was visible: " + std::string(was_visible_before_update ? "true" : "false"));
+    // Create browser source directly with the URL (no content type processing)
+    obs_data_t* settings = obs_data_create();
     
-    // If banner source exists, release it and create new one
-    if (m_banner_source) {
-        obs_source_release(m_banner_source);
-        m_banner_source = nullptr;
-    }
+    // Set browser source properties - exactly like overlays
+    obs_data_set_string(settings, "url", url.c_str());
     
-    create_banner_source(content_data, content_type);
+    // Always use full canvas size like overlays
+    obs_video_info ovi;
+    obs_get_video_info(&ovi);
     
-    // If banner was visible, update it in the scene
-    if (was_visible_before_update) {
-        log_message("BANNER CONTENT: Banner was visible before update - refreshing content in scenes");
+    int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
+    int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
+    
+    obs_data_set_int(settings, "width", canvas_width);
+    obs_data_set_int(settings, "height", canvas_height);
+    obs_data_set_int(settings, "fps", 30);
+    obs_data_set_bool(settings, "reroute_audio", false);
+    obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on URL change
+    obs_data_set_bool(settings, "shutdown", false);
+    
+    // Check if banner source already exists
+    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
+    if (existing_source && strcmp(obs_source_get_id(existing_source), "browser_source") == 0) {
+        // Update existing browser source
+        obs_source_update(existing_source, settings);
         
-        // Temporarily remove old content (this will set m_banner_visible = false - SECURITY RISK!)
-        remove_banner_from_scenes();
+        // Force browser refresh by toggling enabled state
+        obs_source_set_enabled(existing_source, false);
+        obs_source_set_enabled(existing_source, true);
         
-        // CRITICAL SECURITY FIX: Immediately restore the visibility flag to prevent security bypass
-        m_banner_visible = was_visible_before_update;
-        log_message("BANNER CONTENT: SECURITY FIX - Restored visibility flag after remove_banner_from_scenes()");
-        
-        if (!PremiumStatusHandler::is_premium(this)) {
-            // FREE USERS: Content change triggers ALL scenes update
-            log_message("FREE USER: Content changed - updating banners across ALL scenes");
-            initialize_banners_all_scenes();
-            
-            // EXTRA SECURITY: Ensure signal protection is active for free users
-            log_message("FREE USER: SECURITY - Ensuring signal-based protection is active after content update");
-            connect_scene_signals();
-            if (m_banner_source) {
-                connect_source_signals();
-            }
-        } else {
-            // PREMIUM USERS: Content change only affects current scene (if they choose)
-            PremiumStatusHandler::log_premium_action(this, "content change", "use show_premium_banner() to add to current scene");
-        }
-        
-        // Final security verification
-        m_banner_visible = was_visible_before_update;
-        log_message("BANNER CONTENT: SECURITY - Final visibility verification: " + std::string(m_banner_visible ? "true" : "false"));
+        obs_source_release(existing_source);
+        log_message("BANNER URL: Updated and refreshed existing browser source with new URL");
     } else {
-        log_message("BANNER CONTENT: Banner was not visible before update - no scene refresh needed");
-    }
-    
-    log_message(std::format("Banner content set - Type: {} (User: {})", content_type, PremiumStatusHandler::get_user_type_string(this)));
-}
-
-void banner_manager::set_banner_content_with_custom_params(std::string_view content_data, std::string_view content_type,
-                                                          std::string_view custom_css, int custom_width, int custom_height, bool css_locked)
-{
-    m_current_banner_content = content_data;
-    m_current_content_type = content_type;
-    
-    log_message(std::format("ENHANCED BANNER: Setting content with custom parameters - Type: {}, CSS: {}, Size: {}x{}", 
-                          content_type, (custom_css.empty() ? "default" : "custom"), custom_width, custom_height));
-    
-    // CRITICAL SECURITY FIX: Preserve visibility state during content update to prevent security bypass
-    bool was_visible_before_update = m_banner_visible;
-    log_message("ENHANCED BANNER: SECURITY - Preserving visibility state during update - Was visible: " + std::string(was_visible_before_update ? "true" : "false"));
-    
-    // If banner source exists, release it and create new one
-    if (m_banner_source) {
-        obs_source_release(m_banner_source);
-        m_banner_source = nullptr;
-    }
-    
-    create_banner_source_with_custom_params(content_data, content_type, custom_css, custom_width, custom_height, css_locked);
-    
-    // If banner was visible, update it in the scene WITHOUT removing it
-    if (was_visible_before_update) {
-        log_message("ENHANCED BANNER: Banner was visible before update - updating content WITHOUT removing from scenes");
-        
-        // DO NOT remove banner from scenes - just refresh the content in place
-        // The create_banner_source_with_custom_params already updated the browser source content
-        
-        if (!PremiumStatusHandler::is_premium(this)) {
-            // FREE USERS: Content updated in-place, just refresh protection
-            log_message("FREE USER: Enhanced content changed - banners updated in-place (full-screen)");
-            
-            // EXTRA SECURITY: Force lock all banners after content update
-            obs_frontend_source_list scenes = {};
-            obs_frontend_get_scenes(&scenes);
-            
-            for (size_t i = 0; i < scenes.sources.num; i++) {
-                obs_source_t* scene_source = scenes.sources.array[i];
-                if (!scene_source) continue;
-                
-                obs_scene_t* scene = obs_scene_from_source(scene_source);
-                if (!scene) continue;
-                
-                obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
-                if (banner_item) {
-                    lock_banner_item(banner_item);
-                }
-            }
-            obs_frontend_source_list_free(&scenes);
-            
-            log_message("FREE USER: SECURITY - All banners re-locked after content update");
-            
-            // CRITICAL: Ensure signal protection is active for free users
-            log_message("FREE USER: SECURITY - Ensuring signal-based protection is active after content update");
-            connect_scene_signals();
-            if (m_banner_source) {
-                connect_source_signals();
-            }
-        } else {
-            // PREMIUM USERS: Content change only affects current scene (if they choose)
-            PremiumStatusHandler::log_premium_action(this, "enhanced content change", "use show_premium_banner() to add to current scene");
+        // Release old source if it exists but isn't a browser source
+        if (existing_source) {
+            obs_source_release(existing_source);
         }
         
-        // Final security verification
-        m_banner_visible = was_visible_before_update;
-        log_message("ENHANCED BANNER: SECURITY - Final visibility verification: " + std::string(m_banner_visible ? "true" : "false"));
-    } else {
-        log_message("ENHANCED BANNER: Banner was not visible before update - no scene refresh needed");
-    }
-    
-    // CRITICAL: Ensure protection systems remain active for free users after ANY content update
-    if (!PremiumStatusHandler::is_premium(this)) {
-        log_message("FREE USER: SECURITY - Ensuring protection system remains active after content update");
+        // Create new browser source
+        m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
         
-        // Force re-enable signal connections if needed
-        if (!m_signals_connected.load()) {
-            log_message("FREE USER: WARNING - Signal connections lost, re-enabling");
-            enable_signal_connections_when_safe();
-        }
-        
-        // Ensure signal protection is active for free users
-        log_message("FREE USER: SECURITY - Ensuring signal-based protection is active");
-        connect_scene_signals();
         if (m_banner_source) {
+            // Add VortiDeck metadata
+            obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
+            obs_data_set_string(private_settings, "vortideck_banner", "true");
+            obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
+            obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
+            obs_data_release(private_settings);
+            
+            // Connect source signals for visibility monitoring
             connect_source_signals();
+            
+            log_message("BANNER URL: Created new browser source with direct URL");
         }
-        
-        log_message("FREE USER: SECURITY - Protection systems verified active after content update");
     }
     
-    log_message(std::format("Enhanced banner content set - Type: {} (User: {})", content_type, PremiumStatusHandler::get_user_type_string(this)));
+    obs_data_release(settings);
 }
 
-
+void banner_manager::resize_banner_to_canvas()
+{
+    log_message("BANNER RESIZE: Resizing banner to match current canvas size");
+    
+    if (!m_banner_source) {
+        log_message("BANNER RESIZE: No banner source to resize");
+        return;
+    }
+    
+    // Get current canvas size
+    obs_video_info ovi;
+    if (!obs_get_video_info(&ovi)) {
+        log_message("BANNER RESIZE: Failed to get video info");
+        return;
+    }
+    
+    int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
+    int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
+    
+    log_message(std::format("BANNER RESIZE: Updating banner to canvas size: {}x{}", canvas_width, canvas_height));
+    
+    // Update browser source dimensions
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_int(settings, "width", canvas_width);
+    obs_data_set_int(settings, "height", canvas_height);
+    
+    // Update the browser source with new dimensions
+    obs_source_update(m_banner_source, settings);
+    
+    obs_data_release(settings);
+    
+    // Force show banner to ensure it's visible after resize
+    show_banner();
+    
+    log_message("BANNER RESIZE: Banner successfully resized and repositioned");
+}
 
 void banner_manager::show_premium_banner()
 {
@@ -1205,9 +1152,8 @@ void banner_manager::banner_menu_callback(void* data)
         
         // Check if content is set - if not, create a transparent placeholder
         if (manager->get_current_banner_content().empty()) {
-            manager->log_message("FREE USER: Creating transparent placeholder banner (menu action)");
-            // Create a transparent placeholder instead of red
-            manager->set_banner_content("transparent", "transparent");  // Transparent banner as default
+            manager->log_message("FREE USER: Creating banner with connected service URL (menu action)");
+            manager->create_banner_source();
         }
         
         // Show the banner - FREE USERS get FORCED banners in ALL scenes
@@ -1219,60 +1165,42 @@ void banner_manager::banner_menu_callback(void* data)
 
 void banner_manager::create_banner_source(std::string_view content_data, std::string_view content_type)
 {
-    log_message(std::format("BANNER CREATION: Starting banner source creation - Type: {}, Data: {}...", content_type, content_data.substr(0, 50)));
+    log_message("BANNER CREATION: Creating banner with connected service URL (simplified like overlays)");
     
-    // IMPROVEMENT: Check if a banner source already exists with the base name
-         // Convert content to URL format for browser source (needed for both reuse and create)
-     std::string url_content;
-     std::string css_content = "";
-     
-     if (content_type == "transparent") {
-         // Create completely transparent banner (no visible content)
-         url_content = "data:text/html,<html><body></body></html>";
-         css_content = "body { margin: 0; padding: 0; background: transparent; width: 100vw; height: 100vh; overflow: hidden; }";
-     } else if (content_type == "color") {
-         // Create HTML page with color background
-         std::string color = "#FF0000"; // Default red
-         if (content_data.length() >= 7 && content_data[0] == '#') {
-             color = content_data;
-         }
-         url_content = "data:text/html,<html><body><h2>VortiDeck Banner</h2></body></html>";
-         css_content = std::format("body {{ background-color: {}; margin: 0; padding: 20px; font-family: Arial; color: white; text-align: center; display: flex; align-items: center; justify-content: center; }}", color);
-     } else if (content_type == "text") {
-         // Create HTML page with text content
-         url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
-         css_content = "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }";
-     } else if (is_image_content(content_type) || is_video_content(content_type)) {
-         // For image/video URLs - create HTML wrapper for proper CSS targeting
-         if (is_url(content_data)) {
-             // Create HTML wrapper with image/video element
-             std::string element_tag = is_video_content(content_type) ? "video" : "img";
-             std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
-             std::string default_css = std::format("body {{ margin: 0; padding: 0; background: transparent; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; overflow: hidden; }} {} {{ width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; border: none; }}", element_tag);
-             
-             url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
-                                     default_css, element_tag, content_data, extra_attrs, element_tag);
-             css_content = ""; // CSS is now embedded in HTML
-         } else {
-             // Local file or other image/video path - same wrapper approach
-             std::string element_tag = is_video_content(content_type) ? "video" : "img";
-             std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
-             std::string default_css = std::format("body {{ margin: 0; padding: 0; background: transparent; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; overflow: hidden; }} {} {{ width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; border: none; }}", element_tag);
-             
-             url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
-                                     default_css, element_tag, content_data, extra_attrs, element_tag);
-             css_content = ""; // CSS is now embedded in HTML
-         }
-     } else if (content_type == "url" || is_url(content_data)) {
-         // Direct URL - use as is
-         url_content = content_data;
-         css_content = "";
-         log_message(std::format("BANNER CREATION: Using direct URL: {}", content_data));
-     } else {
-         // Default fallback - treat as text
-         url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
-         css_content = "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }";
-     }
+    // Build banner URL from connected WebSocket server (consolidated logic)
+    extern std::string get_global_websocket_url();
+    std::string websocket_url = get_global_websocket_url();
+    std::string banner_url;
+    
+    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
+        std::string base_url;
+        if (websocket_url.starts_with("ws://")) {
+            base_url = "http://" + websocket_url.substr(5);
+        } else {
+            base_url = "https://" + websocket_url.substr(6);
+        }
+        if (base_url.ends_with("/ws")) {
+            base_url = base_url.substr(0, base_url.length() - 3);
+        }
+        if (base_url.ends_with("/")) {
+            banner_url = base_url + "banners";
+        } else {
+            banner_url = base_url + "/banners";
+        }
+    } else {
+        banner_url = websocket_url + "/banners";
+    }
+    
+    log_message("CREATE_BANNER_SOURCE: Banner URL: " + banner_url);
+    
+    // Always use connected service URL (no more complex content types)
+    set_banner_url(banner_url);
+    
+    log_message("BANNER CREATION: Banner source created with connected service URL");
+    
+    // Use the connected service URL directly - no content type processing needed
+    std::string url_content = banner_url;
+    std::string css_content = "";  // No custom CSS needed for connected service URLs
 
     obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
     if (existing_source) {
@@ -1456,304 +1384,304 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
     }
 }
 
-void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
-                                                             std::string_view custom_css, int custom_width, int custom_height, bool css_locked)
-{
-    log_message(std::format("ENHANCED BANNER CREATION: Starting banner source creation with custom params - Type: {}, Data: {}...", 
-                          content_type, content_data.substr(0, 50)));
-    log_message(std::format("ENHANCED BANNER CREATION: Custom CSS: {}, Dimensions: {}x{}", 
-                          (custom_css.empty() ? "none" : "provided"), custom_width, custom_height));
+// void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
+//                                                              std::string_view custom_css, int custom_width, int custom_height, bool css_locked)
+// {
+//     log_message(std::format("ENHANCED BANNER CREATION: Starting banner source creation with custom params - Type: {}, Data: {}...", 
+//                           content_type, content_data.substr(0, 50)));
+//     log_message(std::format("ENHANCED BANNER CREATION: Custom CSS: {}, Dimensions: {}x{}", 
+//                           (custom_css.empty() ? "none" : "provided"), custom_width, custom_height));
     
-    // Convert content to URL format for browser source (needed for both reuse and create)
-    std::string url_content;
-    std::string css_content = "";
+//     // Convert content to URL format for browser source (needed for both reuse and create)
+//     std::string url_content;
+//     std::string css_content = "";
     
-    if (content_type == "transparent") {
-        // Create completely transparent banner (no visible content)
-        url_content = "data:text/html,<html><body></body></html>";
-        css_content = custom_css.empty() ? 
-            "body { margin: 0; padding: 0; background: transparent; width: 100vw; height: 100vh; overflow: hidden; }" :
-            std::string(custom_css);
-    } else if (content_type == "color") {
-        // Create HTML page with color background
-        std::string color = "#FF0000"; // Default red
-        if (content_data.length() >= 7 && content_data[0] == '#') {
-            color = std::string(content_data);
-        }
-        url_content = "data:text/html,<html><body><h2>VortiDeck Banner</h2></body></html>";
-        css_content = custom_css.empty() ? 
-            std::format("body {{ background-color: {}; margin: 0; padding: 20px; font-family: Arial; color: white; text-align: center; display: flex; align-items: center; justify-content: center; }}", color) :
-            std::string(custom_css);
-    } else if (content_type == "text") {
-        // Create HTML page with text content
-        url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
-        css_content = custom_css.empty() ? 
-            "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }" :
-            std::string(custom_css);
-                    } else if (is_image_content(content_type) || is_video_content(content_type)) {
-        // For image/video URLs - check if custom CSS needs HTML structure
-        if (is_url(content_data)) {
-            // Check if custom CSS references HTML elements (img, video, etc.)
-            bool needs_html_wrapper = !custom_css.empty() && 
-                                    (custom_css.find("img") != std::string::npos || 
-                                     custom_css.find("video") != std::string::npos ||
-                                     custom_css.find("@keyframes") != std::string::npos ||
-                                     custom_css.find("animation") != std::string::npos);
+//     if (content_type == "transparent") {
+//         // Create completely transparent banner (no visible content)
+//         url_content = "data:text/html,<html><body></body></html>";
+//         css_content = custom_css.empty() ? 
+//             "body { margin: 0; padding: 0; background: transparent; width: 100vw; height: 100vh; overflow: hidden; }" :
+//             std::string(custom_css);
+//     } else if (content_type == "color") {
+//         // Create HTML page with color background
+//         std::string color = "#FF0000"; // Default red
+//         if (content_data.length() >= 7 && content_data[0] == '#') {
+//             color = std::string(content_data);
+//         }
+//         url_content = "data:text/html,<html><body><h2>VortiDeck Banner</h2></body></html>";
+//         css_content = custom_css.empty() ? 
+//             std::format("body {{ background-color: {}; margin: 0; padding: 20px; font-family: Arial; color: white; text-align: center; display: flex; align-items: center; justify-content: center; }}", color) :
+//             std::string(custom_css);
+//     } else if (content_type == "text") {
+//         // Create HTML page with text content
+//         url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
+//         css_content = custom_css.empty() ? 
+//             "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }" :
+//             std::string(custom_css);
+//                     } else if (is_image_content(content_type) || is_video_content(content_type)) {
+//         // For image/video URLs - check if custom CSS needs HTML structure
+//         if (is_url(content_data)) {
+//             // Check if custom CSS references HTML elements (img, video, etc.)
+//             bool needs_html_wrapper = !custom_css.empty() && 
+//                                     (custom_css.find("img") != std::string::npos || 
+//                                      custom_css.find("video") != std::string::npos ||
+//                                      custom_css.find("@keyframes") != std::string::npos ||
+//                                      custom_css.find("animation") != std::string::npos);
             
-            if (needs_html_wrapper) {
-                // Create HTML wrapper with image/video element for CSS targeting
-                std::string element_tag = is_video_content(content_type) ? "video" : "img";
-                std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
+//             if (needs_html_wrapper) {
+//                 // Create HTML wrapper with image/video element for CSS targeting
+//                 std::string element_tag = is_video_content(content_type) ? "video" : "img";
+//                 std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
                 
-                // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
-                // If css_locked is not explicitly set, use smart defaults:
-                // - Premium users: CSS editable by default 
-                // - Free users: CSS locked by default (for ad content protection)
-                bool final_css_locked = css_locked;
-                if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
-                    // Free users get locked CSS by default unless explicitly overridden
-                    final_css_locked = true;
-                    log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
-                }
+//                 // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
+//                 // If css_locked is not explicitly set, use smart defaults:
+//                 // - Premium users: CSS editable by default 
+//                 // - Free users: CSS locked by default (for ad content protection)
+//                 bool final_css_locked = css_locked;
+//                 if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
+//                     // Free users get locked CSS by default unless explicitly overridden
+//                     final_css_locked = true;
+//                     log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
+//                 }
                 
-                if (final_css_locked) {
-                    // LOCKED MODE: Embed CSS in HTML (ads, protected content)
-                    url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
-                                            custom_css, element_tag, content_data, extra_attrs, element_tag);
-                    css_content = ""; // CSS is hidden in HTML
-                    log_message("BANNER CREATION: CSS LOCKED - Embedded in HTML (not visible in OBS properties)");
-                } else {
-                    // EDITABLE MODE: CSS visible in OBS browser source properties
-                    // Create basic HTML structure without embedded CSS
-                    url_content = std::format("data:text/html,<html><body><{} src=\"{}\"{}></{}</body></html>", 
-                                            element_tag, content_data, extra_attrs, element_tag);
-                    css_content = std::string(custom_css); // CSS will be visible in OBS
-                    log_message("BANNER CREATION: CSS EDITABLE - Visible in OBS properties for inspection/modification");
-                }
+//                 if (final_css_locked) {
+//                     // LOCKED MODE: Embed CSS in HTML (ads, protected content)
+//                     url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}</body></html>", 
+//                                             custom_css, element_tag, content_data, extra_attrs, element_tag);
+//                     css_content = ""; // CSS is hidden in HTML
+//                     log_message("BANNER CREATION: CSS LOCKED - Embedded in HTML (not visible in OBS properties)");
+//                 } else {
+//                     // EDITABLE MODE: CSS visible in OBS browser source properties
+//                     // Create basic HTML structure without embedded CSS
+//                     url_content = std::format("data:text/html,<html><body><{} src=\"{}\"{}></{}</body></html>", 
+//                                             element_tag, content_data, extra_attrs, element_tag);
+//                     css_content = std::string(custom_css); // CSS will be visible in OBS
+//                     log_message("BANNER CREATION: CSS EDITABLE - Visible in OBS properties for inspection/modification");
+//                 }
                 
-                log_message(std::format("BANNER CREATION: Created HTML wrapper for image/video with custom CSS - Mode: {}", 
-                                       final_css_locked ? "LOCKED" : "EDITABLE"));
-            } else {
-                // Direct image/video URL (no custom CSS or CSS doesn't need HTML structure)
-                url_content = std::string(content_data);
-                css_content = custom_css.empty() ? 
-                    "body { margin: 0; padding: 0; background: transparent; overflow: hidden; }" :
-                    std::string(custom_css);
-            }
-        } else {
-            // Local file or other image URL - same logic
-            bool needs_html_wrapper = !custom_css.empty() && 
-                                    (custom_css.find("img") != std::string::npos || 
-                                     custom_css.find("video") != std::string::npos ||
-                                     custom_css.find("@keyframes") != std::string::npos ||
-                                     custom_css.find("animation") != std::string::npos);
+//                 log_message(std::format("BANNER CREATION: Created HTML wrapper for image/video with custom CSS - Mode: {}", 
+//                                        final_css_locked ? "LOCKED" : "EDITABLE"));
+//             } else {
+//                 // Direct image/video URL (no custom CSS or CSS doesn't need HTML structure)
+//                 url_content = std::string(content_data);
+//                 css_content = custom_css.empty() ? 
+//                     "body { margin: 0; padding: 0; background: transparent; overflow: hidden; }" :
+//                     std::string(custom_css);
+//             }
+//         } else {
+//             // Local file or other image URL - same logic
+//             bool needs_html_wrapper = !custom_css.empty() && 
+//                                     (custom_css.find("img") != std::string::npos || 
+//                                      custom_css.find("video") != std::string::npos ||
+//                                      custom_css.find("@keyframes") != std::string::npos ||
+//                                      custom_css.find("animation") != std::string::npos);
             
-            if (needs_html_wrapper) {
-                std::string element_tag = is_video_content(content_type) ? "video" : "img";
-                std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
+//             if (needs_html_wrapper) {
+//                 std::string element_tag = is_video_content(content_type) ? "video" : "img";
+//                 std::string extra_attrs = is_video_content(content_type) ? " autoplay loop muted" : "";
                 
-                // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
-                // If css_locked is not explicitly set, use smart defaults:
-                // - Premium users: CSS editable by default 
-                // - Free users: CSS locked by default (for ad content protection)
-                bool final_css_locked = css_locked;
-                if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
-                    // Free users get locked CSS by default unless explicitly overridden
-                    final_css_locked = true;
-                    log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
-                }
+//                 // FLEXIBLE CSS HANDLING: Use explicit css_locked parameter with smart defaults
+//                 // If css_locked is not explicitly set, use smart defaults:
+//                 // - Premium users: CSS editable by default 
+//                 // - Free users: CSS locked by default (for ad content protection)
+//                 bool final_css_locked = css_locked;
+//                 if (!css_locked && !PremiumStatusHandler::is_premium(this)) {
+//                     // Free users get locked CSS by default unless explicitly overridden
+//                     final_css_locked = true;
+//                     log_message("BANNER CREATION: Auto-locking CSS for free user (set css_locked=false to override)");
+//                 }
                 
-                if (final_css_locked) {
-                    // LOCKED MODE: Embed CSS in HTML (ads, protected content)
-                    url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}>></body></html>", 
-                                            custom_css, element_tag, content_data, extra_attrs, element_tag);
-                    css_content = ""; // CSS is hidden in HTML
-                    log_message("BANNER CREATION: CSS LOCKED - Embedded in HTML (not visible in OBS properties)");
-                } else {
-                    // EDITABLE MODE: CSS visible in OBS browser source properties
-                    // Create basic HTML structure without embedded CSS
-                    url_content = std::format("data:text/html,<html><body><{} src=\"{}\"{}></{}>></body></html>", 
-                                            element_tag, content_data, extra_attrs, element_tag);
-                    css_content = std::string(custom_css); // CSS will be visible in OBS
-                    log_message("BANNER CREATION: CSS EDITABLE - Visible in OBS properties for inspection/modification");
-                }
+//                 if (final_css_locked) {
+//                     // LOCKED MODE: Embed CSS in HTML (ads, protected content)
+//                     url_content = std::format("data:text/html,<html><head><style>{}</style></head><body><{} src=\"{}\"{}></{}>></body></html>", 
+//                                             custom_css, element_tag, content_data, extra_attrs, element_tag);
+//                     css_content = ""; // CSS is hidden in HTML
+//                     log_message("BANNER CREATION: CSS LOCKED - Embedded in HTML (not visible in OBS properties)");
+//                 } else {
+//                     // EDITABLE MODE: CSS visible in OBS browser source properties
+//                     // Create basic HTML structure without embedded CSS
+//                     url_content = std::format("data:text/html,<html><body><{} src=\"{}\"{}></{}>></body></html>", 
+//                                             element_tag, content_data, extra_attrs, element_tag);
+//                     css_content = std::string(custom_css); // CSS will be visible in OBS
+//                     log_message("BANNER CREATION: CSS EDITABLE - Visible in OBS properties for inspection/modification");
+//                 }
                 
-                log_message(std::format("BANNER CREATION: Local file HTML wrapper with custom CSS - Mode: {}", 
-                           final_css_locked ? "LOCKED" : "EDITABLE"));
-            } else {
-                url_content = std::string(content_data);
-                css_content = custom_css.empty() ? 
-                    "body { margin: 0; padding: 0; background: transparent; overflow: hidden; }" :
-                    std::string(custom_css);
-            }
-        }
-    } else if (is_url(content_data)) {
-        // Direct URL - use as is
-        url_content = std::string(content_data);
-        css_content = std::string(custom_css); // Use provided CSS or empty
-    } else {
-        // Default fallback - treat as text
-        url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
-        css_content = custom_css.empty() ? 
-            "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }" :
-            std::string(custom_css);
-    }
+//                 log_message(std::format("BANNER CREATION: Local file HTML wrapper with custom CSS - Mode: {}", 
+//                            final_css_locked ? "LOCKED" : "EDITABLE"));
+//             } else {
+//                 url_content = std::string(content_data);
+//                 css_content = custom_css.empty() ? 
+//                     "body { margin: 0; padding: 0; background: transparent; overflow: hidden; }" :
+//                     std::string(custom_css);
+//             }
+//         }
+//     } else if (is_url(content_data)) {
+//         // Direct URL - use as is
+//         url_content = std::string(content_data);
+//         css_content = std::string(custom_css); // Use provided CSS or empty
+//     } else {
+//         // Default fallback - treat as text
+//         url_content = std::format("data:text/html,<html><body>{}</body></html>", content_data);
+//         css_content = custom_css.empty() ? 
+//             "body { background-color: #000; margin: 0; padding: 20px; font-family: Arial, sans-serif; color: white; text-align: center; font-size: 24px; display: flex; align-items: center; justify-content: center; }" :
+//             std::string(custom_css);
+//     }
 
-    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
-    if (existing_source) {
-        // Check if existing source is actually a browser source
-        const char* source_id = obs_source_get_id(existing_source);
-        if (source_id && std::string(source_id) == "browser_source") {
-            log_message("ENHANCED BANNER CREATION: Found existing browser source, reusing it");
+//     obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
+//     if (existing_source) {
+//         // Check if existing source is actually a browser source
+//         const char* source_id = obs_source_get_id(existing_source);
+//         if (source_id && std::string(source_id) == "browser_source") {
+//             log_message("ENHANCED BANNER CREATION: Found existing browser source, reusing it");
             
-            // Release our current source if any
-            if (m_banner_source) {
-                obs_source_release(m_banner_source);
-            }
+//             // Release our current source if any
+//             if (m_banner_source) {
+//                 obs_source_release(m_banner_source);
+//             }
             
-            // Use the existing source
-            m_banner_source = existing_source;
+//             // Use the existing source
+//             m_banner_source = existing_source;
             
-            // Update the existing browser source with new URL content (use the shared conversion logic)
-            obs_data_t* settings = obs_data_create();
+//             // Update the existing browser source with new URL content (use the shared conversion logic)
+//             obs_data_t* settings = obs_data_create();
             
-            // Set browser source properties with custom dimensions
-            obs_data_set_string(settings, "url", url_content.c_str());
+//             // Set browser source properties with custom dimensions
+//             obs_data_set_string(settings, "url", url_content.c_str());
             
-            // FULL-SCREEN BANNERS: Use custom dimensions if provided, otherwise use full canvas size
-            // Get OBS canvas resolution for full-screen banners
-            obs_video_info ovi;
-            obs_get_video_info(&ovi);
+//             // FULL-SCREEN BANNERS: Use custom dimensions if provided, otherwise use full canvas size
+//             // Get OBS canvas resolution for full-screen banners
+//             obs_video_info ovi;
+//             obs_get_video_info(&ovi);
             
-            int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-            int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
+//             int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
+//             int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
             
-            // ALWAYS use full canvas size for browser source (ignore custom width/height)
-            int width = canvas_width;
-            int height = canvas_height;
+//             // ALWAYS use full canvas size for browser source (ignore custom width/height)
+//             int width = canvas_width;
+//             int height = canvas_height;
             
-            log_message("FULL-SCREEN BANNER: Browser source dimensions " + std::to_string(width) + "x" + std::to_string(height) + 
-                       " (Full Canvas - Custom w/h " + std::to_string(custom_width) + "x" + std::to_string(custom_height) + " for CSS only)");
+//             log_message("FULL-SCREEN BANNER: Browser source dimensions " + std::to_string(width) + "x" + std::to_string(height) + 
+//                        " (Full Canvas - Custom w/h " + std::to_string(custom_width) + "x" + std::to_string(custom_height) + " for CSS only)");
             
-            obs_data_set_int(settings, "width", width);
-            obs_data_set_int(settings, "height", height);
+//             obs_data_set_int(settings, "width", width);
+//             obs_data_set_int(settings, "height", height);
             
-            obs_data_set_int(settings, "fps", 30);
-            obs_data_set_bool(settings, "reroute_audio", false);
-            obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-            obs_data_set_bool(settings, "shutdown", false);
-            obs_data_set_string(settings, "css", css_content.c_str());
+//             obs_data_set_int(settings, "fps", 30);
+//             obs_data_set_bool(settings, "reroute_audio", false);
+//             obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
+//             obs_data_set_bool(settings, "shutdown", false);
+//             obs_data_set_string(settings, "css", css_content.c_str());
             
-            // Update the browser source
-            obs_source_update(m_banner_source, settings);
+//             // Update the browser source
+//             obs_source_update(m_banner_source, settings);
             
-            // Force a refresh by toggling the source active state AND triggering browser refresh
-            obs_source_set_enabled(m_banner_source, false);
-            obs_source_set_enabled(m_banner_source, true);
+//             // Force a refresh by toggling the source active state AND triggering browser refresh
+//             obs_source_set_enabled(m_banner_source, false);
+//             obs_source_set_enabled(m_banner_source, true);
             
-            // Force browser source refresh for new content
-            log_message("ENHANCED BANNER CREATION: Forced browser source refresh for new content");
+//             // Force browser source refresh for new content
+//             log_message("ENHANCED BANNER CREATION: Forced browser source refresh for new content");
             
-            obs_data_release(settings);
+//             obs_data_release(settings);
             
-            log_message(std::format("ENHANCED BANNER CREATION: Successfully reused existing browser source - Type: {}", content_type));
-            log_message(std::format("ENHANCED BANNER CREATION: Updated URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
-            log_message(std::format("ENHANCED BANNER CREATION: Dimensions: {}x{}", width, height));
-            log_message(std::format("ENHANCED BANNER CREATION: CSS: {}", (custom_css.empty() ? "default" : "custom")));
-            return;
-        } else {
-            // Existing source is NOT a browser source (probably old custom source) - remove it and create new browser source
-            log_message("ENHANCED BANNER CREATION: Found existing NON-browser source (probably old custom), removing it");
-            obs_source_release(existing_source);
+//             log_message(std::format("ENHANCED BANNER CREATION: Successfully reused existing browser source - Type: {}", content_type));
+//             log_message(std::format("ENHANCED BANNER CREATION: Updated URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
+//             log_message(std::format("ENHANCED BANNER CREATION: Dimensions: {}x{}", width, height));
+//             log_message(std::format("ENHANCED BANNER CREATION: CSS: {}", (custom_css.empty() ? "default" : "custom")));
+//             return;
+//         } else {
+//             // Existing source is NOT a browser source (probably old custom source) - remove it and create new browser source
+//             log_message("ENHANCED BANNER CREATION: Found existing NON-browser source (probably old custom), removing it");
+//             obs_source_release(existing_source);
             
-            // Remove the old source from all scenes first
-            obs_frontend_source_list scenes = {};
-            obs_frontend_get_scenes(&scenes);
+//             // Remove the old source from all scenes first
+//             obs_frontend_source_list scenes = {};
+//             obs_frontend_get_scenes(&scenes);
             
-            for (size_t i = 0; i < scenes.sources.num; i++) {
-                obs_source_t* scene_source = scenes.sources.array[i];
-                if (!scene_source) continue;
+//             for (size_t i = 0; i < scenes.sources.num; i++) {
+//                 obs_source_t* scene_source = scenes.sources.array[i];
+//                 if (!scene_source) continue;
                 
-                obs_scene_t* scene = obs_scene_from_source(scene_source);
-                if (!scene) continue;
+//                 obs_scene_t* scene = obs_scene_from_source(scene_source);
+//                 if (!scene) continue;
                 
-                obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
-                if (item) {
-                    obs_sceneitem_remove(item);
-                    log_message("ENHANCED BANNER CREATION: Removed old source from scene");
-                }
-            }
-            obs_frontend_source_list_free(&scenes);
-        }
-    }
+//                 obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
+//                 if (item) {
+//                     obs_sceneitem_remove(item);
+//                     log_message("ENHANCED BANNER CREATION: Removed old source from scene");
+//                 }
+//             }
+//             obs_frontend_source_list_free(&scenes);
+//         }
+//     }
     
-    // Create settings for browser_source directly
-    obs_data_t* settings = obs_data_create();
+//     // Create settings for browser_source directly
+//     obs_data_t* settings = obs_data_create();
     
-    // Set browser source properties with custom dimensions
-    obs_data_set_string(settings, "url", url_content.c_str());
+//     // Set browser source properties with custom dimensions
+//     obs_data_set_string(settings, "url", url_content.c_str());
     
-    // FULL-SCREEN BANNERS: Use custom dimensions if provided, otherwise use full canvas size
-    // Get OBS canvas resolution for full-screen banners
-    obs_video_info ovi;
-    obs_get_video_info(&ovi);
+//     // FULL-SCREEN BANNERS: Use custom dimensions if provided, otherwise use full canvas size
+//     // Get OBS canvas resolution for full-screen banners
+//     obs_video_info ovi;
+//     obs_get_video_info(&ovi);
     
-    int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-    int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
+//     int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
+//     int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
     
-    // ALWAYS use full canvas size for browser source (ignore custom width/height)
-    int width = canvas_width;
-    int height = canvas_height;
+//     // ALWAYS use full canvas size for browser source (ignore custom width/height)
+//     int width = canvas_width;
+//     int height = canvas_height;
     
-    log_message(std::format("FULL-SCREEN BANNER: Browser source dimensions {}x{} (Full Canvas - Custom w/h {}x{} for CSS only)", 
-                           width, height, custom_width, custom_height));
+//     log_message(std::format("FULL-SCREEN BANNER: Browser source dimensions {}x{} (Full Canvas - Custom w/h {}x{} for CSS only)", 
+//                            width, height, custom_width, custom_height));
     
-    obs_data_set_int(settings, "width", width);
-    obs_data_set_int(settings, "height", height);
-    obs_data_set_int(settings, "fps", 30);
-    obs_data_set_bool(settings, "reroute_audio", false);
-    obs_data_set_bool(settings, "restart_when_active", true); // Help with content loading
-    obs_data_set_bool(settings, "shutdown", false);
-    obs_data_set_string(settings, "css", css_content.c_str());
+//     obs_data_set_int(settings, "width", width);
+//     obs_data_set_int(settings, "height", height);
+//     obs_data_set_int(settings, "fps", 30);
+//     obs_data_set_bool(settings, "reroute_audio", false);
+//     obs_data_set_bool(settings, "restart_when_active", true); // Help with content loading
+//     obs_data_set_bool(settings, "shutdown", false);
+//     obs_data_set_string(settings, "css", css_content.c_str());
     
-    log_message("ENHANCED BANNER CREATION: Attempting to create browser_source directly...");
-    log_message(std::format("ENHANCED BANNER CREATION: New source URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
-    log_message(std::format("ENHANCED BANNER CREATION: Dimensions: {}x{}", width, height));
-    log_message(std::format("ENHANCED BANNER CREATION: CSS: {}", (custom_css.empty() ? "default" : "custom")));
+//     log_message("ENHANCED BANNER CREATION: Attempting to create browser_source directly...");
+//     log_message(std::format("ENHANCED BANNER CREATION: New source URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
+//     log_message(std::format("ENHANCED BANNER CREATION: Dimensions: {}x{}", width, height));
+//     log_message(std::format("ENHANCED BANNER CREATION: CSS: {}", (custom_css.empty() ? "default" : "custom")));
     
-    // Create browser_source directly - simple and reliable
-    m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
+//     // Create browser_source directly - simple and reliable
+//     m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
     
-    obs_data_release(settings);
+//     obs_data_release(settings);
     
-    if (m_banner_source) {
-        // Add VortiDeck protection metadata to the browser source
-        obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
-        obs_data_set_string(private_settings, "vortideck_banner", "true");
-        obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
-        obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
-        obs_data_release(private_settings);
+//     if (m_banner_source) {
+//         // Add VortiDeck protection metadata to the browser source
+//         obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
+//         obs_data_set_string(private_settings, "vortideck_banner", "true");
+//         obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
+//         obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
+//         obs_data_release(private_settings);
         
-        // Connect source signals for visibility monitoring
-        connect_source_signals();
+//         // Connect source signals for visibility monitoring
+//         connect_source_signals();
         
-        log_message(std::format("ENHANCED BANNER CREATION: Successfully created browser_source with VortiDeck protection - Type: {}", content_type));
+//         log_message(std::format("ENHANCED BANNER CREATION: Successfully created browser_source with VortiDeck protection - Type: {}", content_type));
         
-        // Add additional verification
-        const char* source_type = obs_source_get_id(m_banner_source);
-        uint32_t actual_width = obs_source_get_width(m_banner_source);
-        uint32_t actual_height = obs_source_get_height(m_banner_source);
+//         // Add additional verification
+//         const char* source_type = obs_source_get_id(m_banner_source);
+//         uint32_t actual_width = obs_source_get_width(m_banner_source);
+//         uint32_t actual_height = obs_source_get_height(m_banner_source);
         
-        log_message(std::format("ENHANCED BANNER CREATION: Source verification - Type: {}, Size: {}x{}", 
-                               (source_type ? source_type : "NULL"), actual_width, actual_height));
-    } else {
-        log_message("ENHANCED BANNER CREATION: FAILED to create Browser Source for VortiDeck Banner!");
+//         log_message(std::format("ENHANCED BANNER CREATION: Source verification - Type: {}, Size: {}x{}", 
+//                                (source_type ? source_type : "NULL"), actual_width, actual_height));
+//     } else {
+//         log_message("ENHANCED BANNER CREATION: FAILED to create Browser Source for VortiDeck Banner!");
         
-        // Fallback to regular banner creation
-        log_message("ENHANCED BANNER CREATION: Falling back to regular banner creation...");
-        create_banner_source(content_data, content_type);
-    }
-}
+//         // Fallback to regular banner creation
+//         log_message("ENHANCED BANNER CREATION: Falling back to regular banner creation...");
+//         create_banner_source(content_data, content_type);
+//     }
+// }
 
 void banner_manager::add_banner_to_current_scene()
 {
@@ -2302,10 +2230,10 @@ void banner_manager::enforce_banner_visibility()
         log_message("PREMIUM USER: Persistence mode enabled - checking banner visibility");
     }
     
-    // Recreate banner source if it was destroyed
-    if (!m_banner_source && !m_current_banner_content.empty()) {
-        log_message("Banner source was destroyed! Recreating it...");
-        create_banner_source(m_current_banner_content, m_current_content_type);
+    // Recreate banner source if it was destroyed (always use connected service URL)
+    if (!m_banner_source) {
+        log_message("Banner source was destroyed! Recreating it with connected service URL...");
+        create_banner_source();
     }
     
     if (!m_banner_source) {
@@ -2649,9 +2577,9 @@ void banner_manager::hide_banner_with_user_restrictions(const std::string& reaso
         remove_banner_from_scenes();
         m_banner_visible = false;
     } else {
-        // FREE: Show transparent content instead of hiding (maintain banner source visibility)
-        log_message("BANNER_HIDE: FREE USER - Showing transparent content (" + reason + ") - cannot hide banners");
-        set_banner_content("transparent", "transparent");
+        // FREE: Show connected service banner instead of hiding (maintain banner source visibility)
+        log_message("BANNER_HIDE: FREE USER - Showing connected service banner (" + reason + ") - cannot hide banners");
+        create_banner_source();
         // Keep m_banner_visible = true for free users (banner source remains visible)
     }
 }

@@ -131,6 +131,47 @@ void update_all_overlay_urls_to_connected_server()
     log_to_obs("Auto-updated all overlay URLs to connected server: " + overlay_url);
 }
 
+// Function to update all existing banner URLs when connected to a new service
+void update_all_banner_urls_to_connected_server()
+{
+    std::string websocket_url = get_global_websocket_url();
+    if (websocket_url == "https://vortideck.com") {
+        return; // Not connected to a real service
+    }
+    
+    // Build the banner URL (identical logic to overlays)
+    std::string banner_url;
+    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
+        std::string base_url;
+        if (websocket_url.starts_with("ws://")) {
+            base_url = "http://" + websocket_url.substr(5);
+        } else {
+            base_url = "https://" + websocket_url.substr(6);
+        }
+        // Remove /ws path if present since that's WebSocket-only
+        if (base_url.ends_with("/ws")) {
+            base_url = base_url.substr(0, base_url.length() - 3);
+        }
+        // Ensure no double slashes
+        if (base_url.ends_with("/")) {
+            banner_url = base_url + "banners";
+        } else {
+            banner_url = base_url + "/banners";
+        }
+    } else {
+        banner_url = websocket_url + "/banners";
+    }
+    
+    // Update the banner_manager with the new URL
+    try {
+        auto& banner_mgr = get_global_banner_manager();
+        banner_mgr.set_banner_url(banner_url);
+        log_to_obs("Updated banner manager to use connected server: " + banner_url);
+    } catch (...) {
+        log_to_obs("Failed to update banner manager URL");
+    }
+}
+
 
 
 // Simple plugin interface for banner manager
@@ -946,6 +987,9 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
     
     // Auto-update all existing overlay URLs to use the connected server
     update_all_overlay_urls_to_connected_server();
+    
+    // Auto-update banner URL to use the connected server
+    update_all_banner_urls_to_connected_server();
 }
 
 
@@ -1258,10 +1302,6 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
         {
             action_banner_toggle(parameters);
         }
-        else if (action_id == actions::s_banner_set_data)
-        {
-            action_banner_set_data(parameters);
-        }
         // Overlay action handlers (no restrictions)
         else if (action_id == actions::s_overlay_set_data)
         {
@@ -1465,45 +1505,12 @@ void vorti::applets::obs_plugin::register_regular_actions()
     actions.push_back(register_action(actions::s_mic_unmute, "APPLET_OBS_MIC_UNMUTE"));
     actions.push_back(register_action(actions::s_mic_mute_toggle, "APPLET_OBS_MIC_MUTE_TOGGLE"));
 
-    // ADD THESE BANNER ACTIONS:
+    // ADD THESE BANNER ACTIONS (simplified - no data setting, banners always use connected service URL)
     if constexpr (BANNER_MANAGER_ENABLED) {
         actions.push_back(register_action(actions::s_banner_show, "APPLET_OBS_BANNER_SHOW"));
         actions.push_back(register_action(actions::s_banner_hide, "APPLET_OBS_BANNER_HIDE"));
         actions.push_back(register_action(actions::s_banner_toggle, "APPLET_OBS_BANNER_TOGGLE"));
-        
-        // Banner set data action with enhanced parameters (CSS, dimensions)
-        action_parameters banner_params;
-        nlohmann::json content_data_param = {
-            {"name", "content_data"},
-            {"displayName", "Content Data"},
-            {"description", "Image URL, Base64 data, or file path"}
-        };
-        nlohmann::json content_type_param = {
-            {"name", "content_type"},
-            {"displayName", "Content Type"},
-            {"description", "MIME type (image/png, image/jpeg, video/mp4, text, color, etc.)"}
-        };
-        nlohmann::json css_param = {
-            {"name", "css"},
-            {"displayName", "Custom CSS"},
-            {"description", "Optional custom CSS styling (overrides default styles)"}
-        };
-        nlohmann::json width_param = {
-            {"name", "width"},
-            {"displayName", "Width"},
-            {"description", "Optional custom width in pixels (default: 1920)"}
-        };
-        nlohmann::json height_param = {
-            {"name", "height"},
-            {"displayName", "Height"},
-            {"description", "Optional custom height in pixels (default: auto-sized by content type)"}
-        };
-        banner_params.push_back(content_data_param);
-        banner_params.push_back(content_type_param);
-        banner_params.push_back(css_param);
-        banner_params.push_back(width_param);
-        banner_params.push_back(height_param);
-        actions.push_back(register_action(actions::s_banner_set_data, "APPLET_OBS_BANNER_SET_DATA", banner_params));
+        // Removed APPLET_OBS_BANNER_SET_DATA - banners now use connected service URL + /banners like overlays
     }
     
     // Register overlay actions (always available, no restrictions)
@@ -2915,61 +2922,6 @@ void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parame
     }
 }
 
-void vorti::applets::obs_plugin::action_banner_set_data(const action_invoke_parameters &parameters)
-{
-    if constexpr (BANNER_MANAGER_ENABLED) {
-        auto content_data_it = parameters.find("content_data");
-        auto content_type_it = parameters.find("content_type");
-        
-        if (content_data_it != parameters.end() && content_type_it != parameters.end()) {
-            log_to_obs("ACTION_BANNER_SET_DATA: Setting banner content");
-            
-            // Extract optional CSS and size parameters
-            std::string custom_css = "";
-            auto css_it = parameters.find("css");
-            if (css_it != parameters.end()) {
-                custom_css = css_it->second;
-            }
-            
-            int custom_width = 0;
-            int custom_height = 0;
-            auto width_it = parameters.find("width");
-            auto height_it = parameters.find("height");
-            
-            if (width_it != parameters.end()) {
-                try {
-                    custom_width = std::stoi(width_it->second);
-                } catch (...) {
-                    custom_width = 0;
-                }
-            }
-            
-            if (height_it != parameters.end()) {
-                try {
-                    custom_height = std::stoi(height_it->second);
-                } catch (...) {
-                    custom_height = 0;
-                }
-            }
-            
-            // Set banner content with parameters
-            if (custom_css.empty() && custom_width == 0 && custom_height == 0) {
-                m_banner_manager.set_banner_content(content_data_it->second, content_type_it->second);
-            } else {
-                m_banner_manager.set_banner_content_with_custom_params(
-                    content_data_it->second, content_type_it->second, custom_css, 
-                    custom_width, custom_height, false);
-            }
-            
-            // Show banner
-            m_banner_manager.show_banner();
-            
-            log_to_obs("ACTION_BANNER_SET_DATA: Banner content set successfully");
-        } else {
-            log_to_obs("ACTION_BANNER_SET_DATA: ERROR - Missing required parameters (content_data and content_type)");
-        }
-    }
-}
 
 // ============================================================================
 // OVERLAY ACTION HANDLERS (NO RESTRICTIONS)
@@ -4071,10 +4023,18 @@ void vorti::applets::obs_plugin::handle_canvas_size_request(const nlohmann::json
 
 void vorti::applets::obs_plugin::handle_video_reset_signal(void *data, calldata_t *cd)
 {
-    log_to_obs("🎥 Video reset signal detected - sending canvas size update");
+    log_to_obs("🎥 Video reset signal detected - sending canvas size update and resizing banner");
     
     // Send canvas size update when video settings reset
     send_canvas_size_update();
+    
+    // Resize banner to match new canvas size
+    try {
+        auto& banner_mgr = get_global_banner_manager();
+        banner_mgr.resize_banner_to_canvas();
+    } catch (...) {
+        log_to_obs("Failed to resize banner to canvas - banner_manager not available");
+    }
 }
 
 void vorti::applets::obs_plugin::connect_video_reset_signals()

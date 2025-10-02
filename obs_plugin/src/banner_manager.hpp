@@ -35,9 +35,8 @@ namespace vorti {
             void show_banner(bool enable_duration_timer = false);
             void hide_banner();
             void toggle_banner();
-            void set_banner_content(std::string_view content_data, std::string_view content_type);
-            void set_banner_content_with_custom_params(std::string_view content_data, std::string_view content_type,
-                                                       std::string_view custom_css = "", int custom_width = 0, int custom_height = 0, bool css_locked = false);
+            void set_banner_url(const std::string& url);  // Simple URL-only method like overlays
+            void resize_banner_to_canvas();  // Resize banner to match current canvas size
             void show_premium_banner();  // PREMIUM USERS ONLY: Add banner to current scene by choice
             void make_banner_persistent();  // Make banner unhideable and persistent
             
@@ -109,10 +108,8 @@ namespace vorti {
             // Prevention-based banner enforcement (better than correction)
             void enforce_banner_lock_and_position();
             
-            // Internal operations
-                    void create_banner_source(std::string_view content_data, std::string_view content_type);
-        void create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
-                                                     std::string_view custom_css, int custom_width, int custom_height, bool css_locked = false);
+            // Internal operations (simplified - always uses connected service URL)
+            void create_banner_source(std::string_view content_data = "", std::string_view content_type = "");
             void add_banner_to_current_scene();
             void initialize_banners_all_scenes();  // Initialize banners across ALL scenes (for FREE USERS)
             void remove_banner_from_scenes();
