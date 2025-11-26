@@ -5,6 +5,7 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 #include <obs.h>
 #include <obs-source.h>
 // Note: signal_handler functions are included in obs.h
@@ -21,6 +22,12 @@ namespace vorti {
 
             // Shutdown method for explicit cleanup (call before destruction)
             void shutdown();
+
+            // Early shutdown flag (call FIRST in obs_module_unload to stop signal handlers immediately)
+            void set_shutting_down();
+
+            // Early signal disconnection (call in obs_module_unload before source teardown)
+            void disconnect_all_signals();
 
             // OBS Source Registration (new)
             static void register_vortideck_banner_source();
@@ -90,12 +97,17 @@ namespace vorti {
             void connect_scene_signals();
             void disconnect_scene_signals();
             void connect_source_signals();
-            void disconnect_source_signals(); 
+            void disconnect_source_signals();
+
+            // Global OBS signal handlers (prevents CEF crash - no scene signals)
+            static void on_global_source_remove(void* data, calldata_t* calldata);
+
+            // Old scene signal handlers (kept for reference but may cause CEF crash)
             static void on_item_add(void* data, calldata_t* calldata);
             static void on_item_remove(void* data, calldata_t* calldata);
             static void on_item_visible(void* data, calldata_t* calldata);
             static void on_item_transform(void* data, calldata_t* calldata);
-            
+
             // Source signal handlers (for banner source itself)
             static void on_source_hide(void* data, calldata_t* calldata);
             static void on_source_show(void* data, calldata_t* calldata);
@@ -114,6 +126,11 @@ namespace vorti {
             void initialize_banners_all_scenes();  // Initialize banners across ALL scenes (for FREE USERS)
             void remove_banner_from_scenes();
             void lock_banner_item(obs_sceneitem_t* item);
+
+            // Per-scene wrapper management (NEW - prevents CEF crashes)
+            obs_source_t* get_or_create_wrapper_for_scene(const std::string& scene_name);
+            void release_wrapper_for_scene(const std::string& scene_name);
+            void release_all_wrappers();
             
             // Content type detection and handling
             bool is_url(std::string_view content);
@@ -198,7 +215,8 @@ namespace vorti {
             };
             
             // State variables
-            obs_source_t* m_banner_source;
+            obs_source_t* m_banner_source;  // RESTORED: Single shared banner source across all scenes
+
             bool m_banner_visible;
             bool m_banner_persistent;  // True when banner should be unhideable
             bool m_persistence_monitor_active;  // Monitor jthread active flag (to be removed)
@@ -225,10 +243,14 @@ namespace vorti {
             // Initialization prevention
             std::atomic<bool> m_initialization_started{false};  // Flag to prevent multiple initialization calls
             std::atomic<bool> m_signals_connected{false};  // Flag to prevent multiple signal connections
-            
+
             // Add flag to temporarily disable signal handling during intentional operations
             std::atomic<bool> m_intentional_hide_in_progress{false};
-            
+            std::atomic<bool> m_cleanup_in_progress{false};  // Flag to prevent restoration during cleanup
+
+            // Polling thread for banner restoration (NO signals to prevent CEF crash)
+            std::jthread m_polling_thread;  // Managed thread that can be stopped/joined during shutdown
+
             // Timer-based banner enforcement
             std::atomic<bool> m_enforcement_timer_active{false};
             obs_weak_source_t* m_timer_source{nullptr};

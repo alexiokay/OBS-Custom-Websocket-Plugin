@@ -7,3 +7,6 @@
 [submodule "other/websocketpp"]
 	path = other/websocketpp
 	url = https://github.com/Logitech/logi_websocketpp
+[submodule "other/mdns_cpp"]
+	path = other/mdns_cpp
+	url = https://github.com/gocarlos/mdns_cpp.git

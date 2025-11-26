@@ -163,12 +163,14 @@ void update_all_banner_urls_to_connected_server()
     }
     
     // Update the banner_manager with the new URL
-    try {
-        auto& banner_mgr = get_global_banner_manager();
-        banner_mgr.set_banner_url(banner_url);
-        log_to_obs("Updated banner manager to use connected server: " + banner_url);
-    } catch (...) {
-        log_to_obs("Failed to update banner manager URL");
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        try {
+            auto& banner_mgr = get_global_banner_manager();
+            banner_mgr.set_banner_url(banner_url);
+            log_to_obs("Updated banner manager to use connected server: " + banner_url);
+        } catch (...) {
+            log_to_obs("Failed to update banner manager URL");
+        }
     }
 }
 
@@ -250,11 +252,15 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP)
     {
         m_collection_locked = true;
-        
-        // CRITICAL: Clean up banner sources before scene collection changes
-        // This prevents "sources could not be unloaded" errors
+
+        // CRITICAL: Don't clean up banner sources if we're shutting down - OBS will handle it
+        // This prevents banner restoration threads from spawning during shutdown
         if constexpr (BANNER_MANAGER_ENABLED) {
-            m_banner_manager.cleanup_for_scene_collection_change();
+            if (!m_shutting_down) {
+                m_banner_manager.cleanup_for_scene_collection_change();
+            } else {
+                blog(LOG_INFO, "[OBS Plugin] Skipping banner cleanup - shutdown in progress");
+            }
         }
     }
     else if (event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED
@@ -273,13 +279,13 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
                 // Use printf since log_to_obs is not available in this scope
                 printf("[OBS Plugin] Scene collection changed - re-initializing banners\n");
                 m_banner_manager.initialize_after_obs_ready();
-                
+
                 // SAFE: Enable signal connections after banners are stable
                 printf("[OBS Plugin] Enabling banner signal protection after scene collection change\n");
                 m_banner_manager.enable_signal_connections_when_safe();
             }
         }
-        
+
         // SAFE: Enable signal connections when scenes are first available
         if (event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED) {
             if constexpr (BANNER_MANAGER_ENABLED) {
@@ -317,12 +323,45 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     }
     else if (event == OBS_FRONTEND_EVENT_EXIT)
     {
+        blog(LOG_INFO, "[OBS Plugin] EXIT event received - performing shutdown");
         m_shutting_down = true;
-        stop_loop();
 
-        uninitialize_actions();
+        // CRITICAL: Set banner_manager shutdown flag IMMEDIATELY to stop signal handlers
+        // Sources are destroyed shortly after this event, before obs_module_unload()
+        if constexpr (BANNER_MANAGER_ENABLED) {
+            blog(LOG_INFO, "[OBS Plugin] Setting banner_manager shutdown flag in EXIT event");
+            m_banner_manager.set_shutting_down();
+        }
 
-        disconnect();
+        // CRITICAL: Stop websocket immediately to interrupt any pending connection attempts
+        // Only call stop() if websocket thread was started (which calls init_asio)
+        if (m_websocket_thread) {
+            try {
+                std::lock_guard<std::mutex> wl(m_lock);
+                m_websocket.stop();
+                blog(LOG_INFO, "[OBS Plugin] Websocket stopped");
+            } catch (const std::exception& e) {
+                blog(LOG_WARNING, "[OBS Plugin] Exception stopping websocket: %s", e.what());
+            } catch (...) {
+                blog(LOG_WARNING, "[OBS Plugin] Unknown exception stopping websocket");
+            }
+        }
+
+        // Notify any waiting condition variables to wake up and check shutdown flag
+        m_compressor_ready_cv.notify_all();
+
+        // CRITICAL: Stop mDNS discovery FIRST before it tries to reconnect
+        // The discovery thread can still be running and accessing plugin memory
+        stop_continuous_discovery();
+
+        // Shutdown banner manager
+        if constexpr (BANNER_MANAGER_ENABLED) {
+            blog(LOG_INFO, "[OBS Plugin] Shutting down banner manager");
+            m_banner_manager.shutdown();
+        }
+
+        // DON'T stop websocket loop or uninitialize - process will terminate naturally
+        blog(LOG_INFO, "[OBS Plugin] EXIT event complete");
     }
 }
 
@@ -350,15 +389,15 @@ void obs_module_post_load()
 
     // Register custom VortiDeck sources
     if constexpr (BANNER_MANAGER_ENABLED) {
-        register_banner_source();   // Banner source (menu integration)
+        register_banner_source();   // Banner source for free users
+    }
+    if constexpr (OVERLAY_ENABLED) {
         register_overlay_source();  // Overlay source
     }
 
-    // Initialize banner functionality
-    if constexpr (BANNER_MANAGER_ENABLED) {
+    // Initialize VortiDeck menu
+    if constexpr (VORTIDECK_MENU_ENABLED) {
         create_obs_menu();
-        
-        // Analytics tracking removed - simplified banner system
     }
 
     register_actions_broadcast();
@@ -369,42 +408,42 @@ void obs_module_post_load()
 void obs_module_unload()
 {
     // Called when the module is unloaded.
-    blog(LOG_INFO, "[OBS Plugin] OBS module unloading - setting shutdown flag");
-    
-    // Set shutdown flag FIRST to stop all threads immediately
+    // NOTE: Most cleanup already happened in OBS_FRONTEND_EVENT_EXIT
+    // Keep this minimal to avoid triggering OBS core audio crash bug
+    blog(LOG_INFO, "[OBS Plugin] OBS module unloading - minimal cleanup");
+
+    // CRITICAL: Set banner_manager shutdown flag FIRST before ANY cleanup
+    // This stops signal handlers immediately, even if they're already queued
+    if constexpr (BANNER_MANAGER_ENABLED) {
+        blog(LOG_INFO, "[OBS Plugin] Setting banner_manager shutdown flag IMMEDIATELY");
+        vorti::applets::obs_plugin::m_banner_manager.set_shutting_down();
+        blog(LOG_INFO, "[OBS Plugin] Disconnecting banner_manager signals");
+        vorti::applets::obs_plugin::m_banner_manager.disconnect_all_signals();
+    }
+
+    // Just set flag - everything else already cleaned up in EXIT event
     {
         std::lock_guard<std::mutex> wl(vorti::applets::obs_plugin::m_lock);
         vorti::applets::obs_plugin::m_shutting_down = true;
     }
-    
-    // Stop continuous mDNS discovery
-    vorti::applets::obs_plugin::stop_continuous_discovery();
-    
-    // Notify all waiting threads to wake up and check shutdown flag
-    vorti::applets::obs_plugin::m_compressor_ready_cv.notify_all();
-    vorti::applets::obs_plugin::m_initialization_cv.notify_all();
 
-    vorti::applets::obs_plugin::uninitialize_actions();
+    // CRITICAL: Immediately detach threads - DO NOT SLEEP during shutdown
+    // Sleeping blocks OBS shutdown and causes WASAPI/CEF crashes as they're torn down
+    // Threads have m_shutting_down flag set and will exit gracefully on their own
 
-    obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
-    obs_frontend_remove_save_callback(handle_obs_frontend_save, nullptr);
-    
-    // Disconnect video reset signals
-    disconnect_video_reset_signals();
-
-    // Cleanup banner functionality FIRST (before disconnecting)
-    if constexpr (BANNER_MANAGER_ENABLED) {
-        blog(LOG_INFO, "[OBS Plugin] Cleaning up banner manager...");
-        // Call explicit cleanup method to stop all threads
-        m_banner_manager.shutdown();
-        
-        // Unregister custom VortiDeck Banner source
-        // vorti::applets::banner_manager::unregister_vortideck_banner_source(); // REMOVED - Banner handled internally
-        blog(LOG_INFO, "[OBS Plugin] Banner manager cleanup complete");
+    // Detach websocket thread immediately
+    if (vorti::applets::obs_plugin::m_websocket_thread &&
+        vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
+        blog(LOG_INFO, "[OBS Plugin] Detaching websocket thread (will exit via shutdown flag)");
+        vorti::applets::obs_plugin::m_websocket_thread->detach();
     }
 
-    vorti::applets::obs_plugin::disconnect();
-    
+    // Detach mDNS discovery thread immediately
+    if (vorti::applets::obs_plugin::m_continuous_discovery_thread.joinable()) {
+        blog(LOG_INFO, "[OBS Plugin] Detaching mDNS discovery thread (will exit via shutdown flag)");
+        vorti::applets::obs_plugin::m_continuous_discovery_thread.detach();
+    }
+
     blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
 }
 
@@ -457,19 +496,38 @@ bool vorti::applets::obs_plugin::connect()
         }
     }
 
-    // Wait for connection with timeout
+    // Wait for connection with timeout, checking shutdown flag periodically
     {
         std::unique_lock<std::mutex> lk(m_compressor_ready_mutex);
-        if (m_compressor_ready_cv.wait_until(lk, std::chrono::system_clock::now() + std::chrono::seconds(3)) == std::cv_status::timeout) {
-            log_to_obs("Connection timeout - will retry later");
-            disconnect();  // Clean up current attempt, but don't set m_shutting_down
-            return false;  // This will trigger reconnection logic in _run_forever
+        auto start_time = std::chrono::system_clock::now();
+        while (!m_websocket_open && !m_shutting_down) {
+            // Wait for 100ms at a time to check shutdown flag frequently
+            if (m_compressor_ready_cv.wait_for(lk, std::chrono::milliseconds(100)) == std::cv_status::timeout) {
+                // Check if total timeout exceeded
+                if (std::chrono::system_clock::now() - start_time > std::chrono::seconds(3)) {
+                    log_to_obs("Connection timeout - will retry later");
+                    disconnect();  // Clean up current attempt, but don't set m_shutting_down
+                    return false;  // This will trigger reconnection logic in _run_forever
+                }
+            }
+        }
+
+        // If we exited because of shutdown, don't proceed
+        if (m_shutting_down) {
+            log_to_obs("Connection wait interrupted by shutdown");
+            return false;
         }
     }
 
     // Start initialization sequence
     log_to_obs("Connection established, starting initialization sequence...");
-    
+
+    // CRITICAL: Check shutdown flag again before initializing
+    if (m_shutting_down) {
+        log_to_obs("Aborting initialization - shutdown in progress");
+        return false;
+    }
+
     // Reset failure counter on successful connection
     m_connection_failure_count = 0;
 
@@ -586,10 +644,22 @@ void vorti::applets::obs_plugin::disconnect()
     {
         try {
             log_to_obs("Disconnect: Stopping websocket");
-            
+
+            // CRITICAL: During shutdown, don't block - just detach and exit fast
+            if (m_shutting_down) {
+                log_to_obs("Disconnect: Shutdown in progress - detaching websocket thread");
+                if (m_websocket_thread->joinable()) {
+                    m_websocket_thread->request_stop();
+                    m_websocket_thread->detach();
+                }
+                m_websocket_thread.reset();
+                log_to_obs("Disconnect: Fast shutdown complete");
+                return;  // Exit immediately, don't block
+            }
+
             // Stop the websocket gracefully
             m_websocket.stop();
-            
+
             // Wait for jthread to finish with timeout to prevent hanging
             if (m_websocket_thread->joinable())
             {
@@ -709,10 +779,12 @@ void vorti::applets::obs_plugin::_run_forever()
             }
             
             log_to_obs("Connection lost - attempting to reconnect in 1 second");
-            
-            // Reset for next attempt
-            m_websocket.reset();
-            
+
+            // Reset for next attempt (skip if shutting down to avoid blocking)
+            if (!m_shutting_down) {
+                m_websocket.reset();
+            }
+
             // Small delay before next attempt - interruptible
             for (int i = 0; i < 10 && !m_shutting_down; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -727,8 +799,12 @@ void vorti::applets::obs_plugin::_run_forever()
                 std::lock_guard<std::mutex> wl(m_lock);
                 m_websocket_open = false;
             }
-            m_websocket.reset();
-            
+
+            // Reset websocket (skip if shutting down to avoid blocking)
+            if (!m_shutting_down) {
+                m_websocket.reset();
+            }
+
             // Interruptible sleep - check shutdown every 100ms
             for (int i = 0; i < 10 && !m_shutting_down; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -740,8 +816,13 @@ void vorti::applets::obs_plugin::_run_forever()
 
 ws_client::connection_ptr vorti::applets::obs_plugin::_create_connection()
 {
+    // CRITICAL: Check shutdown flag immediately
+    if (m_shutting_down) {
+        return nullptr;
+    }
+
     websocketpp::lib::error_code error_code;
-    
+
     // Get the connection URL from mDNS discovery or fallback
     std::string connection_url = get_connection_url();
     log_to_obs(std::format("Connecting to: {}", connection_url).c_str());
@@ -996,6 +1077,11 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
 void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::connection_hdl &connection_handle,
                                                           const ws_client::message_ptr &response)
 {
+    // CRITICAL: Check shutdown flag immediately to prevent processing messages after module unload
+    if (m_shutting_down) {
+        return;
+    }
+
     /* Received a message, handle it */
     std::string payload = response->get_payload();
     log_to_obs("Received payload: " + payload);
@@ -2724,6 +2810,11 @@ void vorti::applets::obs_plugin::loop_function()
 
     while (true)
     {
+        // CRITICAL: Check shutdown flag first to exit immediately if shutting down
+        if (m_shutting_down) {
+            break;
+        }
+
         bool is_loop_running = false;
         long update_interval = 0;
 
@@ -2743,6 +2834,11 @@ void vorti::applets::obs_plugin::loop_function()
         }
 
         std::lock_guard<std::mutex> wlock(m_thread_lock);
+
+        // CRITICAL: Check shutdown flag again before calling obs_frontend functions
+        if (m_shutting_down) {
+            break;
+        }
 
         // clang-format off
         // Gather obs data here...
@@ -3224,13 +3320,19 @@ void vorti::applets::obs_plugin::stop_continuous_discovery()
 {
     log_to_obs("Stopping continuous mDNS discovery");
     m_continuous_discovery_enabled = false;
-    
-    if (m_continuous_discovery_thread.joinable()) {
-        m_continuous_discovery_thread.join();
-    }
-    
+
+    // CRITICAL: Stop mDNS discovery first to interrupt any ongoing discovery
     if (m_mdns_discovery) {
         m_mdns_discovery->stop_discovery();
+    }
+
+    // Request thread stop - it will check m_shutting_down and exit
+    if (m_continuous_discovery_thread.joinable()) {
+        m_continuous_discovery_thread.request_stop();
+
+        // DON'T join or detach - just let it exit when it checks flags
+        // The process will terminate soon anyway
+        log_to_obs("Requested mDNS discovery thread to stop");
     }
 }
 

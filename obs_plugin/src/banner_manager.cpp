@@ -96,62 +96,112 @@ banner_manager::banner_manager()
 
 banner_manager::~banner_manager()
 {
-    log_message("Banner manager shutting down...");
-    
+    log_message("Banner manager destructor called...");
+
+    // Set shutdown flag
+    m_shutting_down = true;
+
+    // CRITICAL: Stop polling thread FIRST before any cleanup
+    if (m_polling_thread.joinable()) {
+        log_message("DESTRUCTOR: Requesting polling thread to stop...");
+        m_polling_thread.request_stop();
+        // jthread will automatically join on destruction
+    }
+
     // Clean up signal handlers and monitoring
     disconnect_scene_signals();
     disconnect_source_signals();
     stop_persistence_monitor();
-    
-    // Clean up OBS sources
+
+    // Release single shared banner source
     if (m_banner_source) {
         obs_source_release(m_banner_source);
         m_banner_source = nullptr;
     }
-    
-    log_message("Banner manager destroyed");
+
+    log_message("Banner manager destroyed - polling thread automatically joined");
+}
+
+void banner_manager::set_shutting_down()
+{
+    log_message("SHUTDOWN FLAG SET - All signal handlers will now abort immediately");
+    m_shutting_down = true;
+}
+
+void banner_manager::disconnect_all_signals()
+{
+    log_message("Disconnecting ALL banner_manager signals (called from obs_module_unload)");
+    disconnect_scene_signals();
+    disconnect_source_signals();
+    log_message("All signals disconnected successfully");
 }
 
 void banner_manager::shutdown()
 {
     log_message("Banner manager shutdown requested...");
-    
-    // Set shutdown flags to prevent new operations
+
+    // CRITICAL: Set shutdown flag FIRST
     m_shutting_down = true;
-    
-    // Clean up signal handlers and monitoring
-    disconnect_scene_signals();
-    disconnect_source_signals();
-    stop_persistence_monitor();
-    
-    log_message("Banner manager shutdown complete");
+
+    // CRITICAL: Stop polling thread BEFORE any OBS API cleanup
+    // This prevents race condition where thread calls OBS API during CEF shutdown
+    if (m_polling_thread.joinable()) {
+        log_message("SHUTDOWN: Stopping polling thread...");
+        m_polling_thread.request_stop();  // Signal thread to stop
+
+        // jthread will automatically join on destruction
+        // The thread should exit quickly due to stop_token.stop_requested() check
+        log_message("SHUTDOWN: Polling thread stop requested - will auto-join on destruction");
+    } else {
+        log_message("SHUTDOWN: No polling thread to stop");
+    }
+
+    // DO NOT manually destroy banner source - let OBS handle it during obs_shutdown()
+    // Manually destroying causes OBS to hang and browser processes to remain
+    // The polling thread being stopped is sufficient to prevent crashes
+    log_message("SHUTDOWN: Leaving banner source for OBS to clean up naturally");
+
+    stop_persistence_monitor();  // Stop any persistence monitoring
+
+    log_message("Banner manager shutdown complete - polling thread stopped, OBS can proceed with cleanup");
 }
 
 void banner_manager::initialize_after_obs_ready()
 {
     log_message("INITIALIZATION: Starting banner initialization process...");
-    
-    // CRITICAL: Prevent multiple initialization calls
-    if (m_initialization_started.load()) {
-        log_message("INITIALIZATION: Already started - ignoring duplicate call");
+
+    // CRITICAL: Check shutdown flag FIRST - don't initialize during shutdown
+    if (m_shutting_down.load()) {
+        log_message("INITIALIZATION: Shutdown in progress - aborting initialization");
         return;
     }
-    
+
     // Safety check - ensure OBS is fully initialized
     if (!obs_frontend_get_current_scene()) {
         log_message("INITIALIZATION: OBS not fully initialized yet - delaying banner initialization");
-        
+
         // Try again after a short delay
         std::jthread([this]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+            // CRITICAL: Check shutdown flag before retrying initialization
+            if (m_shutting_down.load()) {
+                log_message("INITIALIZATION: Shutdown detected, aborting delayed initialization");
+                return;
+            }
+
             initialize_after_obs_ready();
         }).detach();
         return;
     }
-    
+
     log_message("INITIALIZATION: OBS is ready, proceeding with banner initialization");
-    
-    // Set flag to prevent multiple calls
+
+    // Clear cleanup flag to allow banner operations
+    m_cleanup_in_progress.store(false);
+    log_message("INITIALIZATION: Cleanup flag cleared - banner operations enabled");
+
+    // Set flag to prevent duplicate calls during this initialization
     m_initialization_started.store(true);
     
     log_message("INITIALIZATION: User type: " + PremiumStatusHandler::get_user_type_string(this));
@@ -159,22 +209,15 @@ void banner_manager::initialize_after_obs_ready()
     if (!PremiumStatusHandler::is_premium(this)) {
         // FREE USERS: Initialize banners after OBS is fully loaded
         log_message("INITIALIZATION: FREE USER - Starting automatic banner initialization");
-        
-        // Create banner using connected service URL like overlays
-        log_message("INITIALIZATION: Creating banner with connected service URL");
+
+        // Create single shared banner source
+        log_message("INITIALIZATION: Creating single shared banner source");
         create_banner_source();
-        
-        // Verify banner source was created
-        if (m_banner_source) {
-            log_message("INITIALIZATION: Banner source created successfully");
-        } else {
-            log_message("INITIALIZATION: ERROR - Banner source creation failed!");
-        }
-        
+
         // Force show banners across ALL scenes for FREE USERS
         log_message("INITIALIZATION: Forcing banner display across all scenes");
         show_banner();
-        
+
         log_message("INITIALIZATION: FREE USER - Automatic banner initialization complete");
     } else {
         // PREMIUM USERS: Just log that they have freedom
@@ -186,26 +229,79 @@ void banner_manager::initialize_after_obs_ready()
         log_message("INITIALIZATION: Enabling signal-based banner protection for free users");
         enable_signal_connections_when_safe();
     }
-    
+
     log_message("INITIALIZATION: Banner initialization process completed");
 }
 
 void banner_manager::enable_signal_connections_when_safe()
 {
+    // NEW ARCHITECTURE: Banner sources are self-managing for visibility/position
+    // Banner_manager ONLY handles restoration when banners are removed (for free users)
+
     // CRITICAL: Prevent multiple signal connections
     if (m_signals_connected.load()) {
         log_message("Signal connections already established - ignoring duplicate call");
         return;
     }
-    
-    // STEP 1: Re-enable signal connections with minimal handlers
-    if (!PremiumStatusHandler::is_premium(this)) {
-        log_message("STEP 1: Enabling signal connections with minimal handlers");
-        connect_scene_signals();
-        m_signals_connected.store(true);
-    } else {
-        PremiumStatusHandler::log_premium_action(this, "signal connections", "not needed - complete banner freedom");
+
+    // Only connect for free users (premium users can remove banners freely)
+    if (PremiumStatusHandler::is_premium(this)) {
+        log_message("SIGNAL CONNECTIONS: Premium user - skipping (no enforcement needed)");
+        return;
     }
+
+    log_message("SIGNAL CONNECTIONS: NO SIGNALS - Using polling timer instead (prevents CEF crash)");
+
+    // DO NOT connect ANY signals - they ALL cause CEF shutdown crashes
+    // Scene signals, global signals, source signals - ALL cause the same CEF crash
+    // The only solution is polling-based monitoring with a timer
+
+    // Start polling timer to check banner existence every 3 seconds
+    // CRITICAL: Store thread (don't detach) so we can join it during shutdown
+    m_polling_thread = std::jthread([this](std::stop_token stop_token) {
+        log_message("POLLING: Banner restoration timer started (checks every 3 seconds)");
+
+        while (!stop_token.stop_requested() && !m_shutting_down.load()) {
+            // Use interruptible sleep - wakes up immediately on stop request
+            if (std::this_thread::sleep_for(std::chrono::seconds(3)), stop_token.stop_requested()) {
+                break;
+            }
+
+            // Double-check shutdown flags after sleep
+            if (m_shutting_down.load() || stop_token.stop_requested()) break;
+
+            // Check if banner source exists
+            if (!m_banner_source) {
+                log_message("POLLING: Banner source NULL - recreating");
+                create_banner_source();
+                initialize_banners_all_scenes();
+                continue;
+            }
+
+            // Check if banner is in current scene
+            obs_source_t* current_scene_source = obs_frontend_get_current_scene();
+            if (current_scene_source) {
+                obs_scene_t* scene = obs_scene_from_source(current_scene_source);
+                if (scene) {
+                    obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
+                    if (!item) {
+                        log_message("POLLING: Banner missing from current scene - re-adding");
+                        obs_sceneitem_t* new_item = obs_scene_add(scene, m_banner_source);
+                        if (new_item) {
+                            obs_sceneitem_set_visible(new_item, true);
+                            obs_sceneitem_set_locked(new_item, true);
+                            obs_sceneitem_set_order(new_item, OBS_ORDER_MOVE_TOP);
+                        }
+                    }
+                }
+                obs_source_release(current_scene_source);
+            }
+        }
+        log_message("POLLING: Banner restoration timer stopped (shutdown/stop requested)");
+    });
+
+    m_signals_connected.store(true);
+    log_message("SIGNAL CONNECTIONS: Polling timer started - NO signal connections = NO CEF crash");
 }
 
 void banner_manager::connect_scene_signals()
@@ -360,61 +456,109 @@ void banner_manager::on_item_add(void* data, calldata_t* calldata)
     }
 }
 
+// NEW: Global signal handler for source removal (prevents CEF crash)
+void banner_manager::on_global_source_remove(void* data, calldata_t* calldata)
+{
+    if (!data || !calldata) return;
+
+    banner_manager* manager = static_cast<banner_manager*>(data);
+    if (!manager) return;
+
+    // CRITICAL: Check shutdown flags FIRST
+    if (manager->m_shutting_down.load() || manager->m_cleanup_in_progress.load()) {
+        return;
+    }
+
+    // Get the removed source
+    obs_source_t* removed_source = (obs_source_t*)calldata_ptr(calldata, "source");
+    if (!removed_source) return;
+
+    const char* source_name = obs_source_get_name(removed_source);
+    if (!source_name) return;
+
+    // Check if this is our banner source being removed
+    if (std::string(source_name) == manager->m_banner_source_name) {
+        manager->log_message("GLOBAL SIGNAL: Banner source removed - Name: " + std::string(source_name));
+
+        if (!PremiumStatusHandler::is_premium(manager)) {
+            manager->log_message("GLOBAL SIGNAL: FREE USER - Recreating banner source immediately");
+
+            // Recreate the banner source
+            manager->create_banner_source();
+
+            // Re-add to all scenes
+            manager->initialize_banners_all_scenes();
+        }
+    }
+}
+
 void banner_manager::on_item_remove(void* data, calldata_t* calldata)
 {
     if (!data || !calldata) return;
-    
+
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
-    // CRITICAL: Skip if intentional hide is in progress
-    if (manager->m_intentional_hide_in_progress.load()) {
-        return;  // Don't interfere with intentional hide operations
+
+    // CRITICAL: Check ALL abort conditions FIRST, before touching ANY OBS API
+    // This prevents signal handlers from running during shutdown/cleanup
+    if (manager->m_shutting_down.load()) {
+        return;  // Shutdown in progress - abort immediately
     }
-    
+
+    if (manager->m_cleanup_in_progress.load()) {
+        return;  // Cleanup in progress - abort immediately
+    }
+
+    if (manager->m_intentional_hide_in_progress.load()) {
+        return;  // Intentional hide in progress - abort immediately
+    }
+
     try {
         obs_sceneitem_t* item = (obs_sceneitem_t*)calldata_ptr(calldata, "item");
         if (!item) return;
-    
+
         obs_source_t* source = obs_sceneitem_get_source(item);
         if (!source) return;
-    
+
         const char* name = obs_source_get_name(source);
         if (!name) return;
-        
+
         // Check if this is our ADS being removed (metadata-based detection)
         if (manager->is_vortideck_ads_item(item)) {
-            manager->log_message("SIGNAL: Banner removal detected - Name: " + std::string(name) + 
+            manager->log_message("SIGNAL: Banner removal detected - Name: " + std::string(name) +
                                ", User: " + PremiumStatusHandler::get_user_type_string(manager));
-            
+
+            // SYNCHRONOUS restoration - no delayed threads, happens immediately
+            // This prevents CEF shutdown crashes by avoiding late banner creation
+
             if (!PremiumStatusHandler::is_premium(manager)) {
-                manager->log_message("SIGNAL: FREE USER - Starting banner restoration");
-                
-                std::jthread([manager]() {
-                    manager->log_message("SIGNAL: Restoration jthread started");
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    
-                    // Check again if intentional hide is still in progress
-                    if (!manager->m_intentional_hide_in_progress.load()) {
-                        manager->log_message("SIGNAL: Calling enforce_banner_visibility");
-                        manager->enforce_banner_visibility();
-                        
-                        // Also trigger cleanup for free users after restoration
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                        manager->cleanup_banner_names_after_deletion();
-                    } else {
-                        manager->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
-                    }
-                    
-                    manager->log_message("SIGNAL: Restoration jthread completed");
-                }).detach();
+                manager->log_message("SIGNAL: FREE USER - Banner restoration SYNCHRONOUS (immediate)");
+
+                // All critical checks already done at top of function
+                // Safe to proceed with restoration
+
+                // Check if intentional hide is in progress
+                if (!manager->m_intentional_hide_in_progress.load()) {
+                    manager->log_message("SIGNAL: Calling enforce_banner_visibility SYNCHRONOUSLY");
+                    manager->enforce_banner_visibility();
+                    manager->cleanup_banner_names_after_deletion();
+                } else {
+                    manager->log_message("SIGNAL: Skipping restoration - intentional hide in progress");
+                }
             } else {
                 // PREMIUM USER: Trigger cleanup after banner deletion
                 PremiumStatusHandler::log_premium_action(manager, "banner deletion", "triggering cleanup");
-                
+
                 // Trigger cleanup in a jthread to avoid blocking the signal
                 std::jthread([manager]() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+                    // CRITICAL: Check shutdown flag before touching OBS API
+                    if (manager->m_shutting_down.load()) {
+                        manager->log_message("SIGNAL: Shutdown detected, aborting cleanup");
+                        return;
+                    }
+
                     manager->cleanup_banner_names_after_deletion();
                 }).detach();
             }
@@ -428,15 +572,23 @@ void banner_manager::on_item_remove(void* data, calldata_t* calldata)
 void banner_manager::on_item_visible(void* data, calldata_t* calldata)
 {
     if (!data || !calldata) return;
-    
+
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
-    // CRITICAL: Skip if intentional hide is in progress
-    if (manager->m_intentional_hide_in_progress.load()) {
-        return;  // Don't interfere with intentional hide operations
+
+    // CRITICAL: Check ALL abort conditions FIRST, before touching ANY OBS API
+    if (manager->m_shutting_down.load()) {
+        return;  // Shutdown in progress - abort immediately
     }
-    
+
+    if (manager->m_cleanup_in_progress.load()) {
+        return;  // Cleanup in progress - abort immediately
+    }
+
+    if (manager->m_intentional_hide_in_progress.load()) {
+        return;  // Intentional hide in progress - abort immediately
+    }
+
     try {
         obs_sceneitem_t* item = (obs_sceneitem_t*)calldata_ptr(calldata, "item");
         if (!item) return;
@@ -460,14 +612,24 @@ void banner_manager::on_item_visible(void* data, calldata_t* calldata)
             }
             
             if (!is_premium && !visible) {
+                // DISABLED: Automatic visibility restoration causes CEF shutdown issues
+                manager->log_message("SIGNAL: FREE USER - Visibility restoration DISABLED to prevent CEF crashes");
+                return;
+
                 manager->log_message("SIGNAL: FREE USER - Immediate banner restoration (jthread-based)");
-                
+
                 // jthread-based restoration for free users - more reliable than direct call
                 std::jthread([manager, item, name]() {
                     try {
                         // Small delay to ensure the visibility change is complete
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        
+
+                        // CRITICAL: Check shutdown flag before touching OBS API
+                        if (manager->m_shutting_down.load()) {
+                            manager->log_message("SIGNAL: Shutdown detected, aborting visibility restoration");
+                            return;
+                        }
+
                         // Check again if intentional hide is still in progress
                         if (!manager->m_intentional_hide_in_progress.load()) {
                             obs_sceneitem_set_visible(item, true);
@@ -489,9 +651,18 @@ void banner_manager::on_item_transform(void* data, calldata_t* calldata)
 {
     // STEP 5: FIXED - Prevent infinite loop with correction flag
     if (!data || !calldata) return;
-    
+
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
+
+    // CRITICAL: Check ALL abort conditions FIRST, before touching ANY OBS API
+    if (manager->m_shutting_down.load()) {
+        return;  // Shutdown in progress - abort immediately
+    }
+
+    if (manager->m_cleanup_in_progress.load()) {
+        return;  // Cleanup in progress - abort immediately
+    }
     
     // CRITICAL: Skip if we're currently correcting position (prevents infinite loop)
     if (manager->m_correcting_position.load()) {
@@ -599,14 +770,20 @@ void banner_manager::enforce_banner_lock_and_position()
 void banner_manager::on_source_hide(void* data, calldata_t* calldata)
 {
     if (!data) return;
-    
+
     banner_manager* manager = static_cast<banner_manager*>(data);
     if (!manager) return;
-    
+
     try {
+        // CRITICAL: Check shutdown FIRST - don't process signals during shutdown
+        if (manager->m_shutting_down.load()) {
+            manager->log_message("SOURCE SIGNAL: Ignoring hide signal during shutdown");
+            return;
+        }
+
         manager->m_source_visible.store(false);
         manager->log_message("SOURCE SIGNAL: Banner source hidden");
-        
+
         // For free users, immediately enforce visibility
         if (!manager->m_is_premium.load() && !manager->m_intentional_hide_in_progress.load()) {
             manager->log_message("FREE USER: Banner hidden via source - enforcing visibility");
@@ -693,20 +870,26 @@ void banner_manager::on_scene_reorder(void* data, calldata_t* calldata)
             // Defer the correction by 100ms to let the reorder operation complete
             std::thread([manager, scene]() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                
+
+                // CRITICAL: Check shutdown flag before touching OBS API
+                if (manager->m_shutting_down.load()) {
+                    manager->log_message("REORDER: Shutdown detected, aborting reorder correction");
+                    return;
+                }
+
                 obs_sceneitem_t* banner_item = manager->find_vortideck_ads_in_scene(scene);
                 if (banner_item) {
                     manager->m_correcting_position.store(true);
-                    
+
                     // Log current position before correction
                     obs_source_t* scene_source = obs_scene_get_source(scene);
                     const char* scene_name = obs_source_get_name(scene_source);
                     manager->log_message("REORDER: Banner found in scene: " + std::string(scene_name ? scene_name : "unknown"));
-                    
+
                     // Try different reorder approaches
                     obs_sceneitem_set_order(banner_item, OBS_ORDER_MOVE_TOP);
                     manager->log_message("REORDER: OBS_ORDER_MOVE_TOP called");
-                    
+
                     // Check if banner is actually at the top now by enumerating scene items
                     bool banner_is_first = false;
                     obs_scene_enum_items(scene, [](obs_scene_t* scene, obs_sceneitem_t* item, void* param) {
@@ -718,9 +901,9 @@ void banner_manager::on_scene_reorder(void* data, calldata_t* calldata)
                         }
                         return false; // Stop after first item (which should be at top)
                     }, &banner_is_first);
-                    
+
                     manager->log_message("REORDER: Banner is now at top: " + std::string(banner_is_first ? "YES" : "NO"));
-                    
+
                     manager->m_correcting_position.store(false);
                 }
             }).detach();
@@ -733,90 +916,68 @@ void banner_manager::on_scene_reorder(void* data, calldata_t* calldata)
 
 void banner_manager::connect_source_signals()
 {
-    if (!m_banner_source) return;
-    
-    signal_handler_t* handler = obs_source_get_signal_handler(m_banner_source);
-    if (!handler) return;
-    
-    // Connect visibility signals
-    signal_handler_connect(handler, "hide", on_source_hide, this);
-    signal_handler_connect(handler, "show", on_source_show, this);
-    signal_handler_connect(handler, "deactivate", on_source_deactivate, this);
-    signal_handler_connect(handler, "activate", on_source_activate, this);
-    
-    // Set initial visibility state
-    m_source_visible.store(obs_source_showing(m_banner_source));
-    
-    log_message("Connected source visibility signals for banner");
+    // NOTE: With per-scene wrappers, we don't need per-source signal monitoring
+    // Each wrapper manages its own signals internally
+    log_message("SOURCE SIGNALS: Not needed with per-scene wrapper architecture");
 }
 
 void banner_manager::disconnect_source_signals()
 {
-    if (!m_banner_source) return;
-    
-    signal_handler_t* handler = obs_source_get_signal_handler(m_banner_source);
-    if (!handler) return;
-    
-    // Disconnect visibility signals
-    signal_handler_disconnect(handler, "hide", on_source_hide, this);
-    signal_handler_disconnect(handler, "show", on_source_show, this);
-    signal_handler_disconnect(handler, "deactivate", on_source_deactivate, this);
-    signal_handler_disconnect(handler, "activate", on_source_activate, this);
-    
-    log_message("Disconnected source visibility signals for banner");
+    // NOTE: With per-scene wrappers, we don't need per-source signal monitoring
+    // Each wrapper manages its own signals internally
+    log_message("SOURCE SIGNALS: Not needed with per-scene wrapper architecture");
 }
 
 void banner_manager::cleanup_for_scene_collection_change()
 {
     log_message("Scene collection changing - cleaning up banner sources");
-    
-    // Stop monitoring to prevent interference
+
+    // CRITICAL: Set cleanup flag to prevent signal handlers during source destruction
+    // Per web research: signal_handler_disconnect() doesn't prevent already-queued signals
+    // So we MUST use flags to abort signal handlers
+    m_cleanup_in_progress.store(true);
+    log_message("CLEANUP: Cleanup flag set - signal handlers will abort during source destruction");
+
+    // Stop monitoring
     stop_persistence_monitor();
-    
-    // Remove banner from all scenes
-    remove_banner_from_scenes();
-    
-    // Release banner source to prevent "sources could not be unloaded" error
-    if (m_banner_source) {
-        obs_source_release(m_banner_source);
-        m_banner_source = nullptr;
-    }
-    
-    // Clear content so it can be recreated after scene collection change
+
+    // Disconnect signals (queued signals will still fire but cleanup flag will stop them)
+    disconnect_scene_signals();
+    disconnect_source_signals();
+
+    // CRITICAL: Do NOT remove ANY sources manually - this triggers item_remove signals
+    // Even with signals disconnected, queued signals fire after disconnect returns
+    // Let OBS handle all source destruction naturally
+    log_message("CLEANUP: NOT removing banners manually - OBS will handle destruction");
+
+    // Clear visibility
     m_banner_visible = false;
-    
-    log_message("Banner sources cleaned up for scene collection change");
+
+    // Cleanup flag will be cleared by initialize_after_obs_ready() when collection loads
+    // If OBS is shutting down, initialize will never be called and flag stays set
+    log_message("CLEANUP: Banner cleanup complete - waiting for collection load or shutdown");
 }
 
 void banner_manager::show_banner(bool enable_duration_timer)
 {
+    // CRITICAL: Check shutdown flag FIRST before touching OBS API
+    if (m_shutting_down.load()) {
+        log_message("SHOW_BANNER: Shutdown detected, aborting banner display");
+        return;
+    }
+
     log_message("SHOW_BANNER: Starting banner display process...");
-    
+
     log_message("SHOW_BANNER: User type: " + PremiumStatusHandler::get_user_type_string(this));
-    
+
     // AD FREQUENCY LIMITS REMOVED - handled by external application
     // Premium users can show banners anytime, free users controlled externally
-    
+
     // Window management removed - handled by external application
-    
-    if (!m_banner_source) {
-        log_message("SHOW_BANNER: No banner source exists, creating one...");
-        
-        // Always use connected service URL like overlays (no more content types)
-        log_message("SHOW_BANNER: Creating banner with connected service URL");
-        create_banner_source();
-        
-        // Verify banner source creation
-        if (m_banner_source) {
-            log_message("SHOW_BANNER: Banner source created successfully");
-        } else {
-            log_message("SHOW_BANNER: ERROR - Failed to create banner source!");
-            return;
-        }
-    } else {
-        log_message("SHOW_BANNER: Using existing banner source");
-    }
-    
+
+    // NOTE: No need to check m_banner_source - wrappers are created on-demand per-scene
+    log_message("SHOW_BANNER: Per-scene wrappers will be created on-demand");
+
     if (!PremiumStatusHandler::is_premium(this)) {
         // FREE USERS: FORCED banner initialization across ALL scenes
         PremiumStatusHandler::log_premium_action(this, "banner display", "forcing across all scenes");
@@ -828,20 +989,17 @@ void banner_manager::show_banner(bool enable_duration_timer)
         
         // For free users, signals will handle visibility monitoring
         log_message("SHOW_BANNER: FREE USER - Using signal-based protection (no polling)");
-        
-        // Ensure source signals are connected
-        if (m_banner_source) {
-            connect_source_signals();
-        }
-        
+
+        // NOTE: Source signals not needed with per-scene wrappers
+
         // FORCE immediate enforcement for FREE USERS
         log_message("SHOW_BANNER: FREE USER - Enforcing banner visibility");
         enforce_banner_visibility();
-        
+
         // CRITICAL: Also enforce banner lock and position
         log_message("SHOW_BANNER: FREE USER - Enforcing banner lock and position");
         enforce_banner_lock_and_position();
-        
+
         // Duration control removed - handled by external application
         log_message("SHOW_BANNER: FREE USER - Duration managed externally");
     } else {
@@ -850,9 +1008,9 @@ void banner_manager::show_banner(bool enable_duration_timer)
         log_message("SHOW_BANNER: PREMIUM USER - Use WebSocket API to add banners if desired");
         // NO automatic banner creation for premium users
         // They have complete choice whether to have banners or not
-        
+
         // Duration control removed - handled by external application
-        if (m_banner_source && m_banner_visible) {
+        if (m_banner_visible) {
             log_message("SHOW_BANNER: PREMIUM USER - Duration managed externally");
         }
     }
@@ -876,40 +1034,10 @@ void banner_manager::hide_banner()
         // Allow VERY temporary hiding but schedule auto-restore for free users
         remove_banner_from_scenes();
         
-        // Schedule auto-restore in only 5 seconds for free users (very limited hiding)
-        // BUT don't auto-restore if this is a duration timer hide (permanent until next ad)
-        std::jthread([this]() {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (!PremiumStatusHandler::is_premium(this)) {
-                // Only auto-restore if this wasn't a duration timer hide (check if we can show ads)
-                // Auto-restore for free users (frequency control handled externally)
-                log_message("HIDE_BANNER: FREE USER - Auto-restoring banner after 5 seconds");
-                show_banner();
-                
-                // CRITICAL: Re-enable full protection system for free users
-                log_message("HIDE_BANNER: FREE USER - Re-enabling signal-based protection system");
-                connect_scene_signals();
-                connect_source_signals();
-                log_message("HIDE_BANNER: FREE USER - Signal protection fully re-enabled");
-            }
-            // Clear the flag after the hide period is over
-            m_intentional_hide_in_progress.store(false);
-            log_message("HIDE_BANNER: FREE USER - Signal protection disabled after hide period");
-        }).detach();
-        
-        // Also clear the flag after a short delay in case the jthread doesn't work
-        std::jthread([this]() {
-            std::this_thread::sleep_for(std::chrono::seconds(10));  // Safety timeout
-            m_intentional_hide_in_progress.store(false);
-            
-            // Safety re-enable of protection system
-            if (!PremiumStatusHandler::is_premium(this)) {
-                log_message("HIDE_BANNER: FREE USER - Safety re-enabling protection system");
-                connect_scene_signals();
-                connect_source_signals();
-            }
-            log_message("HIDE_BANNER: FREE USER - Signal protection safety timeout reached");
-        }).detach();
+        // FREE USERS: No delayed timers - restoration happens SYNCHRONOUSLY via signals
+        // Clear intentional hide flag immediately so signals can restore banners
+        m_intentional_hide_in_progress.store(false);
+        log_message("HIDE_BANNER: FREE USER - Banner will be restored SYNCHRONOUSLY by signal handlers (no delays)");
         
         log_message("HIDE_BANNER: FREE USER - Banner temporarily hidden (5sec auto-restore - upgrade for full control)");
         return;
@@ -949,101 +1077,31 @@ void banner_manager::toggle_banner()
 
 void banner_manager::set_banner_url(const std::string& url)
 {
-    log_message("BANNER URL: Setting banner to direct URL like overlays: " + url);
-    
-    // Create browser source directly with the URL (no content type processing)
-    obs_data_t* settings = obs_data_create();
-    
-    // Set browser source properties - exactly like overlays
-    obs_data_set_string(settings, "url", url.c_str());
-    
-    // Always use full canvas size like overlays
-    obs_video_info ovi;
-    obs_get_video_info(&ovi);
-    
-    int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-    int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
-    
-    obs_data_set_int(settings, "width", canvas_width);
-    obs_data_set_int(settings, "height", canvas_height);
-    obs_data_set_int(settings, "fps", 30);
-    obs_data_set_bool(settings, "reroute_audio", false);
-    obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on URL change
-    obs_data_set_bool(settings, "shutdown", false);
-    
-    // Check if banner source already exists
-    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
-    if (existing_source && strcmp(obs_source_get_id(existing_source), "browser_source") == 0) {
-        // Update existing browser source
-        obs_source_update(existing_source, settings);
-        
-        // Force browser refresh by toggling enabled state
-        obs_source_set_enabled(existing_source, false);
-        obs_source_set_enabled(existing_source, true);
-        
-        obs_source_release(existing_source);
-        log_message("BANNER URL: Updated and refreshed existing browser source with new URL");
-    } else {
-        // Release old source if it exists but isn't a browser source
-        if (existing_source) {
-            obs_source_release(existing_source);
-        }
-        
-        // Create new browser source
-        m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
-        
-        if (m_banner_source) {
-            // Add VortiDeck metadata
-            obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
-            obs_data_set_string(private_settings, "vortideck_banner", "true");
-            obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
-            obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
-            obs_data_release(private_settings);
-            
-            // Connect source signals for visibility monitoring
-            connect_source_signals();
-            
-            log_message("BANNER URL: Created new browser source with direct URL");
-        }
-    }
-    
-    obs_data_release(settings);
+    log_message("BANNER URL: set_banner_url() called with URL: " + url);
+
+    // CRITICAL FIX: This function used to create direct browser sources (line 1085)
+    // which were orphaned and caused CEF shutdown crashes.
+    //
+    // NOW: This function does NOTHING except log. The URL parameter is passed directly
+    // to create_banner_source() by the caller. This function exists only for API compatibility.
+    //
+    // All source creation now happens through create_banner_source() which properly creates
+    // vortideck_banner_menu wrappers with active child registration for clean CEF shutdown.
+
+    log_message("BANNER URL: No action taken - banner creation handled by create_banner_source()");
 }
 
 void banner_manager::resize_banner_to_canvas()
 {
     log_message("BANNER RESIZE: Resizing banner to match current canvas size");
-    
-    if (!m_banner_source) {
-        log_message("BANNER RESIZE: No banner source to resize");
-        return;
-    }
-    
-    // Get current canvas size
-    obs_video_info ovi;
-    if (!obs_get_video_info(&ovi)) {
-        log_message("BANNER RESIZE: Failed to get video info");
-        return;
-    }
-    
-    int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-    int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
-    
-    log_message(std::format("BANNER RESIZE: Updating banner to canvas size: {}x{}", canvas_width, canvas_height));
-    
-    // Update browser source dimensions
-    obs_data_t* settings = obs_data_create();
-    obs_data_set_int(settings, "width", canvas_width);
-    obs_data_set_int(settings, "height", canvas_height);
-    
-    // Update the browser source with new dimensions
-    obs_source_update(m_banner_source, settings);
-    
-    obs_data_release(settings);
-    
+
+    // NOTE: With per-scene wrappers, each wrapper handles its own sizing
+    // Banner sources are automatically sized to canvas
+    log_message("BANNER RESIZE: Per-scene wrappers handle sizing automatically");
+
     // Force show banner to ensure it's visible after resize
     show_banner();
-    
+
     log_message("BANNER RESIZE: Banner successfully resized and repositioned");
 }
 
@@ -1054,25 +1112,20 @@ void banner_manager::show_premium_banner()
         log_message("FREE USER: Cannot use premium banner function - banners are automatically managed");
         return;
     }
-    
-    if (!m_banner_source) {
-        log_message("PREMIUM USER: No banner content set - use WebSocket API to set content first");
-        return;
-    }
-    
+
+    // NOTE: With per-scene wrappers, wrappers are created on-demand
+    log_message("PREMIUM USER: Adding banner to current scene with per-scene wrapper");
+
     // Add to current scene only (premium user's choice)
     add_banner_to_current_scene();
     m_banner_visible = true;
-    
+
     PremiumStatusHandler::log_premium_action(this, "banner added to current scene", "you have full control");
 }
 
 bool banner_manager::is_banner_visible() const
 {
-    if (!m_banner_source) {
-        return false;
-    }
-    
+    // NOTE: With per-scene wrappers, check if any banners exist in any scene
     // PERFORMANCE IMPROVEMENT: Use cached source visibility from signals
     // This eliminates the need to iterate through all scenes every time
     if (m_source_visible.load()) {
@@ -1115,7 +1168,24 @@ std::string banner_manager::get_current_banner_content() const
 
 obs_source_t* banner_manager::get_banner_source() const
 {
-    return m_banner_source;
+    // NOTE: With per-scene wrappers and no stored references, find by name pattern
+    // Return any wrapper source if it exists
+    obs_source_t* found = nullptr;
+
+    obs_enum_sources([](void* param, obs_source_t* source) {
+        obs_source_t** found_ptr = static_cast<obs_source_t**>(param);
+        const char* source_id = obs_source_get_id(source);
+
+        // Find first vortideck_banner_menu wrapper
+        if (source_id && strcmp(source_id, "vortideck_banner_menu") == 0) {
+            *found_ptr = source;
+            return false;  // Stop enumeration
+        }
+
+        return true;  // Continue enumeration
+    }, &found);
+
+    return found;
 }
 
 void banner_manager::add_banner_menu()
@@ -1143,9 +1213,9 @@ void banner_manager::banner_menu_callback(void* data)
         
         // FREE USERS ONLY: Show demo banner
         manager->log_message("FREE USER: Menu action - checking banner initialization");
-        
+
         // PREVENT MULTIPLE CALLS - Check if banners exist across ALL scenes (not just current)
-        if (manager->m_banner_source && manager->is_banner_visible()) {
+        if (manager->is_banner_visible()) {
             manager->log_message("FREE USER: Banners already initialized - menu action ignored to prevent duplicates");
             return;
         }
@@ -1165,13 +1235,19 @@ void banner_manager::banner_menu_callback(void* data)
 
 void banner_manager::create_banner_source(std::string_view content_data, std::string_view content_type)
 {
-    log_message("BANNER CREATION: Creating banner with connected service URL (simplified like overlays)");
-    
-    // Build banner URL from connected WebSocket server (consolidated logic)
+    // CRITICAL: Check shutdown flag FIRST
+    if (m_shutting_down.load()) {
+        log_message("BANNER CREATION: Shutdown detected, aborting");
+        return;
+    }
+
+    log_message("BANNER CREATION: Creating single shared banner source");
+
+    // Build banner URL from connected WebSocket server
     extern std::string get_global_websocket_url();
     std::string websocket_url = get_global_websocket_url();
     std::string banner_url;
-    
+
     if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
         std::string base_url;
         if (websocket_url.starts_with("ws://")) {
@@ -1182,6 +1258,124 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
         if (base_url.ends_with("/ws")) {
             base_url = base_url.substr(0, base_url.length() - 3);
         }
+        if (!base_url.ends_with("/")) {
+            base_url += "/";
+        }
+        banner_url = base_url + "banners";
+    } else {
+        banner_url = websocket_url + "/banners";
+    }
+
+    log_message("BANNER CREATION: Banner URL: " + banner_url);
+
+    // Check if banner source already exists
+    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
+    if (existing_source) {
+        const char* source_id = obs_source_get_id(existing_source);
+        log_message("BANNER CREATION: Found existing banner source with type: " + std::string(source_id ? source_id : "unknown"));
+
+        // Check if it's the OLD browser_source type (needs migration)
+        if (source_id && strcmp(source_id, "browser_source") == 0) {
+            log_message("BANNER CREATION: OLD browser_source detected - DELETING for migration to vortideck_banner_menu");
+            obs_source_remove(existing_source);
+            obs_source_release(existing_source);
+
+            // Remove from all scenes
+            obs_frontend_source_list scenes = {};
+            obs_frontend_get_scenes(&scenes);
+            if (scenes.sources.array) {
+                for (size_t i = 0; i < scenes.sources.num; i++) {
+                    obs_source_t* scene_source = scenes.sources.array[i];
+                    if (scene_source) {
+                        obs_scene_t* scene = obs_scene_from_source(scene_source);
+                        if (scene) {
+                            obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
+                            if (item) {
+                                obs_sceneitem_remove(item);
+                            }
+                        }
+                    }
+                }
+                obs_frontend_source_list_free(&scenes);
+            }
+
+            log_message("BANNER CREATION: Old browser_source deleted, will create new vortideck_banner_menu wrapper");
+            // Continue to create new wrapper below
+        } else {
+            // It's already a vortideck_banner_menu wrapper, just update URL
+            log_message("BANNER CREATION: Found existing vortideck_banner_menu wrapper, updating URL");
+            if (m_banner_source) {
+                obs_source_release(m_banner_source);
+            }
+            m_banner_source = existing_source;
+
+            // Update URL
+            obs_data_t* settings = obs_data_create();
+            obs_data_set_string(settings, "url", banner_url.c_str());
+            obs_source_update(m_banner_source, settings);
+            obs_data_release(settings);
+            return;
+        }
+    }
+
+    // CRITICAL FIX: Use vortideck_banner_menu wrapper (like overlays use vortideck_overlay)
+    // The wrapper creates a browser_source as an active child, preventing CEF/WASAPI crashes
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "url", banner_url.c_str());
+    obs_data_set_string(settings, "banner_id", "main_banner");  // Banner ID for the wrapper
+
+    // Create vortideck_banner_menu wrapper (NOT raw browser_source)
+    // The wrapper will internally create the browser_source as an active child
+    m_banner_source = obs_source_create("vortideck_banner_menu", m_banner_source_name.c_str(), settings, nullptr);
+    obs_data_release(settings);
+
+    if (m_banner_source) {
+        log_message("BANNER CREATION: Successfully created vortideck_banner_menu wrapper (prevents CEF crashes)");
+    } else {
+        log_message("BANNER CREATION: ERROR - Failed to create banner wrapper source!");
+    }
+}
+
+// ============================================================================
+// PER-SCENE WRAPPER MANAGEMENT (NEW - Prevents CEF shutdown crashes)
+// ============================================================================
+
+obs_source_t* banner_manager::get_or_create_wrapper_for_scene(const std::string& scene_name)
+{
+    log_message("WRAPPER: Getting/creating wrapper for scene: " + scene_name);
+
+    // Build unique name for this wrapper
+    std::string wrapper_name = m_banner_source_name + " (" + scene_name + ")";
+
+    // Check if wrapper already exists by name
+    obs_source_t* existing = obs_get_source_by_name(wrapper_name.c_str());
+    if (existing) {
+        log_message("WRAPPER: Found existing wrapper for scene: " + scene_name);
+        // obs_get_source_by_name increments refcount - return it, caller must release
+        return existing;
+    }
+
+    // Create new wrapper for this scene
+    log_message("WRAPPER: Creating NEW wrapper for scene: " + scene_name);
+
+    // Get WebSocket URL for banner (same for all wrappers)
+    extern std::string get_global_websocket_url();
+    std::string websocket_url = get_global_websocket_url();
+    std::string banner_url;
+
+    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
+        // Convert WebSocket URL to HTTP URL and add /banners
+        std::string base_url;
+        if (websocket_url.starts_with("ws://")) {
+            base_url = "http://" + websocket_url.substr(5);
+        } else {
+            base_url = "https://" + websocket_url.substr(6);
+        }
+        // Remove /ws path if present
+        if (base_url.ends_with("/ws")) {
+            base_url = base_url.substr(0, base_url.length() - 3);
+        }
+        // Ensure no double slashes
         if (base_url.ends_with("/")) {
             banner_url = base_url + "banners";
         } else {
@@ -1190,198 +1384,42 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
     } else {
         banner_url = websocket_url + "/banners";
     }
-    
-    log_message("CREATE_BANNER_SOURCE: Banner URL: " + banner_url);
-    
-    // Always use connected service URL (no more complex content types)
-    set_banner_url(banner_url);
-    
-    log_message("BANNER CREATION: Banner source created with connected service URL");
-    
-    // Use the connected service URL directly - no content type processing needed
-    std::string url_content = banner_url;
-    std::string css_content = "";  // No custom CSS needed for connected service URLs
 
-    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
-    if (existing_source) {
-        // Check if existing source is actually a browser source
-        const char* source_id = obs_source_get_id(existing_source);
-        if (source_id && std::string(source_id) == "browser_source") {
-            log_message("BANNER CREATION: Found existing browser source, reusing it");
-        
-        // Release our current source if any
-        if (m_banner_source) {
-            obs_source_release(m_banner_source);
-        }
-        
-        // Use the existing source
-        m_banner_source = existing_source;
-        
-            // Update the existing browser source with new URL content (use the shared conversion logic)
-        obs_data_t* settings = obs_data_create();
-            
-                         // Set browser source properties with full-screen dimensions
-             obs_data_set_string(settings, "url", url_content.c_str());
-             
-             // FULL-SCREEN BANNERS: Always use full canvas size
-             obs_video_info ovi;
-             obs_get_video_info(&ovi);
-             
-             int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-             int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
-             
-             obs_data_set_int(settings, "width", canvas_width);
-             obs_data_set_int(settings, "height", canvas_height);
-             
-             obs_data_set_int(settings, "fps", 30);
-             obs_data_set_bool(settings, "reroute_audio", false);
-             obs_data_set_bool(settings, "restart_when_active", true); // Force refresh on content change
-             obs_data_set_bool(settings, "shutdown", false);
-             obs_data_set_string(settings, "css", css_content.c_str());
-             
-             // Update the browser source
-        obs_source_update(m_banner_source, settings);
-             
-             // Force a refresh by toggling the source active state
-             obs_source_set_enabled(m_banner_source, false);
-             obs_source_set_enabled(m_banner_source, true);
-             
-        obs_data_release(settings);
-        
-             log_message(std::format("BANNER CREATION: Successfully reused existing browser source - Type: {}", content_type));
-             log_message(std::format("BANNER CREATION: Updated URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
-             log_message("BANNER CREATION: Forced browser source refresh for new content");
-        return;
-        } else {
-            // Existing source is NOT a browser source (probably old custom source) - remove it and create new browser source
-            log_message("BANNER CREATION: Found existing NON-browser source (probably old custom), removing it");
-            obs_source_release(existing_source);
-            
-            // Remove the old source from all scenes first
-            obs_frontend_source_list scenes = {};
-            obs_frontend_get_scenes(&scenes);
-            
-            for (size_t i = 0; i < scenes.sources.num; i++) {
-                obs_source_t* scene_source = scenes.sources.array[i];
-                if (!scene_source) continue;
-                
-                obs_scene_t* scene = obs_scene_from_source(scene_source);
-                if (!scene) continue;
-                
-                obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
-                if (item) {
-                    obs_sceneitem_remove(item);
-                    log_message("BANNER CREATION: Removed old source from scene");
-                }
-            }
-            obs_frontend_source_list_free(&scenes);
-        }
-    }
-    
-    // Create settings for browser_source directly
+    // Create settings for wrapper
     obs_data_t* settings = obs_data_create();
-    
-         // Set browser source properties with full-screen dimensions
-     obs_data_set_string(settings, "url", url_content.c_str());
-     
-     // FULL-SCREEN BANNERS: Always use full canvas size
-     obs_video_info ovi;
-     obs_get_video_info(&ovi);
-     
-     int canvas_width = ovi.base_width > 0 ? ovi.base_width : 1920;
-     int canvas_height = ovi.base_height > 0 ? ovi.base_height : 1080;
-     
-     obs_data_set_int(settings, "width", canvas_width);
-     obs_data_set_int(settings, "height", canvas_height);
-     
-     obs_data_set_int(settings, "fps", 30);
-     obs_data_set_bool(settings, "reroute_audio", false);
-     obs_data_set_bool(settings, "restart_when_active", true); // Help with content loading
-     obs_data_set_bool(settings, "shutdown", false);
-     obs_data_set_string(settings, "css", css_content.c_str());
-     
-     log_message("BANNER CREATION: Attempting to create browser_source directly...");
-     log_message(std::format("BANNER CREATION: New source URL: {}{}", url_content.substr(0, 100), (url_content.length() > 100 ? "..." : "")));
-     log_message(std::format("BANNER CREATION: Dimensions: {}x{} (Full Canvas)", canvas_width, canvas_height));
-     
-     // Create browser_source directly - simple and reliable
-     m_banner_source = obs_source_create_private("browser_source", m_banner_source_name.c_str(), settings);
-    
+    obs_data_set_string(settings, "url", banner_url.c_str());
+
+    // Create wrapper source (vortideck_banner_menu creates browser as active child)
+    obs_source_t* wrapper = obs_source_create("vortideck_banner_menu", wrapper_name.c_str(), settings, nullptr);
     obs_data_release(settings);
-    
-    if (m_banner_source) {
-        // Add VortiDeck protection metadata to the browser source
-        obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
-        obs_data_set_string(private_settings, "vortideck_banner", "true");
-        obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
-        obs_data_set_string(private_settings, "vortideck_banner_type", "browser");
-        obs_data_release(private_settings);
-        
-        // Connect source signals for visibility monitoring
-        connect_source_signals();
-        
-        log_message(std::format("BANNER CREATION: Successfully created browser_source with VortiDeck protection - Type: {}", content_type));
-        
-        // Add additional verification
-        const char* source_type = obs_source_get_id(m_banner_source);
-        uint32_t width = obs_source_get_width(m_banner_source);
-        uint32_t height = obs_source_get_height(m_banner_source);
-        
-        log_message(std::format("BANNER CREATION: Source verification - Type: {}, Size: {}x{}", 
-                               (source_type ? source_type : "NULL"), width, height));
+
+    if (wrapper) {
+        log_message("WRAPPER: SUCCESS - Created wrapper for scene: " + scene_name + " with URL: " + banner_url);
+
+        // IMPORTANT: This function returns a strong reference (refcount +1)
+        // Caller MUST call obs_source_release() after adding to scene
+        // obs_scene_add() adds its own reference, so caller's reference must be released
+        // This ensures proper lifecycle: scene holds reference, manager doesn't
+
+        return wrapper;
     } else {
-        log_message("BANNER CREATION: FAILED to create Browser Source for VortiDeck Banner!");
-        log_message("BANNER CREATION: Possible issues:");
-        log_message("BANNER CREATION: 1. Browser source plugin not available");
-        log_message("BANNER CREATION: 2. OBS not fully initialized");
-        log_message("BANNER CREATION: 3. Invalid source settings");
-        
-        // Fallback: Try to create a simple color source instead
-        log_message("BANNER CREATION: Attempting fallback to color source...");
-        
-        obs_data_t* color_settings = obs_data_create();
-        
-        if (content_type == "color" && content_data.length() >= 7 && content_data[0] == '#') {
-            // Parse hex color
-            try {
-                std::string hex = std::string(content_data.substr(1));
-                uint32_t color_value = std::stoul(hex, nullptr, 16);
-                // Convert RGB to RGBA (add alpha channel)
-                color_value |= 0xFF000000;  // Full opacity
-                obs_data_set_int(color_settings, "color", color_value);
-            } catch (const std::exception&) {
-                // Default to transparent if parsing fails
-                obs_data_set_int(color_settings, "color", 0x00000000);  // Fully transparent
-            }
-        } else if (content_type == "transparent") {
-            // Transparent fallback for transparent content type
-            obs_data_set_int(color_settings, "color", 0x00000000);  // Fully transparent
-        } else {
-            // Default to transparent for any content type in fallback mode
-            obs_data_set_int(color_settings, "color", 0x00000000);  // Fully transparent
-        }
-        
-        obs_data_set_int(color_settings, "width", 1920);
-        obs_data_set_int(color_settings, "height", 100);
-        
-        // Try to create a color source as fallback
-        m_banner_source = obs_source_create_private("color_source", m_banner_source_name.c_str(), color_settings);
-        
-        obs_data_release(color_settings);
-        
-        if (m_banner_source) {
-            // Add VortiDeck protection metadata even to fallback source
-            obs_data_t* private_settings = obs_source_get_private_settings(m_banner_source);
-            obs_data_set_string(private_settings, "vortideck_banner", "true");
-            obs_data_set_string(private_settings, "vortideck_banner_id", "banner_v1");
-            obs_data_set_string(private_settings, "vortideck_banner_type", "color_fallback");
-            obs_data_release(private_settings);
-            
-            log_message("BANNER CREATION: FALLBACK SUCCESS - Created color source with VortiDeck protection");
-        } else {
-            log_message("BANNER CREATION: COMPLETE FAILURE - Could not create any source type");
-        }
+        log_message("WRAPPER: FAILED - Could not create wrapper for scene: " + scene_name);
+        return nullptr;
     }
+}
+
+void banner_manager::release_wrapper_for_scene(const std::string& scene_name)
+{
+    // NOTE: We don't hold references anymore - OBS manages wrapper lifecycle
+    // This method is kept for API compatibility but does nothing
+    log_message("WRAPPER: Not holding references - OBS will clean up wrapper for scene: " + scene_name);
+}
+
+void banner_manager::release_all_wrappers()
+{
+    // NOTE: We don't hold references anymore - OBS manages wrapper lifecycle
+    // This allows OBS to properly clean up sources during shutdown
+    log_message("WRAPPER: Not holding references - OBS will clean up all wrappers automatically");
 }
 
 // void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
@@ -1685,57 +1723,71 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
 
 void banner_manager::add_banner_to_current_scene()
 {
-    if (!m_banner_source) {
-        log_message("No banner source to add");
-        return;
-    }
-    
     obs_source_t* current_scene_source = obs_frontend_get_current_scene();
     if (!current_scene_source) {
         log_message("No current scene");
         return;
     }
-    
+
+    const char* scene_name = obs_source_get_name(current_scene_source);
+    if (!scene_name) {
+        obs_source_release(current_scene_source);
+        log_message("Could not get scene name");
+        return;
+    }
+
     obs_scene_t* scene = obs_scene_from_source(current_scene_source);
     if (!scene) {
         obs_source_release(current_scene_source);
         log_message("Could not get scene from source");
         return;
     }
-    
+
+    log_message("ADD BANNER: Adding banner to current scene: " + std::string(scene_name));
+
     // CRITICAL: Check if banner already exists in scene to prevent duplicates (metadata-based)
     int banner_count = count_vortideck_banners_in_scene(scene);
     if (banner_count > 0) {
         // Banner(s) already exist - just ensure first one is visible and properly configured
         obs_sceneitem_t* existing_item = find_vortideck_ads_in_scene(scene);
-    if (existing_item) {
-        obs_sceneitem_set_visible(existing_item, true);
-        lock_banner_item(existing_item);
+        if (existing_item) {
+            obs_sceneitem_set_visible(existing_item, true);
+            lock_banner_item(existing_item);
         }
         log_message(std::format("Banner already exists in scene ({} found) - NO NEW CREATION", banner_count));
     } else {
-        // Add new scene item ONLY if it doesn't exist
-        obs_sceneitem_t* scene_item = obs_scene_add(scene, m_banner_source);
+        // Get or create wrapper for this scene (NEW - prevents CEF crashes)
+        obs_source_t* wrapper = get_or_create_wrapper_for_scene(scene_name);
+        if (!wrapper) {
+            obs_source_release(current_scene_source);
+            log_message("Failed to get/create wrapper for scene");
+            return;
+        }
+
+        // Add new scene item with per-scene wrapper
+        // NOTE: obs_scene_add() adds its own reference, so we need to release ours
+        obs_sceneitem_t* scene_item = obs_scene_add(scene, wrapper);
+        obs_source_release(wrapper);  // CRITICAL: Release the reference from get_or_create_wrapper_for_scene()
         if (scene_item) {
             // Position banner at 0,0 to fill entire screen (CSS controls content positioning)
             vec2 pos;
             pos.x = 0;
             pos.y = 0; // Top-left corner (0,0)
             obs_sceneitem_set_pos(scene_item, &pos);
-            
+
             // Set size to fill entire screen
             vec2 scale;
             scale.x = 1.0f;
             scale.y = 1.0f;
             obs_sceneitem_set_scale(scene_item, &scale);
-            
+
             lock_banner_item(scene_item);
-            log_message("NEW banner added to current scene (1 per scene max)");
+            log_message("NEW banner added to current scene (1 per scene max) using per-scene wrapper");
         } else {
             log_message("Failed to add banner to scene");
         }
     }
-    
+
     obs_source_release(current_scene_source);
 }
 
@@ -1746,68 +1798,61 @@ void banner_manager::initialize_banners_all_scenes()
         PremiumStatusHandler::log_premium_action(this, "banner initialization", "SKIPPED - complete banner freedom");
         return;
     }
-    
-    if (!m_banner_source) {
-        log_message("FREE USER: No banner source to initialize across scenes");
-        return;
-    }
-    
+
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
-    
+
     int scenes_initialized = 0;
     int scenes_already_covered = 0;
     int total_scenes = scenes.sources.num;
-    
+
     log_message(std::format("FREE USER: FORCED banner initialization - checking {} scenes", total_scenes));
-    
+
     for (size_t i = 0; i < scenes.sources.num; i++) {
         obs_source_t* scene_source = scenes.sources.array[i];
         if (!scene_source) continue;
-        
+
         obs_scene_t* scene = obs_scene_from_source(scene_source);
         if (!scene) continue;
-        
+
         // Get scene name for logging
         const char* scene_name = obs_source_get_name(scene_source);
-        
+
         // Check if banner already exists in this scene (metadata-based detection)
         int banner_count = count_vortideck_banners_in_scene(scene);
-        
+
         log_message("FREE USER: Scene '" + std::string(scene_name) + "' - Found " + std::to_string(banner_count) + " VortiDeck banners");
-        
+
         if (banner_count > 0) {
             // Banner(s) already exist - just ensure first one is visible and properly configured
             obs_sceneitem_t* existing_item = find_vortideck_ads_in_scene(scene);
-        if (existing_item) {
-            obs_sceneitem_set_visible(existing_item, true);
-            lock_banner_item(existing_item);
+            if (existing_item) {
+                obs_sceneitem_set_visible(existing_item, true);
+                lock_banner_item(existing_item);
             }
             scenes_already_covered++;
             log_message("FREE USER: Scene '" + std::string(scene_name) + "' already has " + std::to_string(banner_count) + " banner(s) - NO NEW CREATION");
         } else {
-            // Scene missing banner - initialize it
+            // Scene missing banner - add single shared banner source
+            if (!m_banner_source) {
+                log_message("FREE USER: No banner source exists, cannot add to scene");
+                continue;
+            }
+
+            // Add the single shared banner source to this scene
             obs_sceneitem_t* scene_item = obs_scene_add(scene, m_banner_source);
             if (scene_item) {
-                // Position banner at 0,0 to fill entire screen (CSS controls content positioning)
-                vec2 pos;
-                pos.x = 0;
-                pos.y = 0; // Top-left corner (0,0)
+                // Position banner at 0,0
+                vec2 pos = {0, 0};
                 obs_sceneitem_set_pos(scene_item, &pos);
-                
-                // Set size to fill entire screen
-                vec2 scale;
-                scale.x = 1.0f;
-                scale.y = 1.0f;
-                obs_sceneitem_set_scale(scene_item, &scale);
-                
-                // Make it visible and locked
+
+                // Make it visible and locked at top
                 obs_sceneitem_set_visible(scene_item, true);
                 lock_banner_item(scene_item);
                 obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_TOP);
-                
+
                 scenes_initialized++;
-                log_message("FREE USER: Scene '" + std::string(scene_name) + "' missing banner - INITIALIZED");
+                log_message("FREE USER: Scene '" + std::string(scene_name) + "' missing banner - INITIALIZED with shared source");
             } else {
                 log_message("ERROR: Failed to initialize banner in scene '" + std::string(scene_name) + "'");
             }
@@ -1829,30 +1874,32 @@ void banner_manager::remove_banner_from_scenes()
 {
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
-    
-    int scenes_hidden = 0;
-    
+
+    int scenes_removed = 0;
+
     for (size_t i = 0; i < scenes.sources.num; i++) {
         obs_source_t* source = scenes.sources.array[i];
         if (!source) continue;
-        
+
         obs_scene_t* scene = obs_scene_from_source(source);
         if (!scene) continue;
-        
+
         // Use metadata-based detection instead of name-based
         obs_sceneitem_t* item = find_vortideck_ads_in_scene(scene);
         if (item) {
-            obs_sceneitem_set_visible(item, false);
-            scenes_hidden++;
+            // CRITICAL: Actually REMOVE the scene item, don't just hide it
+            // Hiding leaves scene item references that prevent browser source cleanup
+            obs_sceneitem_remove(item);
+            scenes_removed++;
         }
     }
-    
+
     obs_frontend_source_list_free(&scenes);
-    
+
     // Update the visibility flag based on actual scene state
-    if (scenes_hidden > 0) {
+    if (scenes_removed > 0) {
         m_banner_visible = false;
-        log_message("Banner removed from " + std::to_string(scenes_hidden) + " scenes");
+        log_message("Banner removed from " + std::to_string(scenes_removed) + " scenes");
     } else {
         log_message("No banners found to remove from scenes");
     }
@@ -1895,32 +1942,25 @@ void banner_manager::lock_banner_item(obs_sceneitem_t* item)
 
 void banner_manager::make_banner_persistent()
 {
-    if (!m_banner_source) {
-        log_message("No banner source to make persistent");
-        return;
-    }
-    
     if (m_banner_persistent) {
         log_message("Banner already in persistent mode - ignoring duplicate request");
         return;
     }
-    
+
     // Set persistent flag
     m_banner_persistent = true;
-    
+
     // DON'T add to all scenes immediately - let the monitoring system handle it gradually
     // This prevents the massive banner creation burst that was happening
-    
+
     log_message("Banner persistence mode ENABLED - will be maintained across scenes");
-    
+
     // Signal-based monitoring handles persistence automatically
     log_message("Banner made persistent - signal-based protection active (no polling needed)");
-    
+
     // Ensure signals are connected for persistence
     connect_scene_signals();
-    if (m_banner_source) {
-        connect_source_signals();
-    }
+    connect_source_signals();
 }
 
 bool banner_manager::is_url(std::string_view content)
@@ -2061,12 +2101,18 @@ int banner_manager::count_vortideck_banners_in_scene(obs_scene_t* scene) const
 
 void banner_manager::cleanup_banner_names_after_deletion()
 {
+    // CRITICAL: Check shutdown flag FIRST before enumerating scenes
+    if (m_shutting_down.load()) {
+        log_message("CLEANUP: Shutdown detected, aborting cleanup");
+        return;
+    }
+
     log_message("CLEANUP: Starting banner name cleanup after deletion");
-    
+
     // Simple approach: Just log the current state and let OBS handle naming
     // The main issue is that we're creating multiple sources with the same name
     // which causes OBS to auto-number them. We should prevent this instead.
-    
+
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
     
@@ -2208,16 +2254,22 @@ void banner_manager::stop_persistence_monitor()
 
 void banner_manager::enforce_banner_visibility()
 {
+    // CRITICAL: Check shutdown flag FIRST before touching OBS API
+    if (m_shutting_down.load()) {
+        log_message("PERSISTENCE: Shutdown detected, aborting enforcement");
+        return;
+    }
+
     // CRITICAL: Don't enforce during intentional hide operations
     if (m_intentional_hide_in_progress.load()) {
         log_message("PERSISTENCE: Skipping enforcement - intentional hide in progress");
         return;
     }
-    
+
     // Don't enforce if banner is supposed to be hidden due to frequency limits
     // Ad frequency limits removed - handled externally
     // Persistence enforcement always active for applicable users
-    
+
     bool is_premium = m_is_premium.load();
     
     if (!is_premium) {
@@ -2230,35 +2282,29 @@ void banner_manager::enforce_banner_visibility()
         log_message("PREMIUM USER: Persistence mode enabled - checking banner visibility");
     }
     
-    // Recreate banner source if it was destroyed (always use connected service URL)
-    if (!m_banner_source) {
-        log_message("Banner source was destroyed! Recreating it with connected service URL...");
-        create_banner_source();
-    }
-    
-    if (!m_banner_source) {
-        return;
-    }
-    
     // Check all scenes and enforce banner visibility
     obs_frontend_source_list scenes = {};
     obs_frontend_get_scenes(&scenes);
-    
+
     bool banner_found = false;
     bool action_taken = false;
-    
+
     for (size_t i = 0; i < scenes.sources.num; i++) {
         obs_source_t* scene_source = scenes.sources.array[i];
         if (!scene_source) continue;
-        
+
         obs_scene_t* scene = obs_scene_from_source(scene_source);
         if (!scene) continue;
-        
+
+        // Get scene name for per-scene wrapper lookup
+        const char* scene_name = obs_source_get_name(scene_source);
+        if (!scene_name) continue;
+
         // Use metadata-based detection instead of name-based
         obs_sceneitem_t* banner_item = find_vortideck_ads_in_scene(scene);
         if (banner_item) {
             banner_found = true;
-            
+
             // Check if banner is hidden and restore visibility
             if (!obs_sceneitem_visible(banner_item)) {
                 obs_sceneitem_set_visible(banner_item, true);
@@ -2269,7 +2315,7 @@ void banner_manager::enforce_banner_visibility()
                     log_message("PREMIUM USER: Banner restored to visible (persistence mode)");
                 }
             }
-            
+
             // For FREE USERS: Always enforce strict locking and positioning
             if (!is_premium) {
                 lock_banner_item(banner_item);
@@ -2280,49 +2326,73 @@ void banner_manager::enforce_banner_visibility()
                     log_message("Re-locked banner that was unlocked");
                 }
             }
-            
+
             // Keep banner on top
             obs_sceneitem_set_order(banner_item, OBS_ORDER_MOVE_TOP);
         } else {
             // Only recreate in current scene to prevent spam across all scenes
             obs_source_t* current_scene_source = obs_frontend_get_current_scene();
             if (current_scene_source && scene_source == current_scene_source) {
-            if (!is_premium) {
-                    log_message("FREE USER: Banner missing in current scene - recreating");
-                
-                obs_sceneitem_t* scene_item = obs_scene_add(scene, m_banner_source);
-                if (scene_item) {
-                    // Position banner at 0,0 to fill entire screen (CSS controls content positioning)
-                    vec2 pos;
-                    pos.x = 0;
-                    pos.y = 0; // Top-left corner (0,0)
-                    obs_sceneitem_set_pos(scene_item, &pos);
-                    
-                    // Set size to fill entire screen
-                    vec2 scale;
-                    scale.x = 1.0f;
-                    scale.y = 1.0f;
-                    obs_sceneitem_set_scale(scene_item, &scale);
-                    
+                if (!is_premium) {
+                    log_message("FREE USER: Banner missing in current scene - recreating with per-scene wrapper");
+
+                    // Get or create wrapper for this scene (NEW - prevents CEF crashes)
+                    obs_source_t* wrapper = get_or_create_wrapper_for_scene(scene_name);
+                    if (!wrapper) {
+                        log_message("FREE USER: Failed to get/create wrapper for scene: " + std::string(scene_name));
+                        if (current_scene_source) {
+                            obs_source_release(current_scene_source);
+                        }
+                        continue;
+                    }
+
+                    // NOTE: obs_scene_add() adds its own reference, so we need to release ours
+                    obs_sceneitem_t* scene_item = obs_scene_add(scene, wrapper);
+                    obs_source_release(wrapper);  // CRITICAL: Release the reference from get_or_create_wrapper_for_scene()
+                    if (scene_item) {
+                        // Position banner at 0,0 to fill entire screen (CSS controls content positioning)
+                        vec2 pos;
+                        pos.x = 0;
+                        pos.y = 0; // Top-left corner (0,0)
+                        obs_sceneitem_set_pos(scene_item, &pos);
+
+                        // Set size to fill entire screen
+                        vec2 scale;
+                        scale.x = 1.0f;
+                        scale.y = 1.0f;
+                        obs_sceneitem_set_scale(scene_item, &scale);
+
                         // Make it visible and properly locked
-                    obs_sceneitem_set_visible(scene_item, true);
-                    lock_banner_item(scene_item);
-                    obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_TOP);
-                    
+                        obs_sceneitem_set_visible(scene_item, true);
+                        lock_banner_item(scene_item);
+                        obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_TOP);
+
                         action_taken = true;
-                        log_message("FREE USER: Banner restored in current scene");
-                }
-            } else if (m_banner_persistent) {
-                log_message("PREMIUM USER: Banner missing but in persistent mode - recreating");
-                
-                obs_sceneitem_t* scene_item = obs_scene_add(scene, m_banner_source);
-                if (scene_item) {
-                    obs_sceneitem_set_visible(scene_item, true);
-                    obs_sceneitem_set_locked(scene_item, true);
-                    obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_TOP);
+                        log_message("FREE USER: Banner restored in current scene with per-scene wrapper");
+                    }
+                } else if (m_banner_persistent) {
+                    log_message("PREMIUM USER: Banner missing but in persistent mode - recreating with per-scene wrapper");
+
+                    // Get or create wrapper for this scene (NEW - prevents CEF crashes)
+                    obs_source_t* wrapper = get_or_create_wrapper_for_scene(scene_name);
+                    if (!wrapper) {
+                        log_message("PREMIUM USER: Failed to get/create wrapper for scene: " + std::string(scene_name));
+                        if (current_scene_source) {
+                            obs_source_release(current_scene_source);
+                        }
+                        continue;
+                    }
+
+                    // NOTE: obs_scene_add() adds its own reference, so we need to release ours
+                    obs_sceneitem_t* scene_item = obs_scene_add(scene, wrapper);
+                    obs_source_release(wrapper);  // CRITICAL: Release the reference from get_or_create_wrapper_for_scene()
+                    if (scene_item) {
+                        obs_sceneitem_set_visible(scene_item, true);
+                        obs_sceneitem_set_locked(scene_item, true);
+                        obs_sceneitem_set_order(scene_item, OBS_ORDER_MOVE_TOP);
                         action_taken = true;
+                    }
                 }
-            }
             }
             if (current_scene_source) {
                 obs_source_release(current_scene_source);

@@ -427,10 +427,19 @@ namespace vorti
             // Banner functionality - using separate banner manager class
             banner_manager m_banner_manager;
             
-            // Flag to completely disable banner manager functionality
-            // Set to false to completely turn off all banner manager functionality
-            static consteval bool get_banner_manager_enabled() { return true; }
+            // Feature flags - set to false to disable specific functionality
+
+            // Controls banner ads for free users (does NOT affect menu or overlays)
+            static consteval bool get_banner_manager_enabled() { return false; }
             static constexpr bool BANNER_MANAGER_ENABLED = get_banner_manager_enabled();
+
+            // Controls VortiDeck overlay sources
+            static consteval bool get_overlay_enabled() { return true; }
+            static constexpr bool OVERLAY_ENABLED = get_overlay_enabled();
+
+            // Controls VortiDeck menu in OBS toolbar
+            static consteval bool get_vortideck_menu_enabled() { return true; }
+            static constexpr bool VORTIDECK_MENU_ENABLED = get_vortideck_menu_enabled();
         }
     }
 }
