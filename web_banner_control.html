@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VortiDeck OBS Banner Control</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #1e1e1e;
+            color: #ffffff;
+        }
+        
+        .container {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #4CAF50;
+            text-align: center;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .status.connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        .status.disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+        
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        button {
+            padding: 12px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        
+        button:hover {
+            opacity: 0.8;
+        }
+        
+        .btn-primary {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        .btn-secondary {
+            background-color: #2196F3;
+            color: white;
+        }
+        
+        .btn-danger {
+            background-color: #f44336;
+            color: white;
+        }
+        
+        .file-input {
+            grid-column: 1 / -1;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        input[type="text"] {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background-color: #3d3d3d;
+            color: white;
+        }
+        
+        .log {
+            background-color: #1a1a1a;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 15px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        
+        .log-entry {
+            margin-bottom: 5px;
+            padding: 2px 0;
+        }
+        
+        .log-entry.sent {
+            color: #4CAF50;
+        }
+        
+        .log-entry.received {
+            color: #2196F3;
+        }
+        
+        .log-entry.error {
+            color: #f44336;
+        }
+        
+        .log-entry.info {
+            color: #FFC107;
+        }
+    </style>
+</head>
+<body>
+    <h1>VortiDeck OBS Banner Control</h1>
+    
+    <div class="container">
+        <div id="status" class="status disconnected">
+            Disconnected from ws://localhost:9001
+        </div>
+        
+        <div class="controls">
+            <button id="connectBtn" class="btn-primary" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" class="btn-danger" onclick="disconnect()" disabled>Disconnect</button>
+            
+            <button id="showBtn" class="btn-secondary" onclick="showBanner()" disabled>Show Banner</button>
+            <button id="hideBtn" class="btn-secondary" onclick="hideBanner()" disabled>Hide Banner</button>
+            
+            <div class="file-input">
+                <input type="text" id="filePath" placeholder="Enter full path to banner file (e.g., C:/path/to/banner.png)" />
+                <button id="setBtn" class="btn-secondary" onclick="setBanner()" disabled>Set Banner</button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>Communication Log</h3>
+        <div id="log" class="log"></div>
+        <button onclick="clearLog()" style="margin-top: 10px; padding: 8px 15px; background-color: #666; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Clear Log
+        </button>
+    </div>
+
+    <script>
+        let ws = null;
+        let isConnected = false;
+
+        function updateStatus(connected, message) {
+            const statusDiv = document.getElementById('status');
+            const connectBtn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+            const showBtn = document.getElementById('showBtn');
+            const hideBtn = document.getElementById('hideBtn');
+            const setBtn = document.getElementById('setBtn');
+            
+            isConnected = connected;
+            
+            if (connected) {
+                statusDiv.className = 'status connected';
+                statusDiv.textContent = message || 'Connected to ws://localhost:9001';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                showBtn.disabled = false;
+                hideBtn.disabled = false;
+                setBtn.disabled = false;
+            } else {
+                statusDiv.className = 'status disconnected';
+                statusDiv.textContent = message || 'Disconnected from ws://localhost:9001';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                showBtn.disabled = true;
+                hideBtn.disabled = true;
+                setBtn.disabled = true;
+            }
+        }
+
+        function logMessage(message, type = 'info') {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function connect() {
+            if (ws) {
+                ws.close();
+            }
+            
+            logMessage('Attempting to connect to ws://localhost:9001...', 'info');
+            
+            ws = new WebSocket('ws://localhost:9001');
+            
+            ws.onopen = function(event) {
+                updateStatus(true);
+                logMessage('Connected successfully!', 'info');
+            };
+            
+            ws.onmessage = function(event) {
+                logMessage(`Received: ${event.data}`, 'received');
+            };
+            
+            ws.onclose = function(event) {
+                updateStatus(false, `Connection closed (Code: ${event.code})`);
+                logMessage(`Connection closed (Code: ${event.code})`, 'info');
+            };
+            
+            ws.onerror = function(error) {
+                logMessage('WebSocket error occurred', 'error');
+                updateStatus(false, 'Connection error');
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function sendCommand(command, params = {}) {
+            if (!isConnected || !ws) {
+                logMessage('Not connected to server!', 'error');
+                return;
+            }
+            
+            const message = {
+                command: command,
+                ...params
+            };
+            
+            const jsonMessage = JSON.stringify(message);
+            ws.send(jsonMessage);
+            logMessage(`Sent: ${jsonMessage}`, 'sent');
+        }
+
+        function showBanner() {
+            sendCommand('show_banner');
+        }
+
+        function hideBanner() {
+            sendCommand('hide_banner');
+        }
+
+        function setBanner() {
+            const filePath = document.getElementById('filePath').value.trim();
+            
+            if (!filePath) {
+                logMessage('Please enter a file path!', 'error');
+                return;
+            }
+            
+            sendCommand('set_banner', { file_path: filePath });
+        }
+
+        function clearLog() {
+            document.getElementById('log').innerHTML = '';
+        }
+
+        // Handle Enter key in file path input
+        document.getElementById('filePath').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                setBanner();
+            }
+        });
+
+        // Initial status
+        updateStatus(false);
+        logMessage('VortiDeck OBS Banner Control ready', 'info');
+        logMessage('Click "Connect" to establish WebSocket connection', 'info');
+    </script>
+</body>
+</html>

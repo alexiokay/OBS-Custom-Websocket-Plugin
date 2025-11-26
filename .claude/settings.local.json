@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/alexispace/AppData/Roaming/obs-studio/crashes/**)",
+      "Read(//c/Users/alexispace/AppData/Roaming/obs-studio/logs/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
