@@ -35,3 +35,7 @@ forbid_text(
   "${OVERLAY_SOURCE_TEXT}"
   "URL changed from"
   "browser-source capability values must not be written to OBS logs")
+forbid_text(
+  "${OVERLAY_SOURCE_TEXT}"
+  "url=%s"
+  "bearer capability URLs must not be interpolated into OBS logs")

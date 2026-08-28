@@ -211,8 +211,9 @@ static void* overlay_source_create(obs_data_t* settings, obs_source_t* source)
     int width = (int)obs_data_get_int(settings, "width");
     int height = (int)obs_data_get_int(settings, "height");
     
-    blog(LOG_INFO, "[VortiDeck Overlay] STARTUP DEBUG: Initial values - width=%d, height=%d, overlay_id=%s, url=%s", 
-         width, height, overlay_id ? overlay_id : "null", url ? url : "null");
+    // The URL is a bearer capability and must never be written to OBS logs.
+    blog(LOG_INFO, "[VortiDeck Overlay] Initializing source - width=%d, height=%d, overlay_id=%s",
+         width, height, overlay_id ? overlay_id : "null");
     
     if (!overlay_id || strlen(overlay_id) == 0) {
         overlay_id = "default";
