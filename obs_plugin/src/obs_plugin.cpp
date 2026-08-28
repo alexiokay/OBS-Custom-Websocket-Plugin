@@ -77,58 +77,21 @@ std::string get_global_websocket_url()
     }
 }
 
-// Function to update all existing overlay URLs when connected to a new service
-void update_all_overlay_urls_to_connected_server()
+namespace {
+std::mutex g_overlay_capability_mutex;
+std::string g_overlay_capability_url;
+}
+
+std::string get_global_overlay_capability_url()
 {
-    std::string websocket_url = get_global_websocket_url();
-    if (websocket_url == "https://vortideck.com") {
-        return; // Not connected to a real service
-    }
-    
-    // Build the overlay URL
-    std::string overlay_url;
-    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
-        std::string base_url;
-        if (websocket_url.starts_with("ws://")) {
-            base_url = "http://" + websocket_url.substr(5);
-        } else {
-            base_url = "https://" + websocket_url.substr(6);
-        }
-        // Remove /ws path if present since that's WebSocket-only
-        if (base_url.ends_with("/ws")) {
-            base_url = base_url.substr(0, base_url.length() - 3);
-        }
-        // Ensure no double slashes
-        if (base_url.ends_with("/")) {
-            overlay_url = base_url + "overlay.html";
-        } else {
-            overlay_url = base_url + "/overlay.html";
-        }
-    } else {
-        overlay_url = websocket_url + "/overlay.html";
-    }
-    
-    // Update all existing overlay sources
-    obs_enum_sources([](void* data, obs_source_t* source) {
-        std::string url = *(std::string*)data;
-        
-        // Check if this is a VortiDeck overlay source
-        const char* source_id = obs_source_get_id(source);
-        if (source_id && strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) == 0) {
-            // Update the overlay URL
-            obs_data_t* settings = obs_source_get_settings(source);
-            obs_data_set_string(settings, "url", url.c_str());
-            obs_source_update(source, settings);
-            obs_data_release(settings);
-            
-            const char* name = obs_source_get_name(source);
-            blog(LOG_INFO, "Auto-updated overlay '%s' to connected server: %s", 
-                 name ? name : "unnamed", url.c_str());
-        }
-        return true; // Continue enumeration
-    }, &overlay_url);
-    
-    log_to_obs("Auto-updated all overlay URLs to connected server: " + overlay_url);
+    std::lock_guard<std::mutex> lock(g_overlay_capability_mutex);
+    return g_overlay_capability_url;
+}
+
+void set_global_overlay_capability_url(const std::string& url)
+{
+    std::lock_guard<std::mutex> lock(g_overlay_capability_mutex);
+    g_overlay_capability_url = url;
 }
 
 // Function to update all existing banner URLs when connected to a new service
@@ -1066,9 +1029,6 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
     }
     log_to_obs("Registration message sent");
     
-    // Auto-update all existing overlay URLs to use the connected server
-    update_all_overlay_urls_to_connected_server();
-    
     // Auto-update banner URL to use the connected server
     update_all_banner_urls_to_connected_server();
 }
@@ -1084,7 +1044,7 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
 
     /* Received a message, handle it */
     std::string payload = response->get_payload();
-    log_to_obs("Received payload: " + payload);
+    log_to_obs("Received VortiDeck protocol message");
 
     if (payload.empty())
     {
@@ -3113,6 +3073,7 @@ void vorti::applets::obs_plugin::action_overlay_set_data(const action_invoke_par
     
     if (url_it != parameters.end()) {
         std::string url = url_it->second;
+        set_global_overlay_capability_url(url);
         
         // Update ALL existing overlay sources with the new URL
         obs_enum_sources([](void* data, obs_source_t* source) {
@@ -3134,7 +3095,7 @@ void vorti::applets::obs_plugin::action_overlay_set_data(const action_invoke_par
             return true; // Continue enumeration
         }, &url);
         
-        log_to_obs("ACTION_OVERLAY_SET_DATA: Updated all existing overlays with URL: " + url);
+        log_to_obs("ACTION_OVERLAY_SET_DATA: Updated all existing overlays with a refreshed capability URL");
         
         std::string overlay_name = "VortiDeck Overlay";
         
@@ -3228,7 +3189,7 @@ void vorti::applets::obs_plugin::action_overlay_set_data(const action_invoke_par
             obs_source_release(overlay_source);
         }
         
-        log_to_obs("ACTION_OVERLAY_SET_DATA: Overlay data set successfully - URL: " + url);
+        log_to_obs("ACTION_OVERLAY_SET_DATA: Overlay capability applied successfully");
     } else {
         log_to_obs("ACTION_OVERLAY_SET_DATA: ERROR - Missing required parameter (url)");
     }

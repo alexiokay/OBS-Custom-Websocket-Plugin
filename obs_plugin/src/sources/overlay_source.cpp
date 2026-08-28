@@ -4,8 +4,8 @@
 #include <obs-frontend-api.h>
 #include <util/dstr.h>
 
-// External function to get WebSocket URL
-extern std::string get_global_websocket_url();
+// The overlay URL is a host-issued capability. Discovery URLs never contain it.
+extern std::string get_global_overlay_capability_url();
 #include <string>
 #include <thread>
 #include <chrono>
@@ -376,8 +376,7 @@ static void overlay_source_update(void* data, obs_data_t* settings)
     // Update URL if changed
     const char* new_url = obs_data_get_string(settings, "url");
     if (new_url && context->url != new_url) {
-        blog(LOG_INFO, "[VortiDeck Overlay] URL changed from '%s' to '%s'", 
-             context->url.c_str(), new_url);
+        blog(LOG_INFO, "[VortiDeck Overlay] Applying refreshed browser-source capability");
         context->url = new_url;
         
         if (context->browser_source) {
@@ -385,7 +384,7 @@ static void overlay_source_update(void* data, obs_data_t* settings)
             obs_data_set_string(browser_settings, "url", new_url);
             obs_source_update(context->browser_source, browser_settings);
             obs_data_release(browser_settings);
-            blog(LOG_INFO, "[VortiDeck Overlay] Updated browser source URL to: %s", new_url);
+            blog(LOG_INFO, "[VortiDeck Overlay] Browser-source capability refreshed");
         } else {
             blog(LOG_WARNING, "[VortiDeck Overlay] No browser source to update!");
         }
@@ -459,34 +458,13 @@ static void overlay_source_defaults(obs_data_t* settings)
     obs_data_set_default_int(settings, "width", width);
     obs_data_set_default_int(settings, "height", height);
     
-    // Build default URL from connected WebSocket server + /overlay.html
-    std::string websocket_url = get_global_websocket_url();
-    std::string default_url;
-    
-    if (websocket_url.starts_with("ws://") || websocket_url.starts_with("wss://")) {
-        // Convert WebSocket URL to HTTP URL and add /overlay.html
-        std::string base_url;
-        if (websocket_url.starts_with("ws://")) {
-            base_url = "http://" + websocket_url.substr(5);
-        } else {
-            base_url = "https://" + websocket_url.substr(6);
-        }
-        // Remove /ws path if present since that's WebSocket-only
-        if (base_url.ends_with("/ws")) {
-            base_url = base_url.substr(0, base_url.length() - 3);
-        }
-        // Ensure no double slashes
-        if (base_url.ends_with("/")) {
-            default_url = base_url + "overlay.html";
-        } else {
-            default_url = base_url + "/overlay.html";
-        }
+    std::string default_url = get_global_overlay_capability_url();
+    if (default_url.empty()) {
+        default_url = "about:blank";
+        blog(LOG_INFO, "[VortiDeck Overlay] Waiting for an authenticated overlay capability");
     } else {
-        // Fallback if not a proper WebSocket URL
-        default_url = websocket_url + "/overlay.html";
+        blog(LOG_INFO, "[VortiDeck Overlay] Using the current authenticated overlay capability");
     }
-    
-    blog(LOG_INFO, "[VortiDeck Overlay] Using connected server URL: %s", default_url.c_str());
     
     obs_data_set_default_string(settings, "url", default_url.c_str());
     obs_data_set_default_string(settings, "overlay_id", "main_overlay");

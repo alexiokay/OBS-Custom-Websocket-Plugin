@@ -16,6 +16,7 @@ Optionally configure and enable the documented Apple and Linux signing variables
 ## Normal developer flow
 
 1. Develop and test the plugin.
+   Run `cmake --preset windows-ci-x64`, build the preset, and run `ctest --test-dir build_x64 -C RelWithDebInfo --output-on-failure`. The overlay capability policy test is mandatory.
 2. Commit and push the complete intended source, workflow, compatibility template, and submodule pointers.
 3. Run `./scripts/release.ps1 patch`, `minor`, or `major`. The helper requires clean release metadata and an up-to-date `main`, updates only `buildspec.json`, creates the matching commit and tag, and pushes both.
 

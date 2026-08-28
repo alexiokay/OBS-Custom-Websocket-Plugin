@@ -4,6 +4,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCO
 
 project(${_name} VERSION ${_version})
 
+include(CTest)
+
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
 option(ENABLE_QT "Use Qt functionality" ON)
 
@@ -92,3 +94,13 @@ set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES
     CXX_EXTENSIONS OFF)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+if(BUILD_TESTING)
+  add_test(
+    NAME overlay-capability-policy
+    COMMAND
+      ${CMAKE_COMMAND}
+      -DOBS_PLUGIN_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/obs_plugin.cpp
+      -DOVERLAY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/sources/overlay_source.cpp
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/overlay-capability-policy.cmake)
+endif()

@@ -60,7 +60,10 @@ sequenceDiagram
     
     U->>O: Add VortiDeck Overlay source
     O->>O: Create overlay_source wrapper
-    O->>O: Create browser_source child
+    O->>O: Keep browser_source at about:blank
+    O->>V: Authenticate and activate companion
+    V->>O: Deliver process-scoped overlay capability
+    O->>O: Apply capability URL to browser_source
     O->>V: Send canvas size (via WebSocket)
     V->>V: Initialize overlay at canvas resolution
     V->>O: Ready signal
@@ -132,7 +135,7 @@ interface OverlaySourceSettings {
     "source_name": "VortiDeck Overlay",
     "width": "2560",
     "height": "1440",
-    "url": "http://192.168.178.253:9001/overlay.html"
+    "url": "http://192.168.178.253:9001/overlay.html?overlayToken=<process-capability>"
   }
 }
 ```
@@ -143,7 +146,7 @@ interface OverlaySourceSettings {
   "actionId": "obs_overlay_create",
   "parameters": {
     "overlay_id": "main_overlay",
-    "url": "http://192.168.178.253:9001/overlay.html",
+    "url": "http://192.168.178.253:9001/overlay.html?overlayToken=<process-capability>",
     "source_name": "VortiDeck Overlay",
     "scene_name": "Scene 1",
     "width": "1920",
@@ -153,6 +156,16 @@ interface OverlaySourceSettings {
 ```
 
 ## Key Features
+
+### Authenticated capability handoff
+
+- mDNS advertises only public discovery metadata; it never carries an overlay token.
+- OBS identity is activated only after the host connection authentication boundary.
+- VortiDeck sends the current capability after every successful activation/reconnect.
+- A VortiDeck restart rotates the capability and automatically refreshes existing sources.
+- The plugin never derives an overlay URL from the discovered WebSocket address. A source without a host-issued capability remains `about:blank`.
+- Capability URLs and complete protocol payloads must never be written to OBS logs.
+- Same-machine operation is automatic. Dual-PC transport must use authenticated encrypted transport before it is considered production-secure.
 
 ### 1. Automatic Resolution Matching
 - **Main overlay** automatically resizes to match OBS canvas

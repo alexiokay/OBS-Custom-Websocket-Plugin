@@ -60,6 +60,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
           cmake --build --preset windows-ci-x64
           if ($LASTEXITCODE -ne 0) { throw "CMake build failed: $LASTEXITCODE" }
+          ctest --test-dir build_x64 -C RelWithDebInfo --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Companion tests failed: $LASTEXITCODE" }
           $dll = Resolve-Path 'build_x64\RelWithDebInfo\vorti-obs-plugin.dll'
           Copy-Item -LiteralPath $dll -Destination "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll" -Force
       - name: Sign and timestamp Windows companion
