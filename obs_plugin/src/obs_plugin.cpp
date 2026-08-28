@@ -3653,8 +3653,11 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
     }
     
     if (services_copy.empty()) {
-        log_to_obs("DEBUG: services_copy is empty, returning early");
-        return;
+        if (!force_show_dialog) {
+            log_to_obs("DEBUG: services_copy is empty and not forced, returning early");
+            return;
+        }
+        log_to_obs("DEBUG: services_copy is empty, opening dialog to await mDNS discovery");
     }
     
     // Show clear service selection information in log first
@@ -3767,6 +3770,30 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
             QMetaObject::invokeMethod(app, [services_copy, main_window, current_connected_url, is_currently_connected, persistent_dialog_ptr = &m_persistent_dialog, dialog_mutex_ptr = &m_dialog_mutex]() {
                 log_to_obs("DEBUG: Creating simple manual dialog with connection status");
                 ServiceSelectionDialog* dialog = new ServiceSelectionDialog(services_copy, static_cast<QWidget*>(main_window));
+
+                // Connect refresh signal to update list in real-time
+                QObject::connect(dialog, &ServiceSelectionDialog::refreshRequested, [dialog]() {
+                    log_to_obs("Dialog refresh requested - refreshing services");
+                    if (!m_discovery_in_progress) {
+                        start_continuous_discovery();
+                    }
+                    std::vector<ServiceInfo> current_services;
+                    {
+                        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
+                        current_services = m_discovered_services;
+                    }
+                    dialog->updateServiceList(current_services);
+                });
+
+                // Connect accepted signal to reconnect to user-selected service
+                QObject::connect(dialog, &QDialog::accepted, [dialog]() {
+                    std::string url = dialog->getSelectedServiceUrl();
+                    if (!url.empty()) {
+                        log_to_obs(std::format("User selected service from dialog: {}", url));
+                        m_selected_service_url = url;
+                        reconnect();
+                    }
+                });
                 
                 // Store dialog reference for live updates
                 {
@@ -4040,12 +4067,11 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
     // Add separator
     vortideck_menu->addSeparator();
     
-    // Add Overlays menu item (no restrictions)
-    QAction* overlays_action = vortideck_menu->addAction("Overlays (Free)");
+    // Add Overlays menu item pointing to modern /streaming/overlays page
+    QAction* overlays_action = vortideck_menu->addAction("Overlays");
     QObject::connect(overlays_action, &QAction::triggered, []() {
-        log_to_obs("VortiDeck Overlays (Free) clicked from top-level menu");
-        // Open VortiDeck overlays page
-        DeepLinkHandler::open_vortideck_with_fallback("overlay");
+        log_to_obs("VortiDeck Overlays clicked from top-level menu");
+        DeepLinkHandler::open_vortideck_with_fallback("streaming/overlays");
     });
     
     // Add Connection Settings submenu item  
@@ -4057,7 +4083,7 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
         }
     });
     
-    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings (ADS), Overlays (Free), and Connection Settings");
+    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings (ADS), Overlays, and Connection Settings");
 }
 
 void vorti::applets::obs_plugin::connection_settings_menu_callback(void* data)
@@ -4085,27 +4111,9 @@ void vorti::applets::obs_plugin::show_connection_settings_dialog()
     // Reset the dialog flag to allow showing the dialog again
     m_show_selection_dialog = false;
     
-    // Check if we have any discovered services first
-    {
-        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
-        if (m_discovered_services.empty()) {
-            log_to_obs("No VortiDeck services currently discovered - triggering discovery");
-            
-            // Set flag to show dialog when discovery completes
-            {
-                std::lock_guard<std::mutex> dialog_lock(m_dialog_mutex);
-                m_pending_dialog_request = true;
-            }
-            
-            // Start discovery if not already running
-            if (!m_discovery_in_progress) {
-                start_continuous_discovery();
-            }
-            
-            // Show message to user
-            log_to_obs("Discovery started - service selection dialog will appear when services are found");
-            return;
-        }
+    // Start discovery if not already running
+    if (!m_discovery_in_progress) {
+        start_continuous_discovery();
     }
     
     // Show the service selection dialog with current services
