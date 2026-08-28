@@ -16,9 +16,10 @@ Optionally configure and enable the documented Apple and Linux signing variables
 ## Normal developer flow
 
 1. Develop and test the plugin.
-2. Choose the next semantic version once in `buildspec.json`.
-3. Commit and push the complete intended source, workflow, compatibility template, and submodule pointers.
-4. In GitHub Actions, run **Native OBS Companion Release** on that commit.
+2. Commit and push the complete intended source, workflow, compatibility template, and submodule pointers.
+3. Run `./scripts/release.ps1 patch`, `minor`, or `major`. The helper requires clean release metadata and an up-to-date `main`, updates only `buildspec.json`, creates the matching commit and tag, and pushes both.
+
+For local manager testing without a release, run `./scripts/stage-local-companion.ps1 -DllPath <built-dll> -VortiDeckRoot <checkout>`, then rebuild VortiDeck. This regenerates the embedded manifest and hash but does not publish or sign anything.
 
 The workflow automatically:
 
