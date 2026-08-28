@@ -38,7 +38,7 @@
     },
     "name": "vorti-obs-plugin",
     "displayName": "VortiDeck OBS Plugin",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "author": "VortiDeck",
     "website": "https://vortideck.com",
     "email": "support@vortideck.com",
