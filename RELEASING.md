@@ -35,12 +35,14 @@ A failed build leaves a draft rather than advertising a partial release. Re-runn
 
 ## How the desktop consumes it
 
-Publish VortiDeck normally with a `desktop-v*` tag. Its workflow automatically resolves the latest stable companion release, verifies all recorded checksums and compatibility metadata plus the DLL's Authenticode signature, and embeds that exact DLL into the MSI. It uploads `obs-companion-provenance.json` beside the desktop release.
+Publish VortiDeck normally with a `desktop-v*` tag. Its workflow automatically resolves the latest stable companion release, verifies all recorded checksums and compatibility metadata, and verifies Authenticode when production enforcement is enabled. It stages that exact DLL as an application build resource; Rust embeds it inside `VortiDeck.exe`, while WiX remains responsible only for installing VortiDeck. The workflow uploads `obs-companion-provenance.json` beside the desktop release.
+
+At runtime, VortiDeck's OBS Companion manager installs the embedded recovery copy transactionally. It detects standard, custom, and portable OBS roots, checks PE architecture, refuses foreign files, stages and verifies replacements, writes an ownership receipt, and rolls back failed operations. The manager does not require GitHub access during installation.
 
 No DLL copying and no version/hash repository-variable synchronization are part of the normal flow. A manually dispatched desktop build can supply `obs_companion_tag` only when an intentional rollback is needed.
 
 ## Future distributions
 
 - Windows ARM64: add a `windows-ci-arm64` build and signed `vorti-obs-plugin-windows-arm64.dll`; never load the x64 DLL into native ARM64 OBS.
-- Portable Windows: publish a ZIP with `obs-plugins/64bit` and `data/obs-plugins/vorti-obs-plugin`; VortiDeck's future companion manager must install it only into a user-confirmed portable instance and record ownership.
-- Custom OBS paths: use registry and running-process discovery as hints, confirm the target, inspect architecture, and manage repair/removal explicitly. Do not make MSI scan disks or silently modify every detected installation.
+- Portable Windows: the VortiDeck manager already installs the embedded x64 DLL into a user-confirmed portable instance and records ownership. A separately downloadable ZIP can be added later as a manual recovery channel.
+- Custom OBS paths: the manager already uses registry/common/running-process discovery as hints, accepts explicit selection, confirms the target, inspects architecture, and manages repair/removal. MSI must never scan disks or silently modify detected installations.
