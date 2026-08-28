@@ -9,10 +9,10 @@ $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $repositoryRoot
 
 function Invoke-Git {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
-    & git @Arguments
+    $gitArguments = @($args)
+    & git @gitArguments
     if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+        throw "git $($gitArguments -join ' ') failed with exit code $LASTEXITCODE"
     }
 }
 
