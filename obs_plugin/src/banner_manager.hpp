@@ -215,7 +215,8 @@ namespace vorti {
             };
             
             // State variables
-            obs_source_t* m_banner_source;  // RESTORED: Single shared banner source across all scenes
+            // Per-scene wrapper management map
+            std::unordered_map<std::string, obs_source_t*> m_scene_wrappers;
 
             bool m_banner_visible;
             bool m_banner_persistent;  // True when banner should be unhideable

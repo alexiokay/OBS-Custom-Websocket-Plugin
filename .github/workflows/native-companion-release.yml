@@ -1,0 +1,248 @@
+name: Native OBS Companion Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Derive version and create a draft release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' buildspec.json)
+          release_tag="v$version"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "$release_tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match canonical buildspec version $release_tag." >&2
+            exit 1
+          fi
+          if release_json=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null); then
+            [[ $(jq -r '.isDraft' <<<"$release_json") == true ]] || {
+              echo "Published release $release_tag already exists; increment buildspec.json before publishing again." >&2
+              exit 1
+            }
+          else
+            gh release create "$release_tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "VortiDeck OBS Companion $release_tag" --generate-notes --draft
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: prepare-release
+    runs-on: windows-2022
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build Windows x64 companion
+        shell: pwsh
+        run: |
+          cmake --preset windows-ci-x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
+          cmake --build --preset windows-ci-x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake build failed: $LASTEXITCODE" }
+          $dll = Resolve-Path 'build_x64\RelWithDebInfo\vorti-obs-plugin.dll'
+          Copy-Item -LiteralPath $dll -Destination "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll" -Force
+      - name: Sign and timestamp Windows companion
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          $dll = "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll"
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) {
+            Write-Warning 'Publishing an unsigned development companion. Configure the code-signing certificate before enforcing production signatures.'
+          } else {
+            $certificatePath = Join-Path $env:RUNNER_TEMP 'vortideck-obs-codesign.pfx'
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signTool = Get-ChildItem -LiteralPath $kitsRoot -Directory |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+              Where-Object { Test-Path -LiteralPath $_ } |
+              Select-Object -First 1
+            if (-not $signTool) { throw 'signtool.exe was not found.' }
+            & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $dll
+            if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed: $LASTEXITCODE" }
+            & $signTool verify /pa /all $dll
+            if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed: $LASTEXITCODE" }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash
+          "$hash  vorti-obs-plugin-windows-x64.dll" | Set-Content -LiteralPath "$dll.sha256"
+      - name: Generate immutable compatibility and provenance manifest
+        shell: pwsh
+        run: |
+          $dll = "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash
+          $manifest = Get-Content -Raw -LiteralPath release-compatibility.json | ConvertFrom-Json
+          $manifest.plugin.version = '${{ needs.prepare-release.outputs.version }}'
+          $manifest | Add-Member -NotePropertyName source -NotePropertyValue ([ordered]@{
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            tag = $env:RELEASE_TAG
+          }) -Force
+          $artifact = @($manifest.artifacts | Where-Object { $_.platform -eq 'windows' -and $_.architecture -eq 'x86_64' })
+          if ($artifact.Count -ne 1) { throw 'Compatibility template must declare one Windows x86_64 artifact.' }
+          $artifact[0] | Add-Member -NotePropertyName fileName -NotePropertyValue 'vorti-obs-plugin-windows-x64.dll' -Force
+          $artifact[0] | Add-Member -NotePropertyName sha256 -NotePropertyValue $hash -Force
+          $signature = Get-AuthenticodeSignature -LiteralPath $dll
+          $artifact[0] | Add-Member -NotePropertyName signatureStatus -NotePropertyValue $signature.Status.ToString() -Force
+          $artifact[0] | Add-Member -NotePropertyName signer -NotePropertyValue $(if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }) -Force
+          $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$env:RUNNER_TEMP\release-compatibility.json" -Encoding utf8
+      - name: Publish Windows companion
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload $env:RELEASE_TAG "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll" "$env:RUNNER_TEMP\vorti-obs-plugin-windows-x64.dll.sha256" "$env:RUNNER_TEMP\release-compatibility.json" --clobber
+
+  macos:
+    needs: prepare-release
+    if: vars.ENABLE_MACOS_RELEASE == 'true'
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Require and import Developer ID identity
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name:-}" || { echo "Missing required macOS release secret: $name" >&2; exit 1; }
+          done
+          certificate_path="$RUNNER_TEMP/vortideck-obs-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/vortideck-obs-build.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychain -d user -s "$keychain_path" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          identity=$(security find-identity -v -p codesigning "$keychain_path" | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+          test -n "$identity" || { echo 'No Developer ID Application identity was imported.' >&2; exit 1; }
+          echo "CODESIGN_IDENT=$identity" >> "$GITHUB_ENV"
+          echo "CODESIGN_TEAM=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
+      - name: Build universal signed plugin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset macos-ci
+          cmake --build --preset macos-ci
+          cmake --install build_macos --config RelWithDebInfo --prefix "$RUNNER_TEMP/vortideck-obs-macos"
+          plugin="$RUNNER_TEMP/vortideck-obs-macos/vorti-obs-plugin.plugin"
+          test -d "$plugin" || { echo 'CMake did not produce the plugin bundle.' >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$plugin"
+          ditto -c -k --sequesterRsrc --keepParent "$plugin" "$RUNNER_TEMP/vorti-obs-plugin-macos-universal.zip"
+      - name: Notarize plugin archive
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit "$RUNNER_TEMP/vorti-obs-plugin-macos-universal.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+      - name: Publish macOS companion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/vorti-obs-plugin-macos-universal.zip" --clobber
+
+  linux:
+    needs: prepare-release
+    if: vars.ENABLE_LINUX_RELEASE == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential pkg-config libobs-dev qt6-base-dev
+      - name: Build Linux plugin and Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset linux-ci-x86_64
+          cmake --build --preset linux-ci-x86_64
+          cmake --install build_x86_64 --prefix "$RUNNER_TEMP/vortideck-obs-linux"
+          cmake --build build_x86_64 --target package
+          plugin=$(find "$RUNNER_TEMP/vortideck-obs-linux" -type f -name 'vorti-obs-plugin.so' -print -quit)
+          test -n "$plugin" || { echo 'CMake did not produce the Linux plugin.' >&2; exit 1; }
+          tar -C "$RUNNER_TEMP/vortideck-obs-linux" -cJf "$RUNNER_TEMP/vorti-obs-plugin-linux-x86_64.tar.xz" .
+      - name: Sign Linux companion artifacts
+        shell: bash
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$LINUX_GPG_PRIVATE_KEY" || { echo 'LINUX_GPG_PRIVATE_KEY is required.' >&2; exit 1; }
+          printf '%s' "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
+          mapfile -t artifacts < <(find release -maxdepth 1 -type f -name '*.deb' -print)
+          artifacts+=("$RUNNER_TEMP/vorti-obs-plugin-linux-x86_64.tar.xz")
+          test "${#artifacts[@]}" -ge 2 || { echo 'Expected a Debian package and tar archive.' >&2; exit 1; }
+          for artifact in "${artifacts[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$LINUX_GPG_PASSPHRASE" --armor --detach-sign "$artifact"
+          done
+          sha256sum "${artifacts[@]}" > "$RUNNER_TEMP/vorti-obs-plugin-linux-SHA256SUMS"
+      - name: Publish Linux companion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t debs < <(find release -maxdepth 1 -type f \( -name '*.deb' -o -name '*.deb.asc' \) -print)
+          gh release upload "$RELEASE_TAG" "${debs[@]}" "$RUNNER_TEMP/vorti-obs-plugin-linux-x86_64.tar.xz" "$RUNNER_TEMP/vorti-obs-plugin-linux-x86_64.tar.xz.asc" "$RUNNER_TEMP/vorti-obs-plugin-linux-SHA256SUMS" --clobber
+
+  publish-release:
+    needs: [prepare-release, windows, macos, linux]
+    if: >-
+      always() &&
+      needs.windows.result == 'success' &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped') &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish the fully assembled release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

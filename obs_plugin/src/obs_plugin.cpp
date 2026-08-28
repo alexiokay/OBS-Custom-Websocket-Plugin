@@ -1092,6 +1092,8 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
         return;
     }
 
+    std::string active_request_id;
+    std::string active_action_id;
     try
     {
         log_to_obs("Parsing JSON payload...");
@@ -1234,6 +1236,7 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
 
             if (!invoked_action.is_null())
             {
+                active_request_id = invoked_action.value("requestId", "");
                 log_to_obs("DEBUG: Payload is not null, checking integration GUID");
                 log_to_obs("DEBUG: Expected GUID: '" + m_integration_guid + "'");
                 
@@ -1250,6 +1253,7 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                         
                         try {
                             action_id = invoked_action["actionId"];
+                            active_action_id = action_id;
                             log_to_obs("DEBUG: Received action_id = '" + action_id + "'");
                             
                             // Manually extract parameters with type conversion
@@ -1274,10 +1278,13 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                         } catch (const std::exception& e) {
                             log_to_obs("ERROR: Failed to extract action parameters: " + std::string(e.what()));
                             log_to_obs("ERROR: Skipping action execution due to parameter error");
+                            send_action_receipt(active_request_id, active_action_id, false,
+                                                "Failed to extract action parameters: " + std::string(e.what()));
                             // Don't return - just skip action execution to keep websocket alive
                         }
 
                         if (extraction_succeeded) {
+                            bool action_handled = true;
                             if (action_id == actions::s_stream_start)
                             {
                                 action_stream_start(parameters);
@@ -1409,11 +1416,16 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
     }
                             else
                             {
+                                action_handled = false;
                                 log_to_obs("DEBUG: Unhandled action_id: '" + action_id + "'");
                             }
+                            send_action_receipt(active_request_id, action_id, action_handled,
+                                                action_handled ? "" : "OBS action is not registered");
                         } // End of if (extraction_succeeded)
                     } else {
                         log_to_obs("DEBUG: Integration GUID mismatch!");
+                        send_action_receipt(active_request_id, active_action_id, false,
+                                            "Integration GUID mismatch");
                     }
                 } else {
                     log_to_obs("DEBUG: No integrationGuid field in payload");
@@ -1426,6 +1438,7 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
     catch (std::exception& e)
     {
         log_to_obs("ERROR: Exception in message handling: " + std::string(e.what()));
+        send_action_receipt(active_request_id, active_action_id, false, e.what());
     }
 }
 
@@ -1534,16 +1547,67 @@ nlohmann::json vorti::applets::obs_plugin::register_action(const std::string &ac
                                                           const std::string &action_name,
                                                           const action_parameters &parameters)
 {
+    action_parameters normalized_parameters = parameters;
+    for (auto &parameter : normalized_parameters)
+    {
+        // Overlay actions historically used the UI-oriented name/description
+        // shape. Emit the canonical SDK fields while retaining the old fields
+        // for compatibility with older hosts.
+        if (!parameter.contains("parameterId") && parameter.contains("name"))
+            parameter["parameterId"] = parameter["name"];
+        if (!parameter.contains("assignmentMessage") && parameter.contains("description"))
+            parameter["assignmentMessage"] = parameter["description"];
+        if (!parameter.contains("errorMessage"))
+            parameter["errorMessage"] = "Invalid action parameter";
+        if (!parameter.contains("parameterType"))
+            parameter["parameterType"] = "STRING";
+        if (!parameter.contains("listSelection"))
+            parameter["listSelection"] = nlohmann::json::array();
+    }
+
     // clang-format off
     nlohmann::json action =
     {
         { "actionId", action_id },
         { "name", action_name },
-        { "parameters", parameters }
+        { "parameters", normalized_parameters }
     };
     // clang-format on
 
     return action;
+}
+
+
+void vorti::applets::obs_plugin::send_action_receipt(const std::string &request_id,
+                                                     const std::string &action_id,
+                                                     bool success,
+                                                     const std::string &error)
+{
+    // Older VortiDeck hosts do not send requestId and therefore do not expect a
+    // receipt. Keeping this a no-op preserves protocol compatibility.
+    if (request_id.empty())
+    {
+        return;
+    }
+
+    nlohmann::json payload = {
+        { "requestId", request_id },
+        { "actionId", action_id },
+        { "success", success }
+    };
+    if (!success)
+    {
+        payload["error"] = error.empty() ? "OBS action failed" : error;
+    }
+    nlohmann::json receipt = {
+        { "path", "/api/v1/integration/sdk/action/receipt" },
+        { "verb", "SET" },
+        { "payload", payload }
+    };
+    if (!send_message(receipt))
+    {
+        log_to_obs("ERROR: Failed to send action receipt for request " + request_id);
+    }
 }
 
 
@@ -1606,7 +1670,9 @@ void vorti::applets::obs_plugin::register_regular_actions()
         nlohmann::json url_param_main = {
             {"name", "url"},
             {"displayName", "URL"},
-            {"description", "URL for the overlay content"}
+            {"description", "URL for the overlay content"},
+            {"parameterType", "STRING"},
+            {"required", true}
         };
         overlay_set_data_params.push_back(url_param_main);
         actions.push_back(register_action(actions::s_overlay_set_data, "APPLET_OBS_OVERLAY_SET_DATA", overlay_set_data_params));
@@ -1616,32 +1682,44 @@ void vorti::applets::obs_plugin::register_regular_actions()
         nlohmann::json overlay_id_param = {
             {"name", "overlay_id"},
             {"displayName", "Overlay ID"},
-            {"description", "Unique identifier for the overlay"}
+            {"description", "Unique identifier for the overlay"},
+            {"parameterType", "STRING"},
+            {"required", true}
         };
         nlohmann::json url_param_create = {
             {"name", "url"},
             {"displayName", "URL"},
-            {"description", "URL for the overlay content"}
+            {"description", "URL for the overlay content"},
+            {"parameterType", "STRING"},
+            {"required", true}
         };
         nlohmann::json name_param = {
             {"name", "name"},
             {"displayName", "Source Name"},
-            {"description", "Optional custom name for the source"}
+            {"description", "Optional custom name for the source"},
+            {"parameterType", "STRING"},
+            {"required", false}
         };
         nlohmann::json scene_param = {
             {"name", "scene_name"},
             {"displayName", "Scene Name"},
-            {"description", "Optional scene to add the overlay to"}
+            {"description", "Optional scene to add the overlay to"},
+            {"parameterType", "STRING"},
+            {"required", false}
         };
         nlohmann::json width_param_overlay = {
             {"name", "width"},
             {"displayName", "Width"},
-            {"description", "Optional width in pixels (default: 1920)"}
+            {"description", "Optional width in pixels (default: 1920)"},
+            {"parameterType", "NUMBER"},
+            {"required", false}
         };
         nlohmann::json height_param_overlay = {
             {"name", "height"},
             {"displayName", "Height"},
-            {"description", "Optional height in pixels (default: 1080)"}
+            {"description", "Optional height in pixels (default: 1080)"},
+            {"parameterType", "NUMBER"},
+            {"required", false}
         };
         overlay_create_params.push_back(overlay_id_param);
         overlay_create_params.push_back(url_param_create);
@@ -1653,13 +1731,17 @@ void vorti::applets::obs_plugin::register_regular_actions()
         
         // Overlay update action
         action_parameters overlay_update_params;
+        nlohmann::json url_param_update = url_param_create;
+        url_param_update["required"] = false;
         nlohmann::json source_name_param = {
             {"name", "source_name"},
             {"displayName", "Source Name"},
-            {"description", "Name of the overlay source to update"}
+            {"description", "Name of the overlay source to update"},
+            {"parameterType", "STRING"},
+            {"required", true}
         };
         overlay_update_params.push_back(source_name_param);
-        overlay_update_params.push_back(url_param_create);
+        overlay_update_params.push_back(url_param_update);
         overlay_update_params.push_back(width_param_overlay);
         overlay_update_params.push_back(height_param_overlay);
         actions.push_back(register_action(actions::s_overlay_update, "APPLET_OBS_OVERLAY_UPDATE", overlay_update_params));
@@ -1681,6 +1763,7 @@ void vorti::applets::obs_plugin::register_regular_actions()
         { "payload",
             {
                 { "actions", actions },
+                { "supportsActionReceipts", true },
                 { "instance",
                     {
                         { "integrationGuid", m_integration_guid },
@@ -1738,6 +1821,7 @@ void vorti::applets::obs_plugin::register_parameter_actions()
         { "payload",
             {
                 { "actions", actions },
+                { "supportsActionReceipts", true },
                 { "instance",
                     {
                         { "integrationGuid", m_integration_guid },

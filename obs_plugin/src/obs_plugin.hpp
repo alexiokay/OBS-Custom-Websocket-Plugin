@@ -196,6 +196,10 @@ namespace vorti
             bool register_actions_broadcast();
             void register_regular_actions();
             void register_parameter_actions();
+            void send_action_receipt(const std::string &request_id,
+                                     const std::string &action_id,
+                                     bool success,
+                                     const std::string &error = std::string());
 
             // Action handlers
             void action_stream_start(const action_invoke_parameters &parameters);

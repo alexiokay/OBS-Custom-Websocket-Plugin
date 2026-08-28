@@ -30,8 +30,7 @@ struct plugin_interface {
 extern plugin_interface* g_obs_plugin_instance;
 
 banner_manager::banner_manager()
-    : m_banner_source(nullptr)
-    , m_banner_visible(false)
+    : m_banner_visible(false)
     , m_banner_persistent(false)
     , m_persistence_monitor_active(false)
     , m_current_banner_content("")
@@ -68,7 +67,7 @@ banner_manager::banner_manager()
     } catch (...) {
         log_message("CONSTRUCTOR: Exception while testing OBS version function");
     }
-    
+
     // Test if we can create a basic color source (this is a good test of OBS functionality)
     try {
         obs_data_t* test_settings = obs_data_create();
@@ -113,11 +112,8 @@ banner_manager::~banner_manager()
     disconnect_source_signals();
     stop_persistence_monitor();
 
-    // Release single shared banner source
-    if (m_banner_source) {
-        obs_source_release(m_banner_source);
-        m_banner_source = nullptr;
-    }
+    // Release all per-scene wrapper sources
+    release_all_wrappers();
 
     log_message("Banner manager destroyed - polling thread automatically joined");
 }
@@ -270,13 +266,8 @@ void banner_manager::enable_signal_connections_when_safe()
             // Double-check shutdown flags after sleep
             if (m_shutting_down.load() || stop_token.stop_requested()) break;
 
-            // Check if banner source exists
-            if (!m_banner_source) {
-                log_message("POLLING: Banner source NULL - recreating");
-                create_banner_source();
-                initialize_banners_all_scenes();
-                continue;
-            }
+            // We don't check for global m_banner_source anymore
+            // We just ensure the wrapper exists for the current scene below
 
             // Check if banner is in current scene
             obs_source_t* current_scene_source = obs_frontend_get_current_scene();
@@ -285,12 +276,16 @@ void banner_manager::enable_signal_connections_when_safe()
                 if (scene) {
                     obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
                     if (!item) {
-                        log_message("POLLING: Banner missing from current scene - re-adding");
-                        obs_sceneitem_t* new_item = obs_scene_add(scene, m_banner_source);
-                        if (new_item) {
-                            obs_sceneitem_set_visible(new_item, true);
-                            obs_sceneitem_set_locked(new_item, true);
-                            obs_sceneitem_set_order(new_item, OBS_ORDER_MOVE_TOP);
+                        log_message("POLLING: Banner missing from current scene - re-adding via wrapper");
+                        std::string scene_name = obs_source_get_name(current_scene_source);
+                        obs_source_t* wrapper = get_or_create_wrapper_for_scene(scene_name);
+                        if (wrapper) {
+                            obs_sceneitem_t* new_item = obs_scene_add(scene, wrapper);
+                            if (new_item) {
+                                obs_sceneitem_set_visible(new_item, true);
+                                obs_sceneitem_set_locked(new_item, true);
+                                obs_sceneitem_set_order(new_item, OBS_ORDER_MOVE_TOP);
+                            }
                         }
                     }
                 }
@@ -1266,74 +1261,23 @@ void banner_manager::create_banner_source(std::string_view content_data, std::st
         banner_url = websocket_url + "/banners";
     }
 
-    log_message("BANNER CREATION: Banner URL: " + banner_url);
+    log_message("BANNER UPDATE: Banner URL: " + banner_url);
 
-    // Check if banner source already exists
-    obs_source_t* existing_source = obs_get_source_by_name(m_banner_source_name.c_str());
-    if (existing_source) {
-        const char* source_id = obs_source_get_id(existing_source);
-        log_message("BANNER CREATION: Found existing banner source with type: " + std::string(source_id ? source_id : "unknown"));
+    // Update all per-scene wrappers
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "url", banner_url.c_str());
+    obs_data_set_string(settings, "banner_id", "main_banner");
 
-        // Check if it's the OLD browser_source type (needs migration)
-        if (source_id && strcmp(source_id, "browser_source") == 0) {
-            log_message("BANNER CREATION: OLD browser_source detected - DELETING for migration to vortideck_banner_menu");
-            obs_source_remove(existing_source);
-            obs_source_release(existing_source);
-
-            // Remove from all scenes
-            obs_frontend_source_list scenes = {};
-            obs_frontend_get_scenes(&scenes);
-            if (scenes.sources.array) {
-                for (size_t i = 0; i < scenes.sources.num; i++) {
-                    obs_source_t* scene_source = scenes.sources.array[i];
-                    if (scene_source) {
-                        obs_scene_t* scene = obs_scene_from_source(scene_source);
-                        if (scene) {
-                            obs_sceneitem_t* item = obs_scene_find_source(scene, m_banner_source_name.c_str());
-                            if (item) {
-                                obs_sceneitem_remove(item);
-                            }
-                        }
-                    }
-                }
-                obs_frontend_source_list_free(&scenes);
-            }
-
-            log_message("BANNER CREATION: Old browser_source deleted, will create new vortideck_banner_menu wrapper");
-            // Continue to create new wrapper below
-        } else {
-            // It's already a vortideck_banner_menu wrapper, just update URL
-            log_message("BANNER CREATION: Found existing vortideck_banner_menu wrapper, updating URL");
-            if (m_banner_source) {
-                obs_source_release(m_banner_source);
-            }
-            m_banner_source = existing_source;
-
-            // Update URL
-            obs_data_t* settings = obs_data_create();
-            obs_data_set_string(settings, "url", banner_url.c_str());
-            obs_source_update(m_banner_source, settings);
-            obs_data_release(settings);
-            return;
+    int updated_count = 0;
+    for (auto& [name, wrapper] : m_scene_wrappers) {
+        if (wrapper) {
+            obs_source_update(wrapper, settings);
+            updated_count++;
         }
     }
 
-    // CRITICAL FIX: Use vortideck_banner_menu wrapper (like overlays use vortideck_overlay)
-    // The wrapper creates a browser_source as an active child, preventing CEF/WASAPI crashes
-    obs_data_t* settings = obs_data_create();
-    obs_data_set_string(settings, "url", banner_url.c_str());
-    obs_data_set_string(settings, "banner_id", "main_banner");  // Banner ID for the wrapper
-
-    // Create vortideck_banner_menu wrapper (NOT raw browser_source)
-    // The wrapper will internally create the browser_source as an active child
-    m_banner_source = obs_source_create("vortideck_banner_menu", m_banner_source_name.c_str(), settings, nullptr);
     obs_data_release(settings);
-
-    if (m_banner_source) {
-        log_message("BANNER CREATION: Successfully created vortideck_banner_menu wrapper (prevents CEF crashes)");
-    } else {
-        log_message("BANNER CREATION: ERROR - Failed to create banner wrapper source!");
-    }
+    log_message("BANNER UPDATE: Successfully updated URL for " + std::to_string(updated_count) + " wrappers.");
 }
 
 // ============================================================================
@@ -1347,11 +1291,17 @@ obs_source_t* banner_manager::get_or_create_wrapper_for_scene(const std::string&
     // Build unique name for this wrapper
     std::string wrapper_name = m_banner_source_name + " (" + scene_name + ")";
 
+    // Check if wrapper already exists in our map
+    if (auto it = m_scene_wrappers.find(wrapper_name); it != m_scene_wrappers.end() && it->second) {
+        log_message("WRAPPER: Found existing wrapper for scene: " + scene_name);
+        return it->second;
+    }
+
     // Check if wrapper already exists by name
     obs_source_t* existing = obs_get_source_by_name(wrapper_name.c_str());
     if (existing) {
-        log_message("WRAPPER: Found existing wrapper for scene: " + scene_name);
-        // obs_get_source_by_name increments refcount - return it, caller must release
+        log_message("WRAPPER: Found existing wrapper from OBS for scene: " + scene_name);
+        m_scene_wrappers[wrapper_name] = existing;
         return existing;
     }
 
@@ -1396,11 +1346,7 @@ obs_source_t* banner_manager::get_or_create_wrapper_for_scene(const std::string&
     if (wrapper) {
         log_message("WRAPPER: SUCCESS - Created wrapper for scene: " + scene_name + " with URL: " + banner_url);
 
-        // IMPORTANT: This function returns a strong reference (refcount +1)
-        // Caller MUST call obs_source_release() after adding to scene
-        // obs_scene_add() adds its own reference, so caller's reference must be released
-        // This ensures proper lifecycle: scene holds reference, manager doesn't
-
+        m_scene_wrappers[wrapper_name] = wrapper;
         return wrapper;
     } else {
         log_message("WRAPPER: FAILED - Could not create wrapper for scene: " + scene_name);
@@ -1410,16 +1356,26 @@ obs_source_t* banner_manager::get_or_create_wrapper_for_scene(const std::string&
 
 void banner_manager::release_wrapper_for_scene(const std::string& scene_name)
 {
-    // NOTE: We don't hold references anymore - OBS manages wrapper lifecycle
-    // This method is kept for API compatibility but does nothing
-    log_message("WRAPPER: Not holding references - OBS will clean up wrapper for scene: " + scene_name);
+    std::string wrapper_name = m_banner_source_name + " (" + scene_name + ")";
+    if (auto it = m_scene_wrappers.find(wrapper_name); it != m_scene_wrappers.end()) {
+        if (it->second) {
+            obs_source_release(it->second);
+        }
+        m_scene_wrappers.erase(it);
+        log_message("WRAPPER: Released and removed wrapper for scene: " + scene_name);
+    }
 }
 
 void banner_manager::release_all_wrappers()
 {
-    // NOTE: We don't hold references anymore - OBS manages wrapper lifecycle
-    // This allows OBS to properly clean up sources during shutdown
-    log_message("WRAPPER: Not holding references - OBS will clean up all wrappers automatically");
+    log_message("WRAPPER: Releasing all " + std::to_string(m_scene_wrappers.size()) + " per-scene wrappers...");
+    for (auto& [name, wrapper] : m_scene_wrappers) {
+        if (wrapper) {
+            obs_source_release(wrapper);
+        }
+    }
+    m_scene_wrappers.clear();
+    log_message("WRAPPER: All wrappers released successfully.");
 }
 
 // void banner_manager::create_banner_source_with_custom_params(std::string_view content_data, std::string_view content_type,
@@ -1833,14 +1789,16 @@ void banner_manager::initialize_banners_all_scenes()
             scenes_already_covered++;
             log_message("FREE USER: Scene '" + std::string(scene_name) + "' already has " + std::to_string(banner_count) + " banner(s) - NO NEW CREATION");
         } else {
-            // Scene missing banner - add single shared banner source
-            if (!m_banner_source) {
-                log_message("FREE USER: No banner source exists, cannot add to scene");
+            // Scene missing banner - add using per-scene wrapper
+            std::string scene_name_str(scene_name);
+            obs_source_t* wrapper = get_or_create_wrapper_for_scene(scene_name_str);
+            if (!wrapper) {
+                log_message("FREE USER: Failed to create banner wrapper, cannot add to scene: " + scene_name_str);
                 continue;
             }
 
-            // Add the single shared banner source to this scene
-            obs_sceneitem_t* scene_item = obs_scene_add(scene, m_banner_source);
+            // Add the per-scene wrapper to this scene
+            obs_sceneitem_t* scene_item = obs_scene_add(scene, wrapper);
             if (scene_item) {
                 // Position banner at 0,0
                 vec2 pos = {0, 0};

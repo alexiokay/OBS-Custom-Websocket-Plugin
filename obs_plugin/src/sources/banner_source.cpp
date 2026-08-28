@@ -1,6 +1,6 @@
 #include "banner_source.h"
 #include "vortideck_common.h"
-#include "../obs_plugin/src/banner_manager.hpp"
+#include "../banner_manager.hpp"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/dstr.h>

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "plugin": {
+    "id": "vorti-obs-plugin",
+    "version": null,
+    "protocolVersion": 1
+  },
+  "vortideck": {
+    "minimumVersion": "0.6.9"
+  },
+  "obs": {
+    "builtAgainst": "30.1.2",
+    "testedVersions": [
+      "30.1.2"
+    ],
+    "policy": "Only listed OBS versions are release-validated; expand this list after automated and manual compatibility tests."
+  },
+  "artifacts": [
+    {
+      "platform": "windows",
+      "architecture": "x86_64",
+      "kind": "dll"
+    },
+    {
+      "platform": "macos",
+      "architecture": "universal",
+      "kind": "plugin-bundle-zip"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "kind": "deb-and-so-archive"
+    }
+  ]
+}
