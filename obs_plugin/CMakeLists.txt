@@ -78,7 +78,7 @@ target_include_directories(${CMAKE_PROJECT_NAME}
         ${DEPS_DIR}/other/websocketpp
         ${DEPS_DIR}/other/json/include
         ${DEPS_DIR}/other/asio/asio/include
-        ${DEPS_DIR}/other/mdns_cpp/include)
+        ${DEPS_DIR}/other/mdns_cpp/src)
 
 # Add source files
 target_sources(${CMAKE_PROJECT_NAME}
@@ -89,6 +89,8 @@ target_sources(${CMAKE_PROJECT_NAME}
         src/banner_manager.hpp
         src/mdns_discovery.cpp
         src/mdns_discovery.hpp
+        src/structured_mdns_query.cpp
+        src/structured_mdns_query.hpp
         src/ui/service_selection_dialog.cpp
         src/ui/service_selection_dialog.hpp
         src/ui/ServiceSelectionDialog.ui
@@ -96,10 +98,7 @@ target_sources(${CMAKE_PROJECT_NAME}
         src/sources/overlay_source.h
         src/sources/banner_source.cpp
         src/sources/banner_source.h
-        src/vortideck_common.h
-        ${DEPS_DIR}/other/mdns_cpp/src/logger.cpp
-        ${DEPS_DIR}/other/mdns_cpp/src/mdns.cpp
-        ${DEPS_DIR}/other/mdns_cpp/src/utils.cpp)
+        src/vortideck_common.h)
 
 # Set output name for the plugin
 set_target_properties(${CMAKE_PROJECT_NAME} 

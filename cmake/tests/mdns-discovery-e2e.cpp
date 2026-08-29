@@ -1,13 +1,10 @@
 #include "mdns_discovery.hpp"
+#include "mdns-test-advertiser.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <string>
-#include <thread>
-
-#include "mdns_cpp/mdns.hpp"
-#include "mdns_cpp/logger.hpp"
 
 int main(int argc, char** argv)
 {
@@ -20,15 +17,10 @@ int main(int argc, char** argv)
     vorti::applets::obs_plugin::MDNSDiscovery discovery(
         [&logs](const std::string& message) { logs.push_back(message); });
 
-    std::unique_ptr<mdns_cpp::mDNS> advertised_service;
+    std::unique_ptr<MdnsTestAdvertiser> advertised_service;
     if (!probe_existing) {
-        mdns_cpp::Logger::setLoggerSink([](const std::string&) {});
-        advertised_service = std::make_unique<mdns_cpp::mDNS>();
-        advertised_service->setServiceName(vorti::applets::obs_plugin::MDNSDiscovery::SERVICE_TYPE);
-        advertised_service->setServiceHostname("vortideck-e2e");
-        advertised_service->setServicePort(test_port);
-        advertised_service->startService();
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        advertised_service = std::make_unique<MdnsTestAdvertiser>(test_port);
+        advertised_service->start();
     }
 
     bool callback_received = false;
@@ -45,11 +37,7 @@ int main(int argc, char** argv)
     });
 
     if (advertised_service) {
-        std::thread stop_thread([&advertised_service]() { advertised_service->stopService(); });
-        vorti::applets::obs_plugin::MDNSDiscovery wake_discovery;
-        wake_discovery.discover_services(std::chrono::seconds(1));
-        stop_thread.join();
-        mdns_cpp::Logger::useDefaultSink();
+        advertised_service->stop();
     }
 
     if (match == services.end() || !callback_received) {

@@ -22,17 +22,14 @@ add_executable(mdns_discovery_test
     main.cpp
     # mDNS discovery implementation
     ../obs_plugin/src/mdns_discovery.cpp
-    # mdns_cpp library sources
-    ${DEPS_DIR}/other/mdns_cpp/src/logger.cpp
-    ${DEPS_DIR}/other/mdns_cpp/src/mdns.cpp
-    ${DEPS_DIR}/other/mdns_cpp/src/utils.cpp
+    ../obs_plugin/src/structured_mdns_query.cpp
 )
 
 # Set include directories
 target_include_directories(mdns_discovery_test
     PRIVATE
     ../obs_plugin/src
-    ${DEPS_DIR}/other/mdns_cpp/include
+    ${DEPS_DIR}/other/mdns_cpp/src
 )
 
 # Platform-specific settings
@@ -54,4 +51,4 @@ endif()
 
 # Debug output
 message(STATUS "DEPS_DIR: ${DEPS_DIR}")
-message(STATUS "mdns_cpp include: ${DEPS_DIR}/other/mdns_cpp/include")
+message(STATUS "mdns low-level include: ${DEPS_DIR}/other/mdns_cpp/src")

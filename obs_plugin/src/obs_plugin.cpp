@@ -968,7 +968,9 @@ void vorti::applets::obs_plugin::on_service_discovered(const ServiceInfo& servic
                         // Only update if dialog is visible (not hidden/closing)
                         if (dialog_ptr && dialog_ptr->isVisible()) {
                             try {
-                                dialog_ptr->updateServiceList(services_copy);
+                                const std::string connected_url =
+                                    is_connected() ? m_selected_service_url : std::string{};
+                                dialog_ptr->updateServiceList(services_copy, connected_url);
                                 log_to_obs("Updated dialog with new service list");
                             } catch (...) {
                                 log_to_obs("Exception updating dialog service list - ignored");
@@ -3406,11 +3408,12 @@ void complete_discovery_refresh_ui()
         std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
         refreshed_services = m_discovered_services;
     }
-    QMetaObject::invokeMethod(qApp, [refreshed_services]() {
+    const std::string connected_url = is_connected() ? m_selected_service_url : std::string{};
+    QMetaObject::invokeMethod(qApp, [refreshed_services, connected_url]() {
         std::lock_guard<std::mutex> lock(m_dialog_mutex);
         auto* dialog = static_cast<ServiceSelectionDialog*>(m_persistent_dialog);
         if (dialog && dialog->isVisible()) {
-            dialog->completeRefresh(refreshed_services);
+            dialog->completeRefresh(refreshed_services, connected_url);
         }
     }, Qt::QueuedConnection);
 }
@@ -3774,7 +3777,10 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
             // Simple non-blocking dialog creation with connection status
             QMetaObject::invokeMethod(app, [services_copy, main_window, current_connected_url, is_currently_connected, persistent_dialog_ptr = &m_persistent_dialog, dialog_mutex_ptr = &m_dialog_mutex]() {
                 log_to_obs("DEBUG: Creating simple manual dialog with connection status");
-                ServiceSelectionDialog* dialog = new ServiceSelectionDialog(services_copy, static_cast<QWidget*>(main_window));
+                ServiceSelectionDialog* dialog = new ServiceSelectionDialog(
+                    services_copy,
+                    is_currently_connected ? current_connected_url : std::string{},
+                    static_cast<QWidget*>(main_window));
 
                 // Connect refresh signal to update list in real-time
                 QObject::connect(dialog, &ServiceSelectionDialog::refreshRequested, [dialog]() {
@@ -3850,7 +3856,10 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
         if (false) {
             // We're already on the main thread, call directly
             log_to_obs("DEBUG: Creating dialog directly (already on main thread)");
-            ServiceSelectionDialog dialog(services_copy, static_cast<QWidget*>(main_window));
+            ServiceSelectionDialog dialog(
+                services_copy,
+                is_connected() ? m_selected_service_url : std::string{},
+                static_cast<QWidget*>(main_window));
             log_to_obs("DEBUG: ServiceSelectionDialog created successfully");
             
             // Store dialog reference for live updates
@@ -3885,7 +3894,7 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
                         current_services = m_discovered_services;
                     }
                     
-                    dialog.updateServiceList(current_services);
+                    dialog.updateServiceList(current_services, m_selected_service_url);
                     
                     // Mark connected service
                     for (size_t i = 0; i < current_services.size(); ++i) {
@@ -3915,7 +3924,10 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
             // We're on a background thread, use invokeMethod
             QMetaObject::invokeMethod(app, [&]() {
                 log_to_obs("DEBUG: Creating dialog on main thread via invokeMethod");
-                ServiceSelectionDialog dialog(services_copy, static_cast<QWidget*>(main_window));
+                ServiceSelectionDialog dialog(
+                    services_copy,
+                    is_connected() ? m_selected_service_url : std::string{},
+                    static_cast<QWidget*>(main_window));
                 log_to_obs("DEBUG: ServiceSelectionDialog created successfully on main thread");
                 log_to_obs("DEBUG: About to show dialog (non-blocking) on main thread");
                 dialog.show();

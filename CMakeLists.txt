@@ -43,7 +43,6 @@ target_include_directories(${CMAKE_PROJECT_NAME}
         ${CMAKE_SOURCE_DIR}/other/websocketpp
         ${CMAKE_SOURCE_DIR}/other/json/include
         ${CMAKE_SOURCE_DIR}/other/asio/asio/include
-        ${CMAKE_SOURCE_DIR}/other/mdns_cpp/include
         ${CMAKE_SOURCE_DIR}/other/mdns_cpp/src)
 
 # Add all our source files
@@ -64,10 +63,7 @@ target_sources(${CMAKE_PROJECT_NAME}
         obs_plugin/src/sources/overlay_source.h
         obs_plugin/src/sources/banner_source.cpp
         obs_plugin/src/sources/banner_source.h
-        obs_plugin/src/vortideck_common.h
-        other/mdns_cpp/src/logger.cpp
-        other/mdns_cpp/src/mdns.cpp
-        other/mdns_cpp/src/utils.cpp)
+        obs_plugin/src/vortideck_common.h)
 
 # Add compile definitions
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
@@ -110,16 +106,13 @@ if(BUILD_TESTING)
   add_executable(
     mdns-discovery-e2e
     cmake/tests/mdns-discovery-e2e.cpp
+    cmake/tests/mdns-test-advertiser.cpp
     obs_plugin/src/mdns_discovery.cpp
-    obs_plugin/src/structured_mdns_query.cpp
-    other/mdns_cpp/src/logger.cpp
-    other/mdns_cpp/src/mdns.cpp
-    other/mdns_cpp/src/utils.cpp)
+    obs_plugin/src/structured_mdns_query.cpp)
   target_include_directories(
     mdns-discovery-e2e
     PRIVATE
       ${CMAKE_SOURCE_DIR}/obs_plugin/src
-      ${CMAKE_SOURCE_DIR}/other/mdns_cpp/include
       ${CMAKE_SOURCE_DIR}/other/mdns_cpp/src)
   set_target_properties(
     mdns-discovery-e2e

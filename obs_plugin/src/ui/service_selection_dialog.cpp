@@ -6,13 +6,18 @@
 #include <QDebug>
 #include <QApplication>
 #include <QTimer>
+#include <utility>
 
 using namespace vorti::applets::obs_plugin;
 
-ServiceSelectionDialog::ServiceSelectionDialog(const std::vector<ServiceInfo>& services, QWidget *parent)
+ServiceSelectionDialog::ServiceSelectionDialog(
+    const std::vector<ServiceInfo>& services,
+    std::string connectedServiceUrl,
+    QWidget *parent)
     : QDialog(parent)
     , ui(std::make_unique<Ui::ServiceSelectionDialog>())
     , m_services(services)
+    , m_connectedServiceUrl(std::move(connectedServiceUrl))
     , m_selectedIndex(-1)
     , m_accepted(false)
 {
@@ -112,8 +117,10 @@ void ServiceSelectionDialog::populateServiceList()
         const auto& service = m_services[i];
         
         // Add connection status indicator
-        QString statusIcon = "🔴"; // Red circle for disconnected
-        QString statusText = "Disconnected";
+        const bool connected = !m_connectedServiceUrl.empty() &&
+                               service.websocket_url == m_connectedServiceUrl;
+        QString statusIcon = connected ? "🟢" : "⚪";
+        QString statusText = connected ? "Connected" : "Available";
         
         // Create display text with status
         QString displayText = QString("%1 %2 (%3:%4)")
@@ -314,6 +321,11 @@ void ServiceSelectionDialog::updateServiceStatus(int serviceIndex, bool connecte
         QListWidgetItem* item = ui->serviceList->item(i);
         if (item && item->data(Qt::UserRole).toInt() == serviceIndex) {
             const auto& service = m_services[serviceIndex];
+            if (connected) {
+                m_connectedServiceUrl = service.websocket_url;
+            } else if (m_connectedServiceUrl == service.websocket_url) {
+                m_connectedServiceUrl.clear();
+            }
             
             // Update status icon and text
             QString statusIcon = connected ? "🟢" : "🔴"; // Green for connected, red for disconnected
@@ -400,17 +412,21 @@ void ServiceSelectionDialog::onRefreshClicked()
 }
 
 void ServiceSelectionDialog::completeRefresh(
-    const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services)
+    const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services,
+    std::string connectedServiceUrl)
 {
-    updateServiceList(services);
+    updateServiceList(services, std::move(connectedServiceUrl));
     ui->refreshButton->setText("Refresh");
     ui->refreshButton->setEnabled(true);
 }
 
-void ServiceSelectionDialog::updateServiceList(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services)
+void ServiceSelectionDialog::updateServiceList(
+    const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services,
+    std::string connectedServiceUrl)
 {
     // Update internal services list
     m_services = services;
+    m_connectedServiceUrl = std::move(connectedServiceUrl);
     
     // Clear and repopulate the list
     ui->serviceList->clear();

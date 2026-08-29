@@ -18,7 +18,10 @@ class ServiceSelectionDialog : public QDialog
     Q_OBJECT
 
 public:
-    explicit ServiceSelectionDialog(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services, QWidget *parent = nullptr);
+    explicit ServiceSelectionDialog(
+        const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services,
+        std::string connectedServiceUrl = {},
+        QWidget *parent = nullptr);
     virtual ~ServiceSelectionDialog();
     
     // Get the selected service URL, empty if cancelled
@@ -34,8 +37,12 @@ public:
     void updateServiceStatus(int serviceIndex, bool connected);
     
     // Update the service list with new discoveries
-    void updateServiceList(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services);
-    void completeRefresh(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services);
+    void updateServiceList(
+        const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services,
+        std::string connectedServiceUrl);
+    void completeRefresh(
+        const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services,
+        std::string connectedServiceUrl);
     
     // Show/hide connecting progress indicator
     void showConnectingProgress(const std::string& message);
@@ -74,6 +81,7 @@ private:
     
     // Data
     std::vector<vorti::applets::obs_plugin::ServiceInfo> m_services;
+    std::string m_connectedServiceUrl;
     std::string m_selectedUrl;
     int m_selectedIndex;
     bool m_accepted;
