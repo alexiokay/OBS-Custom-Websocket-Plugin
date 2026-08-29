@@ -397,12 +397,14 @@ void ServiceSelectionDialog::onRefreshClicked()
     
     // Emit signal to request refresh from main plugin
     emit refreshRequested();
-    
-    // Re-enable button after a short delay
-    QTimer::singleShot(2000, this, [this]() {
-        ui->refreshButton->setText("Refresh");
-        ui->refreshButton->setEnabled(true);
-    });
+}
+
+void ServiceSelectionDialog::completeRefresh(
+    const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services)
+{
+    updateServiceList(services);
+    ui->refreshButton->setText("Refresh");
+    ui->refreshButton->setEnabled(true);
 }
 
 void ServiceSelectionDialog::updateServiceList(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services)

@@ -162,6 +162,7 @@ namespace vorti
             void start_continuous_discovery();
             void stop_continuous_discovery();
             void continuous_discovery_worker();
+            void request_immediate_discovery();
             void save_discovered_service_state(const ServiceInfo& service);
             bool load_last_known_service_state();
             std::string get_best_available_service_url();
@@ -299,6 +300,9 @@ namespace vorti
             std::mutex m_discovered_services_mutex;
             std::vector<ServiceInfo> m_discovered_services;
             std::chrono::steady_clock::time_point m_last_discovery_time;
+            std::atomic<bool> m_discovery_refresh_requested{false};
+            std::mutex m_discovery_wake_mutex;
+            std::condition_variable m_discovery_wake_cv;
             std::atomic<bool> m_service_found{false};
             std::atomic<bool> m_show_selection_dialog{false};
             std::atomic<int> m_connection_failure_count{0};

@@ -16,7 +16,7 @@ Optionally configure and enable the documented Apple and Linux signing variables
 ## Normal developer flow
 
 1. Develop and test the plugin.
-   Run `cmake --preset windows-ci-x64`, build the preset, and run `ctest --test-dir build_x64 -C RelWithDebInfo --output-on-failure`. The overlay capability policy test is mandatory.
+   Run `cmake --preset windows-ci-x64`, build the preset, and run `ctest --test-dir build_x64 -C RelWithDebInfo --output-on-failure`. The overlay capability policy and structured mDNS end-to-end tests are mandatory.
 2. Commit and push the complete intended source, workflow, compatibility template, and submodule pointers.
 3. Run `./scripts/release.ps1 patch`, `minor`, or `major`. The helper requires clean release metadata and an up-to-date `main`, updates only `buildspec.json`, creates the matching commit and tag, and pushes both.
 
@@ -42,6 +42,16 @@ Publish VortiDeck normally with a `desktop-v*` tag. Its workflow automatically r
 At runtime, VortiDeck's OBS Companion manager installs the embedded recovery copy transactionally. It detects standard, custom, and portable OBS roots, checks PE architecture, refuses foreign files, stages and verifies replacements, writes an ownership receipt, and rolls back failed operations. The manager does not require GitHub access during installation.
 
 No DLL copying and no version/hash repository-variable synchronization are part of the normal flow. A manually dispatched desktop build can supply `obs_companion_tag` only when an intentional rollback is needed.
+
+## Discovery behavior
+
+The companion continuously scans for `_vortideck._tcp.local.` and automatically uses a discovered endpoint; users do not need to open the service dialog or press Refresh during normal startup. Refresh is a recovery and diagnostic action: it clears the displayed discovery snapshot, wakes the existing worker, waits for a real bounded DNS-SD scan, and updates the dialog only after that scan completes.
+
+Discovery consumes structured PTR, SRV, A, and AAAA records directly from mDNS packets. Diagnostic log text is never treated as protocol data. Discovery failures are routed into the OBS log. No loopback or hard-coded endpoint is introduced when discovery fails.
+
+The `mdns-discovery-e2e` test starts a real test advertiser and verifies endpoint assembly plus the streaming callback. It can also probe a running VortiDeck instance:
+
+`build_x64/RelWithDebInfo/mdns-discovery-e2e.exe --probe-existing 9001`
 
 ## Future distributions
 

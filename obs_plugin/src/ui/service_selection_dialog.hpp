@@ -35,6 +35,7 @@ public:
     
     // Update the service list with new discoveries
     void updateServiceList(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services);
+    void completeRefresh(const std::vector<vorti::applets::obs_plugin::ServiceInfo>& services);
     
     // Show/hide connecting progress indicator
     void showConnectingProgress(const std::string& message);

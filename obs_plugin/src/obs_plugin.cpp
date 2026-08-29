@@ -837,7 +837,9 @@ bool vorti::applets::obs_plugin::discover_vortideck_service()
     
     // Initialize mDNS discovery if needed
     if (!m_mdns_discovery) {
-        m_mdns_discovery = std::make_unique<MDNSDiscovery>();
+        m_mdns_discovery = std::make_unique<MDNSDiscovery>([](const std::string& message) {
+            log_to_obs(message);
+        });
     }
 
     // Set discovery in progress flag
@@ -883,7 +885,9 @@ bool vorti::applets::obs_plugin::discover_vortideck_service_async()
 
     // Initialize mDNS discovery if needed
     if (!m_mdns_discovery) {
-        m_mdns_discovery = std::make_unique<MDNSDiscovery>();
+        m_mdns_discovery = std::make_unique<MDNSDiscovery>([](const std::string& message) {
+            log_to_obs(message);
+        });
     }
 
     // Set discovery in progress flag
@@ -3354,7 +3358,9 @@ void vorti::applets::obs_plugin::start_continuous_discovery()
     
     // Initialize mDNS discovery if needed
     if (!m_mdns_discovery) {
-        m_mdns_discovery = std::make_unique<MDNSDiscovery>();
+        m_mdns_discovery = std::make_unique<MDNSDiscovery>([](const std::string& message) {
+            log_to_obs(message);
+        });
     }
     
     // Start the continuous discovery thread
@@ -3365,6 +3371,7 @@ void vorti::applets::obs_plugin::stop_continuous_discovery()
 {
     log_to_obs("Stopping continuous mDNS discovery");
     m_continuous_discovery_enabled = false;
+    m_discovery_wake_cv.notify_all();
 
     // CRITICAL: Stop mDNS discovery first to interrupt any ongoing discovery
     if (m_mdns_discovery) {
@@ -3381,6 +3388,34 @@ void vorti::applets::obs_plugin::stop_continuous_discovery()
     }
 }
 
+void vorti::applets::obs_plugin::request_immediate_discovery()
+{
+    m_discovery_refresh_requested = true;
+    start_continuous_discovery();
+    m_discovery_wake_cv.notify_all();
+}
+
+namespace {
+void complete_discovery_refresh_ui()
+{
+    using namespace vorti::applets::obs_plugin;
+    if (!qApp) return;
+
+    std::vector<ServiceInfo> refreshed_services;
+    {
+        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
+        refreshed_services = m_discovered_services;
+    }
+    QMetaObject::invokeMethod(qApp, [refreshed_services]() {
+        std::lock_guard<std::mutex> lock(m_dialog_mutex);
+        auto* dialog = static_cast<ServiceSelectionDialog*>(m_persistent_dialog);
+        if (dialog && dialog->isVisible()) {
+            dialog->completeRefresh(refreshed_services);
+        }
+    }, Qt::QueuedConnection);
+}
+}
+
 void vorti::applets::obs_plugin::continuous_discovery_worker()
 {
     log_to_obs("Continuous mDNS discovery worker started");
@@ -3389,13 +3424,14 @@ void vorti::applets::obs_plugin::continuous_discovery_worker()
         try {
             // Perform discovery every 30 seconds or when no service is found
             bool should_discover = false;
+            const bool refresh_requested = m_discovery_refresh_requested.exchange(false);
             
             {
                 std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
                 auto now = std::chrono::steady_clock::now();
                 
                 // Discover if no services found or it's been 30+ seconds since last discovery
-                should_discover = m_discovered_services.empty() || 
+                should_discover = refresh_requested || m_discovered_services.empty() ||
                                  (now - m_last_discovery_time) > std::chrono::seconds(30);
             }
             
@@ -3406,17 +3442,17 @@ void vorti::applets::obs_plugin::continuous_discovery_worker()
                 // Check if discovery is already in progress to avoid conflicts
                 if (m_mdns_discovery && !m_mdns_discovery->is_discovering()) {
                     try {
+                        m_discovery_in_progress = true;
+                        if (refresh_requested) {
+                            std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
+                            m_discovered_services.clear();
+                        }
                         // Use synchronous discovery with short timeout to avoid crashes
                         auto services = m_mdns_discovery->discover_services(
                             std::chrono::seconds(5), // Short 5 second timeout
-                            false
+                            false,
+                            [](const ServiceInfo& service) { on_service_discovered(service); }
                         );
-                        
-                        // Process discovered services
-                        for (const auto& service : services) {
-                            on_service_discovered(service);
-                        }
-                        
                         // Update last discovery time
                         {
                             std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
@@ -3428,12 +3464,19 @@ void vorti::applets::obs_plugin::continuous_discovery_worker()
                         } else {
                             log_to_obs("No VortiDeck services found via mDNS discovery");
                         }
+
+                        m_discovery_in_progress = false;
+
+                        if (refresh_requested) complete_discovery_refresh_ui();
                         
                     } catch (const std::exception& e) {
+                        m_discovery_in_progress = false;
                         log_to_obs(std::format("Background mDNS discovery error: {}", e.what()).c_str());
+                        if (refresh_requested) complete_discovery_refresh_ui();
                     }
                 } else {
                     log_to_obs("Skipping background discovery - already in progress");
+                    if (refresh_requested) m_discovery_refresh_requested = true;
                 }
                 
                 // Update last discovery time to prevent repeated messages
@@ -3443,10 +3486,11 @@ void vorti::applets::obs_plugin::continuous_discovery_worker()
                 }
             }
             
-            // Sleep for 5 seconds before next check
-            for (int i = 0; i < 50 && m_continuous_discovery_enabled.load() && !m_shutting_down; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            std::unique_lock<std::mutex> wake_lock(m_discovery_wake_mutex);
+            m_discovery_wake_cv.wait_for(wake_lock, std::chrono::seconds(5), [] {
+                return m_discovery_refresh_requested.load() ||
+                       !m_continuous_discovery_enabled.load() || m_shutting_down.load();
+            });
             
         } catch (const std::exception& e) {
             log_to_obs(std::format("Error in continuous discovery: {}", e.what()));
@@ -3735,15 +3779,7 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
                 // Connect refresh signal to update list in real-time
                 QObject::connect(dialog, &ServiceSelectionDialog::refreshRequested, [dialog]() {
                     log_to_obs("Dialog refresh requested - refreshing services");
-                    if (!m_discovery_in_progress) {
-                        start_continuous_discovery();
-                    }
-                    std::vector<ServiceInfo> current_services;
-                    {
-                        std::lock_guard<std::mutex> lock(m_discovered_services_mutex);
-                        current_services = m_discovered_services;
-                    }
-                    dialog->updateServiceList(current_services);
+                    request_immediate_discovery();
                 });
 
                 // Connect accepted signal to reconnect to user-selected service
@@ -3839,9 +3875,7 @@ void vorti::applets::obs_plugin::show_service_selection_dialog(bool force_show_d
                 log_to_obs("Dialog refresh requested - updating connection status");
                 
                 // Refresh service discovery
-                if (!m_discovery_in_progress) {
-                    start_continuous_discovery();
-                }
+                request_immediate_discovery();
                 
                 // Update dialog with current connection status
                 if (is_connected() && !m_selected_service_url.empty()) {

@@ -43,7 +43,8 @@ target_include_directories(${CMAKE_PROJECT_NAME}
         ${CMAKE_SOURCE_DIR}/other/websocketpp
         ${CMAKE_SOURCE_DIR}/other/json/include
         ${CMAKE_SOURCE_DIR}/other/asio/asio/include
-        ${CMAKE_SOURCE_DIR}/other/mdns_cpp/include)
+        ${CMAKE_SOURCE_DIR}/other/mdns_cpp/include
+        ${CMAKE_SOURCE_DIR}/other/mdns_cpp/src)
 
 # Add all our source files
 target_sources(${CMAKE_PROJECT_NAME}
@@ -54,6 +55,8 @@ target_sources(${CMAKE_PROJECT_NAME}
         obs_plugin/src/banner_manager.hpp
         obs_plugin/src/mdns_discovery.cpp
         obs_plugin/src/mdns_discovery.hpp
+        obs_plugin/src/structured_mdns_query.cpp
+        obs_plugin/src/structured_mdns_query.hpp
         obs_plugin/src/ui/service_selection_dialog.cpp
         obs_plugin/src/ui/service_selection_dialog.hpp
         obs_plugin/src/ui/ServiceSelectionDialog.ui
@@ -103,4 +106,37 @@ if(BUILD_TESTING)
       -DOBS_PLUGIN_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/obs_plugin.cpp
       -DOVERLAY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/sources/overlay_source.cpp
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/overlay-capability-policy.cmake)
+
+  add_executable(
+    mdns-discovery-e2e
+    cmake/tests/mdns-discovery-e2e.cpp
+    obs_plugin/src/mdns_discovery.cpp
+    obs_plugin/src/structured_mdns_query.cpp
+    other/mdns_cpp/src/logger.cpp
+    other/mdns_cpp/src/mdns.cpp
+    other/mdns_cpp/src/utils.cpp)
+  target_include_directories(
+    mdns-discovery-e2e
+    PRIVATE
+      ${CMAKE_SOURCE_DIR}/obs_plugin/src
+      ${CMAKE_SOURCE_DIR}/other/mdns_cpp/include
+      ${CMAKE_SOURCE_DIR}/other/mdns_cpp/src)
+  set_target_properties(
+    mdns-discovery-e2e
+    PROPERTIES
+      CXX_STANDARD 23
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+  if(WIN32)
+    target_link_libraries(mdns-discovery-e2e PRIVATE iphlpapi ws2_32)
+  endif()
+  add_test(NAME mdns-discovery-e2e COMMAND mdns-discovery-e2e)
+  set_tests_properties(mdns-discovery-e2e PROPERTIES TIMEOUT 15)
+  add_test(
+    NAME mdns-structured-policy
+    COMMAND
+      ${CMAKE_COMMAND}
+      -DMDNS_DISCOVERY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/mdns_discovery.cpp
+      -DSTRUCTURED_MDNS_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/structured_mdns_query.cpp
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/mdns-structured-policy.cmake)
 endif()
