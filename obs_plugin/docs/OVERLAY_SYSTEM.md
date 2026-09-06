@@ -17,7 +17,7 @@ graph TB
     subgraph "Resolution Sync"
         OBS --> |Canvas Size| VD
         VD --> |Overlay Update| OBS
-        OBS --> |Browser Recreation| BS
+        OBS --> |Resize-only Recreation| BS
     end
     
     subgraph "Signal Monitoring"
@@ -33,7 +33,8 @@ graph TB
 - **Purpose**: Provides VortiDeck-specific overlay functionality
 - **Features**:
   - Automatic canvas resolution matching
-  - Browser source recreation on content changes
+  - Browser source recreation only for real canvas-size changes
+  - Live content updates over the authenticated WebSocket
   - Main overlay locking and positioning
   - Signal-based resize monitoring
 
@@ -100,14 +101,11 @@ sequenceDiagram
     participant BS as Browser Source
     
     V->>V: Content changes (new elements, layout updates)
-    V->>O: APPLET_OBS_OVERLAY_UPDATE
-    Note over V,O: Same URL, different content
-    O->>OS: action_overlay_update()
-    OS->>OS: Force browser recreation flag
-    OS->>BS: Remove old browser source
-    OS->>BS: Create new browser source
-    Note over BS: Fresh viewport, no caching issues
-    BS->>BS: Load updated content
+    V->>BS: Authenticated live overlay event
+    BS->>BS: Apply data/theme/content update in place
+    V->>O: Optional idempotent source-state update
+    O->>OS: Compare URL and dimensions
+    OS-->>O: No source update when state is unchanged
 ```
 
 ## Configuration
@@ -193,7 +191,9 @@ interface OverlaySourceSettings {
 
 #### 1. Elements Appear Shifted Right
 **Cause**: Browser viewport cached at wrong resolution
-**Solution**: Browser source recreation (automatic via APPLET_OBS_OVERLAY_UPDATE)
+**Solution**: Send the real canvas dimensions with
+`APPLET_OBS_OVERLAY_UPDATE`; only an actual size change recreates the private
+browser source.
 
 #### 2. Overlay Not Resizing
 **Cause**: Auto-resize disabled or signal connection failed
@@ -202,10 +202,11 @@ interface OverlaySourceSettings {
 - Restart OBS to reconnect signals
 
 #### 3. Content Not Updating
-**Cause**: VortiDeck not sending update messages
+**Cause**: The authenticated overlay WebSocket is disconnected or VortiDeck is
+not publishing the live event
 **Solution**:
 - Check WebSocket connection
-- Verify action ID format (use internal "obs_overlay_update")
+- Verify that OBS has received the current process-scoped overlay capability
 
 #### 4. Multiple Overlay Sources with Same Name
 **Cause**: Missing OBS_SOURCE_DO_NOT_DUPLICATE flag
@@ -215,11 +216,12 @@ interface OverlaySourceSettings {
 
 Enable debug logs to see overlay operations:
 ```
-[VortiDeck Overlay] Canvas resize detected: 2560x1441
-[VortiDeck Overlay] FORCE_RECREATION: VortiDeck resolution update detected
-[VortiDeck Overlay] FORCE_RECREATION: Successfully created new browser source
-ACTION_OVERLAY_UPDATE: Comparing dimensions - current: 2560x1441, new: 2560x1441
-ACTION_OVERLAY_UPDATE: No dimension change detected, but forcing recreation anyway
+ACTION_OVERLAY_UPDATE: Comparing dimensions - current: 2560x1440, new: 2560x1440
+ACTION_OVERLAY_UPDATE: Overlay source 'VortiDeck Overlay' is already current; skipping browser update
+
+# For a real canvas resize:
+ACTION_OVERLAY_UPDATE: Dimensions changing from 1920x1080 to 2560x1440
+ACTION_OVERLAY_UPDATE: Flagging for browser source recreation
 ```
 
 ## Advanced Configuration
@@ -244,7 +246,9 @@ ACTION_OVERLAY_UPDATE: No dimension change detected, but forcing recreation anyw
 ```
 
 ### Performance Optimization
-- **Minimal recreation**: Only recreates when content actually changes
+- **Idempotent source updates**: Identical URL/dimension messages are no-ops
+- **Minimal recreation**: Only real canvas-size changes recreate Chromium
+- **Live content path**: Data and theme changes update the existing page
 - **Signal-based**: No polling for resolution changes
 - **Efficient memory**: Properly releases old browser sources
 
@@ -318,8 +322,7 @@ static void handle_canvas_resize(void* data, calldata_t* cd);
 // Overlay update from VortiDeck
 void action_overlay_update(const action_invoke_parameters &parameters);
 
-// Browser source recreation
-void force_browser_recreation(overlay_source* context, int width, int height);
+// Private browser-source update/recreation is internal to overlay_source_update.
 ```
 
 ---

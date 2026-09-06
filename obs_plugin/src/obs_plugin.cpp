@@ -1347,39 +1347,41 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                     {
                         action_mixer_mute_toggle(parameters);
                     }
-                        // Banner action handlers
-    else if constexpr (BANNER_MANAGER_ENABLED) {
-        if (action_id == actions::s_banner_show)
-        {
-            action_banner_show(parameters);
-        }
-        else if (action_id == actions::s_banner_hide)
-        {
-            action_banner_hide(parameters);
-        }
-        else if (action_id == actions::s_banner_toggle)
-        {
-            action_banner_toggle(parameters);
-        }
-        // Overlay action handlers (no restrictions)
-        else if (action_id == actions::s_overlay_set_data)
-        {
-            action_overlay_set_data(parameters);
-        }
-        else if (action_id == actions::s_overlay_create)
-        {
-            action_overlay_create(parameters);
-        }
-        else if (action_id == actions::s_overlay_update)
-        {
-            action_overlay_update(parameters);
-        }
-        else if (action_id == actions::s_overlay_remove)
-        {
-            action_overlay_remove(parameters);
-        }
-        // Complex banner actions removed - handled by external application
-    }
+                    else if (action_id == actions::s_banner_show)
+                    {
+                        if constexpr (BANNER_MANAGER_ENABLED) action_banner_show(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_banner_hide)
+                    {
+                        if constexpr (BANNER_MANAGER_ENABLED) action_banner_hide(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_banner_toggle)
+                    {
+                        if constexpr (BANNER_MANAGER_ENABLED) action_banner_toggle(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_overlay_set_data)
+                    {
+                        if constexpr (OVERLAY_ENABLED) action_overlay_set_data(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_overlay_create)
+                    {
+                        if constexpr (OVERLAY_ENABLED) action_overlay_create(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_overlay_update)
+                    {
+                        if constexpr (OVERLAY_ENABLED) action_overlay_update(parameters);
+                        else action_handled = false;
+                    }
+                    else if (action_id == actions::s_overlay_remove)
+                    {
+                        if constexpr (OVERLAY_ENABLED) action_overlay_remove(parameters);
+                        else action_handled = false;
+                    }
                             else
                             {
                                 action_handled = false;
@@ -1629,8 +1631,8 @@ void vorti::applets::obs_plugin::register_regular_actions()
         // Removed APPLET_OBS_BANNER_SET_DATA - banners now use connected service URL + /banners like overlays
     }
     
-    // Register overlay actions (always available, no restrictions)
-    {
+    // Overlay registration follows the overlay feature independently of banners.
+    if constexpr (OVERLAY_ENABLED) {
         // Main overlay set data action (like banner_set_data)
         action_parameters overlay_set_data_params;
         nlohmann::json url_param_main = {
@@ -3271,14 +3273,19 @@ void vorti::applets::obs_plugin::action_overlay_update(const action_invoke_param
         if (source && strcmp(obs_source_get_id(source), vortideck::SOURCE_ID_OVERLAY) == 0) {
             obs_data_t* settings = obs_source_get_settings(source);
             
-            // Check if dimensions are changing (indicates VortiDeck resolution update)
+            // Browser-source recreation is expensive because it tears down a
+            // Chromium renderer. Only a real canvas-size change requires it;
+            // ordinary overlay content arrives over the authenticated socket.
             bool dimensions_changed = false;
+            bool url_changed = false;
+            int current_width = (int)obs_data_get_int(settings, "width");
+            int current_height = (int)obs_data_get_int(settings, "height");
+            int new_width = current_width;
+            int new_height = current_height;
+
             if (width_it != parameters.end() || height_it != parameters.end()) {
-                int current_width = (int)obs_data_get_int(settings, "width");
-                int current_height = (int)obs_data_get_int(settings, "height");
-                
-                int new_width = (width_it != parameters.end()) ? std::stoi(width_it->second) : current_width;
-                int new_height = (height_it != parameters.end()) ? std::stoi(height_it->second) : current_height;
+                new_width = (width_it != parameters.end()) ? std::stoi(width_it->second) : current_width;
+                new_height = (height_it != parameters.end()) ? std::stoi(height_it->second) : current_height;
                 
                 log_to_obs("ACTION_OVERLAY_UPDATE: Comparing dimensions - current: " + std::to_string(current_width) + "x" + std::to_string(current_height) + 
                           ", new: " + std::to_string(new_width) + "x" + std::to_string(new_height));
@@ -3287,33 +3294,37 @@ void vorti::applets::obs_plugin::action_overlay_update(const action_invoke_param
                     dimensions_changed = true;
                     log_to_obs("ACTION_OVERLAY_UPDATE: Dimensions changing from " + std::to_string(current_width) + "x" + std::to_string(current_height) + 
                               " to " + std::to_string(new_width) + "x" + std::to_string(new_height));
-                } else {
-                    log_to_obs("ACTION_OVERLAY_UPDATE: No dimension change detected, but forcing recreation anyway for VortiDeck content update");
-                    dimensions_changed = true; // Force recreation even without dimension change for content updates
                 }
             }
-            
+
             if (url_it != parameters.end()) {
-                obs_data_set_string(settings, "url", url_it->second.c_str());
+                const char* current_url = obs_data_get_string(settings, "url");
+                url_changed = !current_url || url_it->second != current_url;
+                if (url_changed) {
+                    obs_data_set_string(settings, "url", url_it->second.c_str());
+                }
             }
-            if (width_it != parameters.end()) {
-                obs_data_set_int(settings, "width", std::stoi(width_it->second));
+
+            if (dimensions_changed) {
+                obs_data_set_int(settings, "width", new_width);
+                obs_data_set_int(settings, "height", new_height);
             }
-            if (height_it != parameters.end()) {
-                obs_data_set_int(settings, "height", std::stoi(height_it->second));
-            }
-            
-            // Add flag to trigger browser source recreation for dimension changes
+
             if (dimensions_changed) {
                 obs_data_set_bool(settings, "force_browser_recreation", true);
                 log_to_obs("ACTION_OVERLAY_UPDATE: Flagging for browser source recreation");
             }
-            
-            obs_source_update(source, settings);
+
+            if (dimensions_changed || url_changed) {
+                obs_source_update(source, settings);
+                log_to_obs("ACTION_OVERLAY_UPDATE: Updated overlay source '" + source_name + "'" +
+                           (dimensions_changed ? " (recreating browser)" : " (updating capability)"));
+            } else {
+                log_to_obs("ACTION_OVERLAY_UPDATE: Overlay source '" + source_name +
+                           "' is already current; skipping browser update");
+            }
+
             obs_data_release(settings);
-            
-            log_to_obs("ACTION_OVERLAY_UPDATE: Updated overlay source '" + source_name + "'" + 
-                      (dimensions_changed ? " (recreating browser)" : ""));
         } else {
             log_to_obs("ACTION_OVERLAY_UPDATE: ERROR - Source '" + source_name + "' not found or not a VortiDeck overlay");
         }

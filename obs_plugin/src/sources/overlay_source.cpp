@@ -207,11 +207,22 @@ static void* overlay_source_create(obs_data_t* settings, obs_source_t* source)
     
     // Get overlay configuration from settings
     const char* overlay_id = obs_data_get_string(settings, "overlay_id");
-    const char* url = obs_data_get_string(settings, "url");
+    // Overlay tokens are scoped to the running VortiDeck host. A URL restored
+    // from an OBS scene collection therefore cannot be trusted after either
+    // process restarts. Prefer the currently connected host capability and
+    // otherwise keep the private browser source inert until set_data arrives.
+    std::string capability_url = get_global_overlay_capability_url();
+    const char* url = capability_url.empty() ? "about:blank" : capability_url.c_str();
+    obs_data_set_string(settings, "url", url);
     int width = (int)obs_data_get_int(settings, "width");
     int height = (int)obs_data_get_int(settings, "height");
     
     // The URL is a bearer capability and must never be written to OBS logs.
+    if (capability_url.empty()) {
+        blog(LOG_INFO, "[VortiDeck Overlay] Waiting for an authenticated overlay capability");
+    } else {
+        blog(LOG_INFO, "[VortiDeck Overlay] Using the current authenticated overlay capability");
+    }
     blog(LOG_INFO, "[VortiDeck Overlay] Initializing source - width=%d, height=%d, overlay_id=%s",
          width, height, overlay_id ? overlay_id : "null");
     

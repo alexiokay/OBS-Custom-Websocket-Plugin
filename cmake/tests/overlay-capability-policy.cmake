@@ -20,9 +20,25 @@ require_text(
   "set_global_overlay_capability_url(url);"
   "host-issued overlay capabilities must be retained for future sources")
 require_text(
+  "${OBS_PLUGIN_TEXT}"
+  "if constexpr (OVERLAY_ENABLED) action_overlay_set_data(parameters);"
+  "overlay capability dispatch must use the overlay feature gate")
+require_text(
+  "${OBS_PLUGIN_TEXT}"
+  "if constexpr (OVERLAY_ENABLED) {"
+  "overlay action registration must use the overlay feature gate")
+require_text(
   "${OVERLAY_SOURCE_TEXT}"
   "default_url = \"about:blank\";"
   "an overlay without a host-issued capability must remain inert")
+require_text(
+  "${OVERLAY_SOURCE_TEXT}"
+  "const char* url = capability_url.empty() ? \"about:blank\" : capability_url.c_str();"
+  "restored sources must ignore stale process-scoped capabilities")
+require_text(
+  "${OVERLAY_SOURCE_TEXT}"
+  "obs_data_set_string(settings, \"url\", url);"
+  "the effective host capability must replace the persisted source URL")
 forbid_text(
   "${OBS_PLUGIN_TEXT}"
   "update_all_overlay_urls_to_connected_server"
@@ -39,3 +55,15 @@ forbid_text(
   "${OVERLAY_SOURCE_TEXT}"
   "url=%s"
   "bearer capability URLs must not be interpolated into OBS logs")
+require_text(
+  "${OBS_PLUGIN_TEXT}"
+  "if (dimensions_changed || url_changed)"
+  "unchanged overlay updates must be idempotent")
+require_text(
+  "${OBS_PLUGIN_TEXT}"
+  "is already current; skipping browser update"
+  "unchanged overlay updates must report their no-op outcome")
+forbid_text(
+  "${OBS_PLUGIN_TEXT}"
+  "forcing recreation anyway"
+  "content-only overlay updates must not recreate Chromium browser sources")

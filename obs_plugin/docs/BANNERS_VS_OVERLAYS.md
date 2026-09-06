@@ -102,25 +102,24 @@ graph TB
     OS --> BS[Child Browser Source]
     BS --> S[Scene]
     
-    VD[VortiDeck] --> |Updates| WS[WebSocket]
-    WS --> OS
-    OS --> |Recreate| BS
+    VD[VortiDeck] --> |Live content| WS[Authenticated WebSocket]
+    WS --> BS
+    VD --> |URL/canvas reconciliation| OS
+    OS --> |Resize-only recreation| BS
 ```
 
 ### Overlay Features:
 
-1. **Automatic URL Construction**:
+1. **Host-issued Capability URL**:
    ```cpp
-   // Builds URL from connected WebSocket server
-   if (websocket_url.starts_with("ws://")) {
-       base_url = "http://" + websocket_url.substr(5);
-   }
-   base_url = base_url + "/overlay.html";
+   // The authenticated VortiDeck host supplies a process-scoped URL.
+   // OBS discovery does not reconstruct or persist a tokenless URL.
+   std::string capability_url = get_global_overlay_capability_url();
    ```
 
-2. **Browser Recreation on Updates**:
+2. **Browser Recreation on Real Size Changes**:
    ```cpp
-   // Forces browser recreation to fix viewport caching
+   // Recreates only after the canvas dimensions actually change.
    if (force_recreation) {
        obs_source_remove_active_child(context->source, context->browser_source);
        obs_source_release(context->browser_source);
@@ -139,7 +138,9 @@ graph TB
 
 ## URL Management
 
-Both systems automatically construct URLs from the connected VortiDeck service:
+Banner URLs follow the connected service. Overlay URLs are bearer capabilities
+issued by the authenticated VortiDeck host and must not be reconstructed from
+discovery data.
 
 ### Banner URL:
 ```cpp
@@ -148,10 +149,9 @@ Both systems automatically construct URLs from the connected VortiDeck service:
 ```
 
 ### Overlay URL:
-```cpp
-// From WebSocket: ws://192.168.1.100:9001/ws
-// Becomes: http://192.168.1.100:9001/overlay.html
-```
+
+The host sends the complete capability URL after authentication. The companion
+keeps it in memory for the running process and redacts it from logs.
 
 ## WebSocket Actions
 
@@ -163,7 +163,7 @@ Both systems automatically construct URLs from the connected VortiDeck service:
 
 ### Overlay Actions:
 - `APPLET_OBS_OVERLAY_CREATE` - Create new overlay
-- `APPLET_OBS_OVERLAY_UPDATE` - Update overlay (triggers recreation)
+- `APPLET_OBS_OVERLAY_UPDATE` - Reconcile URL/canvas state idempotently
 - `APPLET_OBS_OVERLAY_SET_DATA` - Update all overlays
 - `APPLET_OBS_OVERLAY_REMOVE` - Remove overlay
 
@@ -213,7 +213,8 @@ The key difference is that banners use a **manager pattern** for enforcement con
 
 ## Best Practices
 
-1. **URL Consistency**: Both systems use the same base URL pattern
+1. **URL Authority**: Banner endpoints follow the service URL; overlays use a
+   host-issued bearer capability
 2. **Content Optimization**: Design responsive HTML that works at any resolution
 3. **Performance**: Minimize DOM updates during streaming
 4. **Error Handling**: Both systems handle disconnections gracefully
