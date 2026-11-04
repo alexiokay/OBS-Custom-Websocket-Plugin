@@ -51,3 +51,9 @@ The following commands are used to build, install, and interact with the VortiDe
 
 These commands facilitate the setup and operation of the VortiDeck OBS Plugin, enabling seamless integration with OBS Studio.
 # End of Selection
+
+## License
+
+The VortiDeck OBS Companion is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 2 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+It is loaded by OBS Studio and links against libobs, which is licensed GPL-2.0-or-later. Bundled third-party libraries in `other/` keep their own licenses.
