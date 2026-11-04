@@ -166,7 +166,7 @@ QListWidget::item:selected:hover {
        <item>
         <widget class="QLabel" name="securityInstructionLabel">
          <property name="text">
-          <string>Enter the 6-digit security code displayed on your VortiDeck device:</string>
+          <string>Paste the OBS pairing key from VortiDeck Canvas Settings. Leave empty only for an unpaired local connection.</string>
          </property>
          <property name="alignment">
           <set>Qt::AlignCenter</set>
@@ -212,14 +212,15 @@ QListWidget::item:selected:hover {
              <height>40</height>
             </size>
            </property>
+           <property name="echoMode"><enum>QLineEdit::Password</enum></property>
            <property name="maxLength">
-            <number>6</number>
+            <number>64</number>
            </property>
            <property name="alignment">
             <set>Qt::AlignCenter</set>
            </property>
            <property name="placeholderText">
-            <string>000000</string>
+            <string>OBS pairing key</string>
            </property>
            <property name="styleSheet">
             <string>QLineEdit {
@@ -256,7 +257,7 @@ QLineEdit:focus {
        <item>
         <widget class="QLabel" name="securityHelpLabel">
          <property name="text">
-          <string>Look for the 6-digit code on your VortiDeck device screen or in the VortiDeck app settings.</string>
+          <string>Pairing authenticates this companion. Use a trusted LAN or an encrypted tunnel for remote traffic.</string>
          </property>
          <property name="alignment">
           <set>Qt::AlignCenter</set>

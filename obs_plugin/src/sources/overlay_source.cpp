@@ -7,10 +7,6 @@
 // The overlay URL is a host-issued capability. Discovery URLs never contain it.
 extern std::string get_global_overlay_capability_url();
 #include <string>
-#include <thread>
-#include <chrono>
-#include <QJsonObject>
-#include <QJsonDocument>
 
 struct overlay_source {
     obs_source_t* source;
@@ -18,7 +14,6 @@ struct overlay_source {
     std::string overlay_id;
     std::string url;
     bool auto_resize_enabled;
-    signal_handler_t* video_signal_handler;
 };
 
 // Lock and configure scene item for main overlay
@@ -40,14 +35,12 @@ static void lock_overlay_item(obs_sceneitem_t* item, const char* overlay_id, uin
         
         obs_sceneitem_set_bounds(item, &bounds);
         obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_STRETCH);
-        obs_sceneitem_set_bounds_alignment(item, 0); // Top-left alignment
+        obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_TOP | OBS_ALIGN_LEFT);
         
         // Lock the item to prevent manipulation
         obs_sceneitem_set_locked(item, true);
         
-        // Set overlay above regular sources but below banners (ADS)
-        // First move to top, then banners will be moved above this
-        obs_sceneitem_set_order(item, OBS_ORDER_MOVE_TOP);
+        // Preserve the scene's chosen source order.
         
         blog(LOG_INFO, "[VortiDeck Overlay] Locked main overlay at %dx%d", width, height);
     }
@@ -65,7 +58,7 @@ static void update_scene_item_bounds(obs_sceneitem_t* item, uint32_t width, uint
     
     obs_sceneitem_set_bounds(item, &bounds);
     obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_STRETCH);
-    obs_sceneitem_set_bounds_alignment(item, 0); // Top-left alignment
+    obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_TOP | OBS_ALIGN_LEFT);
     
     // Ensure position is 0,0
     struct vec2 pos = {0.0f, 0.0f};
@@ -92,14 +85,15 @@ static bool find_and_update_overlay_items(obs_scene_t* scene, obs_sceneitem_t* i
         }
     }
     
+    if (obs_sceneitem_is_group(item)) {
+        obs_scene_enum_items(obs_sceneitem_group_get_scene(item), find_and_update_overlay_items, data);
+    }
     return true; // Continue enumeration
 }
 
-// Canvas resize signal handler
-static void handle_canvas_resize(void* data, calldata_t* cd)
+// Source updates and the companion observer share this one resize path.
+static void handle_canvas_resize(overlay_source* context)
 {
-    UNUSED_PARAMETER(cd);
-    struct overlay_source* context = (struct overlay_source*)data;
     
     if (!context || !context->auto_resize_enabled) {
         return;
@@ -126,43 +120,19 @@ static void handle_canvas_resize(void* data, calldata_t* cd)
             blog(LOG_INFO, "[VortiDeck Overlay] Resolution changed from %dx%d to %dx%d - recreating browser source", 
                  old_width, old_height, ovi.base_width, ovi.base_height);
             
-            // Get current URL and settings before recreating
-            const char* current_url = obs_data_get_string(browser_settings, "url");
-            const char* current_css = obs_data_get_string(browser_settings, "css");
-            std::string url_copy = current_url ? current_url : "";
-            std::string css_copy = current_css ? current_css : "";
-            
-            // Remove old browser source
+            obs_data_set_int(browser_settings, "width", ovi.base_width);
+            obs_data_set_int(browser_settings, "height", ovi.base_height);
+            obs_source_t* replacement = obs_source_create_private("browser_source",
+                obs_source_get_name(context->source), browser_settings);
+            if (!replacement) {
+                obs_data_release(browser_settings);
+                blog(LOG_ERROR, "[VortiDeck Overlay] Resize failed; keeping the previous browser source");
+                return;
+            }
             obs_source_remove_active_child(context->source, context->browser_source);
             obs_source_release(context->browser_source);
-            
-            // Create new browser source with correct dimensions
-            obs_data_t* new_settings = obs_data_create();
-            obs_data_set_string(new_settings, "url", url_copy.c_str());
-            obs_data_set_int(new_settings, "width", ovi.base_width);
-            obs_data_set_int(new_settings, "height", ovi.base_height);
-            obs_data_set_bool(new_settings, "reroute_audio", true);
-            obs_data_set_bool(new_settings, "shutdown", false);
-            obs_data_set_int(new_settings, "fps", 30);
-            if (!css_copy.empty()) {
-                obs_data_set_string(new_settings, "css", css_copy.c_str());
-            }
-            
-            context->browser_source = obs_source_create_private("browser_source", 
-                obs_source_get_name(context->source), new_settings);
-            
-            if (context->browser_source) {
-                obs_source_add_active_child(context->source, context->browser_source);
-                blog(LOG_INFO, "[VortiDeck Overlay] Successfully recreated browser source with %dx%d", 
-                     ovi.base_width, ovi.base_height);
-            } else {
-                blog(LOG_ERROR, "[VortiDeck Overlay] Failed to recreate browser source!");
-            }
-            
-            obs_data_release(new_settings);
-        } else {
-            // No dimension change, just normal update
-            obs_source_update(context->browser_source, browser_settings);
+            context->browser_source = replacement;
+            obs_source_add_active_child(context->source, context->browser_source);
         }
         
         obs_data_release(browser_settings);
@@ -200,7 +170,6 @@ static void* overlay_source_create(obs_data_t* settings, obs_source_t* source)
     context->source = source;
     context->browser_source = nullptr;
     context->auto_resize_enabled = false;
-    context->video_signal_handler = nullptr;
     
     // Set source type metadata
     vortideck::set_source_type(source, vortideck::SourceType::OVERLAY);
@@ -292,35 +261,14 @@ static void* overlay_source_create(obs_data_t* settings, obs_source_t* source)
     
     context->auto_resize_enabled = auto_resize;
     
-    // Connect to video reset signals if auto-resize enabled
-    if (auto_resize) {
-        signal_handler_t* obs_signals = obs_get_signal_handler();
-        if (obs_signals) {
-            context->video_signal_handler = obs_signals;
-            signal_handler_connect(obs_signals, "video_reset", handle_canvas_resize, context);
-            signal_handler_connect(obs_signals, "canvas_video_reset", handle_canvas_resize, context);
-            
-            blog(LOG_INFO, "[VortiDeck Overlay] Connected to video reset signals for auto-resize (overlay_id: %s)", context->overlay_id.c_str());
-            
-            // Immediately resize to current canvas
-            handle_canvas_resize(context, nullptr);
-        } else {
-            blog(LOG_WARNING, "[VortiDeck Overlay] Failed to get signal handler for auto-resize");
-        }
-    }
-    
+    // One companion UI-thread observer owns resize detection. Initial source
+    // settings already use the current canvas when auto-resize is enabled.
     return context;
 }
 
 static void overlay_source_destroy(void* data)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    
-    // Disconnect video signals if connected
-    if (context->video_signal_handler && context->auto_resize_enabled) {
-        signal_handler_disconnect(context->video_signal_handler, "video_reset", handle_canvas_resize, context);
-        signal_handler_disconnect(context->video_signal_handler, "canvas_video_reset", handle_canvas_resize, context);
-    }
     
     if (context->browser_source) {
         obs_source_remove_active_child(context->source, context->browser_source);
@@ -333,57 +281,6 @@ static void overlay_source_destroy(void* data)
 static void overlay_source_update(void* data, obs_data_t* settings)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    
-    // Check if forced browser recreation is requested (from VortiDeck resolution update)
-    bool force_recreation = obs_data_get_bool(settings, "force_browser_recreation");
-    if (force_recreation) {
-        blog(LOG_INFO, "[VortiDeck Overlay] FORCE_RECREATION: VortiDeck resolution update detected");
-        
-        // Clear the flag to avoid repeated recreation
-        obs_data_set_bool(settings, "force_browser_recreation", false);
-        
-        // Force browser source recreation with new dimensions
-        if (context->browser_source) {
-            int new_width = (int)obs_data_get_int(settings, "width");
-            int new_height = (int)obs_data_get_int(settings, "height");
-            const char* current_url = obs_data_get_string(settings, "url");
-            const char* current_css = obs_data_get_string(settings, "css");
-            
-            blog(LOG_INFO, "[VortiDeck Overlay] FORCE_RECREATION: Recreating browser source for %dx%d", new_width, new_height);
-            
-            // Remove old browser source
-            obs_source_remove_active_child(context->source, context->browser_source);
-            obs_source_release(context->browser_source);
-            
-            // Create new browser source with correct dimensions
-            obs_data_t* browser_settings = obs_data_create();
-            obs_data_set_string(browser_settings, "url", current_url ? current_url : "");
-            obs_data_set_int(browser_settings, "width", new_width);
-            obs_data_set_int(browser_settings, "height", new_height);
-            obs_data_set_bool(browser_settings, "reroute_audio", true);
-            obs_data_set_bool(browser_settings, "shutdown", false);
-            obs_data_set_int(browser_settings, "fps", 30);
-            if (current_css && strlen(current_css) > 0) {
-                obs_data_set_string(browser_settings, "css", current_css);
-            }
-            
-            context->browser_source = obs_source_create_private("browser_source", 
-                obs_source_get_name(context->source), browser_settings);
-            
-            if (context->browser_source) {
-                obs_source_add_active_child(context->source, context->browser_source);
-                blog(LOG_INFO, "[VortiDeck Overlay] FORCE_RECREATION: Successfully created new browser source");
-            } else {
-                blog(LOG_ERROR, "[VortiDeck Overlay] FORCE_RECREATION: Failed to create new browser source!");
-            }
-            
-            obs_data_release(browser_settings);
-        }
-        
-        // Update scene items as well
-        handle_canvas_resize(context, nullptr);
-        return;
-    }
     
     // Update URL if changed
     const char* new_url = obs_data_get_string(settings, "url");
@@ -414,33 +311,11 @@ static void overlay_source_update(void* data, obs_data_t* settings)
         obs_data_set_bool(settings, "auto_resize", true);
     }
     
-    bool was_auto_resize = context->auto_resize_enabled;
     context->auto_resize_enabled = auto_resize;
-    
-    // Handle signal connection changes
-    if (auto_resize != was_auto_resize) {
-        signal_handler_t* obs_signals = obs_get_signal_handler();
-        if (obs_signals) {
-            if (auto_resize) {
-                // Connect signals
-                context->video_signal_handler = obs_signals;
-                signal_handler_connect(obs_signals, "video_reset", handle_canvas_resize, context);
-                signal_handler_connect(obs_signals, "canvas_video_reset", handle_canvas_resize, context);
-                // Immediately resize to canvas
-                handle_canvas_resize(context, nullptr);
-            } else {
-                // Disconnect signals
-                signal_handler_disconnect(obs_signals, "video_reset", handle_canvas_resize, context);
-                signal_handler_disconnect(obs_signals, "canvas_video_reset", handle_canvas_resize, context);
-                context->video_signal_handler = nullptr;
-            }
-        }
-    }
-    
     // Update dimensions
     if (auto_resize) {
         // If auto-resize enabled, immediately resize to canvas
-        handle_canvas_resize(context, nullptr);
+        handle_canvas_resize(context);
     } else {
         // Manual dimensions
         int width = (int)obs_data_get_int(settings, "width");
@@ -578,4 +453,43 @@ void register_overlay_source()
     overlay_info.enum_active_sources = overlay_source_enum_active_sources;
     
     obs_register_source(&overlay_info);
+}
+
+void synchronize_overlay_sources_to_canvas()
+{
+    obs_video_info video{};
+    if (!obs_get_video_info(&video)) return;
+    obs_enum_sources([](void* data, obs_source_t* source) {
+        const auto& video = *static_cast<obs_video_info*>(data);
+        const char* source_id = obs_source_get_unversioned_id(source);
+        if (!source_id || strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) != 0) return true;
+        obs_data_t* settings = obs_source_get_settings(source);
+        const bool main = strcmp(obs_data_get_string(settings, "overlay_id"), "main_overlay") == 0;
+        if ((main || obs_data_get_bool(settings, "auto_resize")) &&
+            (obs_data_get_int(settings, "width") != video.base_width ||
+             obs_data_get_int(settings, "height") != video.base_height ||
+             obs_source_get_width(source) != video.base_width || obs_source_get_height(source) != video.base_height)) {
+            obs_data_set_int(settings, "width", video.base_width);
+            obs_data_set_int(settings, "height", video.base_height);
+            obs_source_update(source, settings);
+        }
+        obs_data_release(settings);
+        return true;
+    }, &video);
+}
+
+vortideck_overlay_viewport get_main_overlay_viewport(uint32_t canvas_width, uint32_t canvas_height)
+{
+    struct observation { vortideck_overlay_viewport viewport; uint32_t width; uint32_t height; } result{{}, canvas_width, canvas_height};
+    obs_enum_sources([](void* data, obs_source_t* source) {
+        auto& result = *static_cast<observation*>(data);
+        const char* source_id = obs_source_get_unversioned_id(source);
+        if (!source_id || strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) != 0) return true;
+        obs_data_t* settings = obs_source_get_settings(source);
+        const bool main = strcmp(obs_data_get_string(settings, "overlay_id"), "main_overlay") == 0;
+        obs_data_release(settings);
+        if (main) result.viewport.observe(obs_source_get_width(source), obs_source_get_height(source), result.width, result.height);
+        return true;
+    }, &result);
+    return result.viewport;
 }

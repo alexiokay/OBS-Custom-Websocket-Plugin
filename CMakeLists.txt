@@ -24,8 +24,8 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_QT)
-  find_package(Qt6 COMPONENTS Widgets Core)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+  find_package(Qt6 COMPONENTS Widgets Core Network)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
   target_compile_options(
     ${CMAKE_PROJECT_NAME} PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header
                                   -Wno-comma>)
@@ -132,4 +132,20 @@ if(BUILD_TESTING)
       -DMDNS_DISCOVERY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/mdns_discovery.cpp
       -DSTRUCTURED_MDNS_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/structured_mdns_query.cpp
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/mdns-structured-policy.cmake)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(canvas-sync-contract cmake/tests/canvas-sync.cpp)
+  target_include_directories(canvas-sync-contract PRIVATE ${CMAKE_SOURCE_DIR}/obs_plugin/src)
+  target_link_libraries(canvas-sync-contract PRIVATE OBS::libobs)
+  set_target_properties(canvas-sync-contract PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+  add_test(NAME canvas-sync-contract COMMAND canvas-sync-contract)
+  set_tests_properties(canvas-sync-contract PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CMAKE_SOURCE_DIR}/.deps/bin/64bit")
+  if(WIN32)
+    # libobs also imports the bundled FFmpeg and compression runtimes.
+    file(GLOB _obs_runtime_directories LIST_DIRECTORIES true "${CMAKE_SOURCE_DIR}/.deps/obs-deps-*/bin")
+    foreach(_obs_runtime_directory IN LISTS _obs_runtime_directories)
+      set_property(TEST canvas-sync-contract APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_obs_runtime_directory}")
+    endforeach()
+  endif()
 endif()

@@ -7,6 +7,11 @@
 #include <QApplication>
 #include <QTimer>
 #include <utility>
+#include <QSettings>
+#include <QCryptographicHash>
+#include <QRegularExpression>
+#include <QNetworkInterface>
+#include <QHostAddress>
 
 using namespace vorti::applets::obs_plugin;
 
@@ -216,9 +221,9 @@ void ServiceSelectionDialog::onConnectClicked()
     // If we're on the security code page, validate and accept
     else if (ui->stackedWidget->currentIndex() == 1) {
         QString code = ui->securityCodeInput->text().trimmed();
-        if (code.length() == 6) {
+        if (code.isEmpty() || QRegularExpression("^[0-9a-f]{64}$").match(code).hasMatch()) {
             // Show connecting progress
-            showConnectingProgress("🔐 Authenticating with security code...");
+            showConnectingProgress("Connecting; the server will verify the pairing key...");
             
             // Cancel any existing authentication timer
             if (m_authenticationTimer) {
@@ -227,10 +232,8 @@ void ServiceSelectionDialog::onConnectClicked()
                 m_authenticationTimer = nullptr;
             }
             
-            // Create new authentication timer
-            m_authenticationTimer = new QTimer(this);
-            m_authenticationTimer->setSingleShot(true);
-            connect(m_authenticationTimer, &QTimer::timeout, this, [this, code]() {
+            // Store the supplied credential; only the protocol handshake can
+            // establish authentication. Closing this dialog is not success.
                 m_securityCode = code.toStdString();
                 
                 // Save as trusted device for future use
@@ -238,12 +241,13 @@ void ServiceSelectionDialog::onConnectClicked()
                     const auto& service = m_services[m_selectedIndex];
                     std::string deviceId = service.ip_address + ":" + std::to_string(service.port);
                     saveAsTrustedDevice(deviceId, code.toStdString());
+                    QSettings pairing("VortiDeck", "OBSCompanion");
+                    const auto address=QCryptographicHash::hash(QByteArray::fromStdString(service.websocket_url),QCryptographicHash::Sha256).toHex();
+                    pairing.setValue("keys/" + QString(address),code);
                 }
                 
                 m_accepted = true;
                 accept();
-            });
-            m_authenticationTimer->start(1500);
         }
     }
 }
@@ -270,6 +274,15 @@ void ServiceSelectionDialog::onSecurityCodeChanged()
 
 void ServiceSelectionDialog::showSecurityCodePage()
 {
+    if (m_selectedIndex >= 0 && m_selectedIndex < static_cast<int>(m_services.size())) {
+        const QHostAddress address(QString::fromStdString(m_services[m_selectedIndex].ip_address));
+        if (address.isLoopback() || QNetworkInterface::allAddresses().contains(address)) {
+            m_accepted = true;
+            accept();
+            return;
+        }
+    }
+
     ui->stackedWidget->setCurrentIndex(1);
     ui->backButton->setVisible(true);
     ui->connectButton->setText("Authenticate");
@@ -284,8 +297,10 @@ void ServiceSelectionDialog::showSecurityCodePage()
             ui->securityCodeInput->setText(QString::fromStdString(trustedCode));
             ui->securityInstructionLabel->setText("This device is trusted. The security code has been filled automatically.");
         } else {
-            ui->securityCodeInput->clear();
-            ui->securityInstructionLabel->setText("Enter the 6-digit security code displayed on your VortiDeck device:");
+            QSettings pairing("VortiDeck", "OBSCompanion");
+            const auto address=QCryptographicHash::hash(QByteArray::fromStdString(service.websocket_url),QCryptographicHash::Sha256).toHex();
+            ui->securityCodeInput->setText(pairing.value("keys/" + QString(address)).toString());
+            ui->securityInstructionLabel->setText("Paste the OBS pairing key from VortiDeck Canvas Settings (empty for local connections).");
         }
     }
     
@@ -308,9 +323,9 @@ void ServiceSelectionDialog::updateConnectButtonState()
         // Service selection page - enable if service is selected
         ui->connectButton->setEnabled(m_selectedIndex >= 0);
     } else {
-        // Security code page - enable if 6 digits entered
+        // Pairing key page - validate the full key
         QString code = ui->securityCodeInput->text().trimmed();
-        ui->connectButton->setEnabled(code.length() == 6);
+        ui->connectButton->setEnabled(code.isEmpty() || QRegularExpression("^[0-9a-f]{64}$").match(code).hasMatch());
     }
 }
 

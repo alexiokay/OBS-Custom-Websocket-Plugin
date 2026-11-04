@@ -1,6 +1,9 @@
 #include "obs_plugin.hpp"
 #include "ui/service_selection_dialog.hpp"
 #include "sources/overlay_source.h"
+#include "canvas_profile.hpp"
+#include <QTimer>
+#include <QPointer>
 #include "vortideck_common.h"
 
 // Forward declarations for source registrations
@@ -13,6 +16,9 @@ extern void register_overlay_source();
 #include <QMainWindow>
 #include <QAction>
 #include <QMenu>
+#include <QMessageAuthenticationCode>
+#include <QSettings>
+#include <QUuid>
 
 #define _WEBSOCKETPP_CPP11_RANDOM_DEVICE_
 
@@ -78,8 +84,24 @@ std::string get_global_websocket_url()
 }
 
 namespace {
+std::string obs_pairing_key, obs_client_nonce, obs_session_id;
+uint64_t obs_send_sequence = 0, obs_receive_sequence = 0;
+std::string obs_mac(const std::string& session, const std::string& direction, uint64_t sequence, const std::string& body)
+{
+    const auto text = "vortideck-obs-v1\n" + session + "\n" + direction + "\n" + std::to_string(sequence) + "\n" + body;
+    return QMessageAuthenticationCode::hash(QByteArray::fromStdString(text), QByteArray::fromStdString(obs_pairing_key), QCryptographicHash::Sha256).toHex().toStdString();
+}
+bool obs_equal(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size()) return false;
+    unsigned char difference = 0;
+    for (size_t i=0; i<a.size(); ++i) difference |= a[i] ^ b[i];
+    return difference == 0;
+}
 std::mutex g_overlay_capability_mutex;
 std::string g_overlay_capability_url;
+QPointer<QTimer> g_canvas_observer;
+nlohmann::json g_last_canvas_observation;
 }
 
 std::string get_global_overlay_capability_url()
@@ -288,6 +310,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     {
         blog(LOG_INFO, "[OBS Plugin] EXIT event received - performing shutdown");
         m_shutting_down = true;
+        if (g_canvas_observer) g_canvas_observer->stop();
 
         // CRITICAL: Set banner_manager shutdown flag IMMEDIATELY to stop signal handlers
         // Sources are destroyed shortly after this event, before obs_module_unload()
@@ -348,7 +371,15 @@ void obs_module_post_load()
     obs_frontend_add_save_callback(handle_obs_frontend_save, nullptr);
     
     // Connect to video reset signals for canvas size sync
-    connect_video_reset_signals();
+    if (qApp && !g_canvas_observer) {
+        g_canvas_observer = new QTimer(qApp);
+        QObject::connect(g_canvas_observer, &QTimer::timeout, qApp, []() {
+            if (m_shutting_down) return;
+            if constexpr (OVERLAY_ENABLED) synchronize_overlay_sources_to_canvas();
+            send_canvas_size_update();
+        });
+        g_canvas_observer->start(1000);
+    }
 
     // Register custom VortiDeck sources
     if constexpr (BANNER_MANAGER_ENABLED) {
@@ -374,6 +405,7 @@ void obs_module_unload()
     // NOTE: Most cleanup already happened in OBS_FRONTEND_EVENT_EXIT
     // Keep this minimal to avoid triggering OBS core audio crash bug
     blog(LOG_INFO, "[OBS Plugin] OBS module unloading - minimal cleanup");
+    if (g_canvas_observer) { delete g_canvas_observer; g_canvas_observer = nullptr; }
 
     // CRITICAL: Set banner_manager shutdown flag FIRST before ANY cleanup
     // This stops signal handlers immediately, even if they're already queued
@@ -1024,6 +1056,12 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
     {
         std::lock_guard<std::mutex> wl(m_lock);
         m_websocket_open = true;
+        QSettings pairing("VortiDeck", "OBSCompanion");
+        const auto address = QCryptographicHash::hash(QByteArray::fromStdString(get_connection_url()), QCryptographicHash::Sha256).toHex();
+        obs_pairing_key = pairing.value("keys/" + QString(address)).toString().toStdString();
+        obs_client_nonce = obs_pairing_key.empty() ? "" : QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+        obs_session_id.clear();
+        obs_send_sequence = obs_receive_sequence = 0;
     }
     m_compressor_ready_cv.notify_one();
 
@@ -1064,6 +1102,36 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
     {
         log_to_obs("Parsing JSON payload...");
         nlohmann::json message = nlohmann::json::parse(payload);
+        if (message.value("type", "") == "OBS_AUTH_CHALLENGE") {
+            std::lock_guard<std::mutex> lock(m_lock);
+            const auto session = message.value("session", "");
+            if (obs_pairing_key.empty() || obs_client_nonce.empty() || !obs_session_id.empty() ||
+                !session.starts_with(obs_client_nonce + ":") ||
+                !obs_equal(message.value("proof", ""), obs_mac(session,"host",0,""))) {
+                log_to_obs("OBS pairing failed: invalid host proof");
+                return;
+            }
+            obs_session_id = session;
+            nlohmann::json reply={{"type","OBS_AUTH_RESPONSE"},{"proof",obs_mac(session,"client",0,"")}};
+            websocketpp::lib::error_code ec;
+            m_websocket.send(m_connection_handle,reply.dump(),m_subprotocol_opcode,ec);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!obs_pairing_key.empty()) {
+                const auto sequence=message.value("sequence",uint64_t(0));
+                const auto body=message.value("body","");
+                if (obs_session_id.empty() || message.value("obs_session","") != obs_session_id ||
+                    sequence != obs_receive_sequence + 1 ||
+                    !obs_equal(message.value("signature",""),obs_mac(obs_session_id,"host-message",sequence,body))) {
+                    log_to_obs("Rejected unauthenticated OBS host message");
+                    return;
+                }
+                message=nlohmann::json::parse(body);
+                obs_receive_sequence=sequence;
+            }
+        }
 
         // Safely check for error results
         if (message.contains("result") && !message["result"].is_null() && 
@@ -1172,6 +1240,13 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
             message["type"].get<std::string>() == "GET_OBS_CANVAS_SIZE") {
             log_to_obs("Received canvas size request");
             handle_canvas_size_request(message);
+            return;
+        }
+
+        if (message.contains("type") && !message["type"].is_null() &&
+            message["type"].get<std::string>() == "APPLY_OBS_CANVAS_SIZE") {
+            log_to_obs("Received explicit canvas Apply request");
+            handle_canvas_apply_request(message);
             return;
         }
 
@@ -1451,6 +1526,7 @@ bool vorti::applets::obs_plugin::register_integration()
     };
     // clang-format on
 
+    if (!obs_client_nonce.empty()) register_app["obs_client_nonce"] = obs_client_nonce;
     return send_message(register_app);
 }
 
@@ -2814,8 +2890,18 @@ bool vorti::applets::obs_plugin::send_message(nlohmann::json message)
 
     std::lock_guard<std::mutex> ql(m_lock);
 
+    // Registration starts authentication; all other traffic waits for the proof.
+    if (!obs_pairing_key.empty() && obs_session_id.empty() &&
+        message.value("path", "") != "/api/v1/integration/register") return false;
+
     message["msgId"] = std::to_string(m_current_message_id);
     std::string string_message = message.dump();
+
+    if (!obs_session_id.empty()) {
+        const auto sequence = ++obs_send_sequence;
+        string_message = nlohmann::json({{"obs_session",obs_session_id},{"sequence",sequence},
+            {"body",string_message},{"signature",obs_mac(obs_session_id,"client-message",sequence,string_message)}}).dump();
+    }
 
     m_current_message_id++;
 
@@ -3308,11 +3394,6 @@ void vorti::applets::obs_plugin::action_overlay_update(const action_invoke_param
             if (dimensions_changed) {
                 obs_data_set_int(settings, "width", new_width);
                 obs_data_set_int(settings, "height", new_height);
-            }
-
-            if (dimensions_changed) {
-                obs_data_set_bool(settings, "force_browser_recreation", true);
-                log_to_obs("ACTION_OVERLAY_UPDATE: Flagging for browser source recreation");
             }
 
             if (dimensions_changed || url_changed) {
@@ -4146,8 +4227,8 @@ void vorti::applets::obs_plugin::show_connection_settings_dialog()
 
 nlohmann::json vorti::applets::obs_plugin::get_current_canvas_info()
 {
-    obs_video_info ovi;
-    obs_get_video_info(&ovi);
+    obs_video_info ovi{};
+    if (!obs_get_video_info(&ovi)) return nlohmann::json::object();
     
     nlohmann::json canvas_info;
     canvas_info["type"] = "OBS_CANVAS_SIZE_UPDATE";
@@ -4158,126 +4239,142 @@ nlohmann::json vorti::applets::obs_plugin::get_current_canvas_info()
     canvas_info["timestamp"] = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     canvas_info["source"] = "obs_plugin";
+    canvas_info["streaming"] = obs_frontend_streaming_active();
+    canvas_info["recording"] = obs_frontend_recording_active();
+    const auto viewport=get_main_overlay_viewport(ovi.base_width, ovi.base_height);
+    canvas_info["managed_source_found"]=viewport.found;
+    canvas_info["managed_source_matches"]=viewport.matches();
+    canvas_info["managed_source_count"]=viewport.count;
+    canvas_info["managed_source_matching_count"]=viewport.matching_count;
     
     return canvas_info;
 }
 
 void vorti::applets::obs_plugin::send_canvas_size_update()
 {
-    try {
-        nlohmann::json canvas_info = get_current_canvas_info();
-        
-        // Check if canvas size actually changed
-        CanvasSizeInfo current_size;
-        current_size.width = canvas_info["width"];
-        current_size.height = canvas_info["height"];
-        current_size.fps_num = canvas_info["fps_num"];
-        current_size.fps_den = canvas_info["fps_den"];
-        
-        // Only proceed if size changed
-        if (current_size.width == m_last_canvas_size.width &&
-            current_size.height == m_last_canvas_size.height &&
-            current_size.fps_num == m_last_canvas_size.fps_num &&
-            current_size.fps_den == m_last_canvas_size.fps_den) {
-            log_to_obs("Canvas size unchanged - skipping update");
-            return;
-        }
-        
-        // Update cached size
-        m_last_canvas_size = current_size;
-        
-        if (!is_connected()) {
-            log_to_obs(std::format("Canvas size changed to {}x{} @ {}/{} fps - will send when VortiDeck connects", 
-                current_size.width, current_size.height, current_size.fps_num, current_size.fps_den));
-            return;
-        }
-        
-        // Send the update
-        if (send_message(canvas_info)) {
-            log_to_obs(std::format("✅ Canvas size update sent: {}x{} @ {}/{} fps", 
-                current_size.width, current_size.height, current_size.fps_num, current_size.fps_den));
-        } else {
-            log_to_obs("❌ Failed to send canvas size update");
-        }
-        
-    } catch (const std::exception& e) {
-        log_to_obs(std::format("Error sending canvas size update: {}", e.what()));
+    if (!qApp || m_shutting_down) return;
+    if (QThread::currentThread() != qApp->thread()) {
+        QMetaObject::invokeMethod(qApp, [] { send_canvas_size_update(); }, Qt::QueuedConnection);
+        return;
     }
+    if (!is_connected()) { g_last_canvas_observation = nullptr; return; }
+    auto info = get_current_canvas_info();
+    if (info.empty()) return;
+    auto comparable = info;
+    comparable.erase("timestamp");
+    if (comparable == g_last_canvas_observation) return;
+    if (send_message(info)) g_last_canvas_observation = std::move(comparable);
 }
 
 void vorti::applets::obs_plugin::handle_canvas_size_request(const nlohmann::json& message)
 {
+    if (!qApp || m_shutting_down) return;
+    QMetaObject::invokeMethod(qApp, [message] {
+        if (m_shutting_down) return;
+        auto response = get_current_canvas_info();
+        if (response.empty()) return;
+        if (message.contains("timestamp")) response["request_timestamp"] = message["timestamp"];
+        send_message(response);
+    }, Qt::QueuedConnection);
+}
+
+void vorti::applets::obs_plugin::handle_canvas_apply_request(const nlohmann::json& message)
+{
+    auto fail = [](const std::string& request_id, const std::string& code,
+                   const std::string& detail) {
+        nlohmann::json response = {
+            {"type", "OBS_CANVAS_APPLY_RESULT"},
+            {"request_id", request_id},
+            {"status", "rejected"},
+            {"error_code", code},
+            {"error", detail},
+        };
+        send_message(response);
+    };
+
     try {
-        log_to_obs("Processing canvas size request from VortiDeck");
-        
-        // Always respond with current canvas info
-        nlohmann::json response = get_current_canvas_info();
-        
-        // Add request timestamp if available
-        if (message.contains("timestamp") && !message["timestamp"].is_null()) {
-            response["request_timestamp"] = message["timestamp"];
+        const std::string request_id = message.value("request_id", "");
+        if (request_id.empty() || request_id.size() > 128 ||
+            !message.contains("width") || !message["width"].is_number_unsigned() ||
+            !message.contains("height") || !message["height"].is_number_unsigned()) {
+            fail(request_id, "invalid_request", "Canvas Apply request is malformed");
+            return;
         }
-        
-        if (send_message(response)) {
-            log_to_obs("Canvas size response sent successfully");
-        } else {
-            log_to_obs("Failed to send canvas size response");
+        const uint32_t width = message["width"].get<uint32_t>();
+        const uint32_t height = message["height"].get<uint32_t>();
+        if (width < 320 || width > 7680 || height < 320 || height > 4320) {
+            fail(request_id, "invalid_dimensions",
+                 "Canvas dimensions must be between 320x320 and 7680x4320");
+            return;
         }
-        
-    } catch (const std::exception& e) {
-        log_to_obs(std::format("Error handling canvas size request: {}", e.what()));
-    }
-}
+        if (!qApp) {
+            fail(request_id, "ui_unavailable", "OBS UI thread is unavailable");
+            return;
+        }
 
-// ================================
-// Video Reset Signal Handlers
-// ================================
+        // Video configuration and profile persistence belong to OBS's UI
+        // thread. The WebSocket thread only validates and schedules the work.
+        QMetaObject::invokeMethod(qApp, [request_id, width, height, fail]() {
+            if (m_shutting_down) return;
+            auto* profile = obs_frontend_get_profile_config();
+            if (!profile) { fail(request_id, "profile_unavailable", "OBS profile is unavailable"); return; }
+            if (obs_frontend_streaming_active() || obs_frontend_recording_active() ||
+                obs_frontend_replay_buffer_active() || obs_frontend_virtualcam_active()) {
+                fail(request_id, "output_active",
+                     "Stop streaming, recording, replay buffer, and virtual camera before changing the OBS base canvas");
+                return;
+            }
 
-void vorti::applets::obs_plugin::handle_video_reset_signal(void *data, calldata_t *cd)
-{
-    log_to_obs("🎥 Video reset signal detected - sending canvas size update and resizing banner");
-    
-    // Send canvas size update when video settings reset
-    send_canvas_size_update();
-    
-    // Resize banner to match new canvas size
-    try {
-        auto& banner_mgr = get_global_banner_manager();
-        banner_mgr.resize_banner_to_canvas();
-    } catch (...) {
-        log_to_obs("Failed to resize banner to canvas - banner_manager not available");
-    }
-}
+            obs_video_info video_info{};
+            if (!obs_get_video_info(&video_info)) {
+                fail(request_id, "video_unavailable", "OBS video settings are unavailable");
+                return;
+            }
+            video_info.base_width = width;
+            video_info.base_height = height;
+            const int reset_result = obs_reset_video(&video_info);
+            if (reset_result != OBS_VIDEO_SUCCESS) {
+                const std::string code = reset_result == OBS_VIDEO_CURRENTLY_ACTIVE
+                    ? "output_active"
+                    : "video_reset_failed";
+                fail(request_id, code,
+                     std::format("OBS rejected the base-canvas change (code {})", reset_result));
+                return;
+            }
 
-void vorti::applets::obs_plugin::connect_video_reset_signals()
-{
-    signal_handler_t* obs_signals = obs_get_signal_handler();
-    if (!obs_signals) {
-        log_to_obs("❌ Failed to get OBS signal handler for video reset signals");
-        return;
+            obs_video_info actual{};
+            if (!obs_get_video_info(&actual)) {
+                fail(request_id, "readback_failed", "OBS canvas changed but readback failed");
+                return;
+            }
+            if (!save_canvas_profile(profile, actual.base_width, actual.base_height)) {
+                fail(request_id, "profile_save_failed", "OBS canvas changed but its profile could not be saved; restart may restore the previous dimensions");
+                return;
+            }
+            synchronize_overlay_sources_to_canvas();
+            obs_frontend_save();
+            const auto viewport = get_main_overlay_viewport(actual.base_width, actual.base_height);
+            nlohmann::json response = {
+                {"type", "OBS_CANVAS_APPLY_RESULT"},
+                {"request_id", request_id},
+                {"status", "applied"},
+                {"width", actual.base_width},
+                {"height", actual.base_height},
+                {"output_width", actual.output_width},
+                {"output_height", actual.output_height},
+                {"managed_source_found", viewport.found},
+                {"managed_source_width", viewport.width},
+                {"managed_source_height", viewport.height},
+                {"managed_source_matches", viewport.matches()},
+                {"managed_source_count", viewport.count},
+                {"managed_source_matching_count", viewport.matching_count},
+            };
+            send_message(response);
+            send_canvas_size_update();
+        }, Qt::QueuedConnection);
+    } catch (const std::exception& error) {
+        fail(message.value("request_id", ""), "invalid_request", error.what());
     }
-    
-    // Connect to video_reset signal (main OBS video reset)
-    signal_handler_connect(obs_signals, "video_reset", handle_video_reset_signal, nullptr);
-    
-    // Connect to canvas_video_reset signal (canvas video reset)  
-    signal_handler_connect(obs_signals, "canvas_video_reset", handle_video_reset_signal, nullptr);
-    
-    log_to_obs("✅ Connected to OBS video reset signals for canvas size sync");
-}
-
-void vorti::applets::obs_plugin::disconnect_video_reset_signals()
-{
-    signal_handler_t* obs_signals = obs_get_signal_handler();
-    if (!obs_signals) {
-        return;
-    }
-    
-    // Disconnect video reset signals
-    signal_handler_disconnect(obs_signals, "video_reset", handle_video_reset_signal, nullptr);
-    signal_handler_disconnect(obs_signals, "canvas_video_reset", handle_video_reset_signal, nullptr);
-    
-    log_to_obs("Disconnected from OBS video reset signals");
 }
 
 // ================================

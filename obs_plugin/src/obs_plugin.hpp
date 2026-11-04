@@ -242,11 +242,8 @@ namespace vorti
             // Canvas size synchronization
             void send_canvas_size_update();
             void handle_canvas_size_request(const nlohmann::json& message);
+            void handle_canvas_apply_request(const nlohmann::json& message);
             nlohmann::json get_current_canvas_info();
-            static void handle_video_reset_signal(void *data, calldata_t *cd);
-            void connect_video_reset_signals();
-            void disconnect_video_reset_signals();
-            
             // Complex banner actions removed - handled by external application
 
             // OBS menu creation
@@ -308,15 +305,6 @@ namespace vorti
             std::atomic<int> m_connection_failure_count{0};
             std::string m_selected_service_url;
             std::string m_plugin_secret;  // Security code for authentication
-            
-            // Canvas size tracking
-            struct CanvasSizeInfo {
-                uint32_t width = 0;
-                uint32_t height = 0;
-                uint32_t fps_num = 0;
-                uint32_t fps_den = 1;
-            };
-            CanvasSizeInfo m_last_canvas_size;
             
             // Deep link test function
             static void test_open_vortideck_deep_link();
