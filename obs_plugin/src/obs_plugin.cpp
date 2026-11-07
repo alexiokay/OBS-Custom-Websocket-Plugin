@@ -4325,52 +4325,61 @@ void vorti::applets::obs_plugin::handle_canvas_apply_request(const nlohmann::jso
                 return;
             }
 
-            obs_video_info video_info{};
-            if (!obs_get_video_info(&video_info)) {
+            obs_video_info before{};
+            if (!obs_get_video_info(&before)) {
                 fail(request_id, "video_unavailable", "OBS video settings are unavailable");
                 return;
             }
-            video_info.base_width = width;
-            video_info.base_height = height;
-            const int reset_result = obs_reset_video(&video_info);
-            if (reset_result != OBS_VIDEO_SUCCESS) {
-                const std::string code = reset_result == OBS_VIDEO_CURRENTLY_ACTIVE
-                    ? "output_active"
-                    : "video_reset_failed";
-                fail(request_id, code,
-                     std::format("OBS rejected the base-canvas change (code {})", reset_result));
+            const canvas_size old_base{before.base_width, before.base_height};
+            const canvas_size old_output{before.output_width, before.output_height};
+            const canvas_size new_base{width, height};
+            // Keep the output in the canvas's shape (a portrait canvas is not
+            // squashed into a landscape output) at the user's output quality.
+            const canvas_size new_output = scaled_output_for_canvas(old_base, old_output, new_base);
+            if (!save_canvas_profile(profile, new_base, &new_output)) {
+                fail(request_id, "profile_save_failed", "The OBS profile could not be saved, so the canvas was not changed");
                 return;
             }
 
+            // OBS's own reset path (the one Settings and obs-websocket use): it
+            // reads the profile, resets video and resizes the preview,
+            // projectors and multiview. Calling obs_reset_video directly skips
+            // that and can leave OBS hung.
+            obs_frontend_reset_video();
+
             obs_video_info actual{};
-            if (!obs_get_video_info(&actual)) {
-                fail(request_id, "readback_failed", "OBS canvas changed but readback failed");
+            if (!obs_get_video_info(&actual) || actual.base_width != width || actual.base_height != height) {
+                save_canvas_profile(profile, old_base, &old_output);
+                fail(request_id, "video_reset_failed",
+                     "OBS did not apply the new base canvas. Stop any active output and try again");
                 return;
             }
-            if (!save_canvas_profile(profile, actual.base_width, actual.base_height)) {
-                fail(request_id, "profile_save_failed", "OBS canvas changed but its profile could not be saved; restart may restore the previous dimensions");
-                return;
-            }
-            synchronize_overlay_sources_to_canvas();
-            obs_frontend_save();
-            const auto viewport = get_main_overlay_viewport(actual.base_width, actual.base_height);
-            nlohmann::json response = {
-                {"type", "OBS_CANVAS_APPLY_RESULT"},
-                {"request_id", request_id},
-                {"status", "applied"},
-                {"width", actual.base_width},
-                {"height", actual.base_height},
-                {"output_width", actual.output_width},
-                {"output_height", actual.output_height},
-                {"managed_source_found", viewport.found},
-                {"managed_source_width", viewport.width},
-                {"managed_source_height", viewport.height},
-                {"managed_source_matches", viewport.matches()},
-                {"managed_source_count", viewport.count},
-                {"managed_source_matching_count", viewport.matching_count},
-            };
-            send_message(response);
-            send_canvas_size_update();
+
+            // Resize the managed overlay sources on a later UI turn, once the
+            // video reset has settled.
+            QMetaObject::invokeMethod(qApp, [request_id, actual]() {
+                if (m_shutting_down) return;
+                synchronize_overlay_sources_to_canvas();
+                obs_frontend_save();
+                const auto viewport = get_main_overlay_viewport(actual.base_width, actual.base_height);
+                nlohmann::json response = {
+                    {"type", "OBS_CANVAS_APPLY_RESULT"},
+                    {"request_id", request_id},
+                    {"status", "applied"},
+                    {"width", actual.base_width},
+                    {"height", actual.base_height},
+                    {"output_width", actual.output_width},
+                    {"output_height", actual.output_height},
+                    {"managed_source_found", viewport.found},
+                    {"managed_source_width", viewport.width},
+                    {"managed_source_height", viewport.height},
+                    {"managed_source_matches", viewport.matches()},
+                    {"managed_source_count", viewport.count},
+                    {"managed_source_matching_count", viewport.matching_count},
+                };
+                send_message(response);
+                send_canvas_size_update();
+            }, Qt::QueuedConnection);
         }, Qt::QueuedConnection);
     } catch (const std::exception& error) {
         fail(message.value("request_id", ""), "invalid_request", error.what());

@@ -6,15 +6,45 @@
 
 // The overlay URL is a host-issued capability. Discovery URLs never contain it.
 extern std::string get_global_overlay_capability_url();
+#include <mutex>
 #include <string>
+#include <vector>
 
 struct overlay_source {
     obs_source_t* source;
+    // Written only on the UI thread (create, resize, destroy) but read by the
+    // graphics thread while rendering, so replacements swap under this lock
+    // and readers take their own reference.
     obs_source_t* browser_source;
+    std::mutex browser_mutex;
     std::string overlay_id;
     std::string url;
     bool auto_resize_enabled;
 };
+
+// A reference to the current browser child, safe on any thread; release it.
+static obs_source_t* acquire_browser(overlay_source* context)
+{
+    std::lock_guard<std::mutex> lock(context->browser_mutex);
+    return context->browser_source ? obs_source_get_ref(context->browser_source) : nullptr;
+}
+
+// Replace the browser child (UI thread). The previous one is released after
+// the swap, outside the lock, so rendering never sees a freed source.
+static void replace_browser(overlay_source* context, obs_source_t* replacement)
+{
+    obs_source_t* previous = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(context->browser_mutex);
+        previous = context->browser_source;
+        context->browser_source = replacement;
+    }
+    if (replacement) obs_source_add_active_child(context->source, replacement);
+    if (previous) {
+        obs_source_remove_active_child(context->source, previous);
+        obs_source_release(previous);
+    }
+}
 
 // Lock and configure scene item for main overlay
 static void lock_overlay_item(obs_sceneitem_t* item, const char* overlay_id, uint32_t width, uint32_t height)
@@ -129,10 +159,7 @@ static void handle_canvas_resize(overlay_source* context)
                 blog(LOG_ERROR, "[VortiDeck Overlay] Resize failed; keeping the previous browser source");
                 return;
             }
-            obs_source_remove_active_child(context->source, context->browser_source);
-            obs_source_release(context->browser_source);
-            context->browser_source = replacement;
-            obs_source_add_active_child(context->source, context->browser_source);
+            replace_browser(context, replacement);
         }
         
         obs_data_release(browser_settings);
@@ -269,12 +296,9 @@ static void* overlay_source_create(obs_data_t* settings, obs_source_t* source)
 static void overlay_source_destroy(void* data)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    
-    if (context->browser_source) {
-        obs_source_remove_active_child(context->source, context->browser_source);
-        obs_source_release(context->browser_source);
-    }
-    
+
+    replace_browser(context, nullptr);
+
     delete context;
 }
 
@@ -408,30 +432,39 @@ static obs_properties_t* overlay_source_properties(void* data)
 static uint32_t overlay_source_get_width(void* data)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    return context->browser_source ? obs_source_get_width(context->browser_source) : 0;
+    obs_source_t* browser = acquire_browser(context);
+    const uint32_t width = browser ? obs_source_get_width(browser) : 0;
+    obs_source_release(browser);
+    return width;
 }
 
 static uint32_t overlay_source_get_height(void* data)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    return context->browser_source ? obs_source_get_height(context->browser_source) : 0;
+    obs_source_t* browser = acquire_browser(context);
+    const uint32_t height = browser ? obs_source_get_height(browser) : 0;
+    obs_source_release(browser);
+    return height;
 }
 
 static void overlay_source_render(void* data, gs_effect_t* effect)
 {
+    UNUSED_PARAMETER(effect);
     struct overlay_source* context = (struct overlay_source*)data;
-    
-    if (context->browser_source) {
-        obs_source_video_render(context->browser_source);
+    obs_source_t* browser = acquire_browser(context);
+    if (browser) {
+        obs_source_video_render(browser);
+        obs_source_release(browser);
     }
 }
 
 static void overlay_source_enum_active_sources(void* data, obs_source_enum_proc_t enum_callback, void* param)
 {
     struct overlay_source* context = (struct overlay_source*)data;
-    
-    if (context->browser_source) {
-        enum_callback(context->source, context->browser_source, param);
+    obs_source_t* browser = acquire_browser(context);
+    if (browser) {
+        enum_callback(context->source, browser, param);
+        obs_source_release(browser);
     }
 }
 
@@ -459,23 +492,36 @@ void synchronize_overlay_sources_to_canvas()
 {
     obs_video_info video{};
     if (!obs_get_video_info(&video)) return;
+
+    // Collect first, update afterwards. obs_enum_sources holds OBS's source
+    // list lock; updating (which recreates the browser child) inside it
+    // deadlocks against the graphics thread, which needs that lock to tick.
+    struct collection { obs_video_info video; std::vector<obs_source_t*> sources; } pending{video, {}};
     obs_enum_sources([](void* data, obs_source_t* source) {
-        const auto& video = *static_cast<obs_video_info*>(data);
+        auto& pending = *static_cast<collection*>(data);
         const char* source_id = obs_source_get_unversioned_id(source);
         if (!source_id || strcmp(source_id, vortideck::SOURCE_ID_OVERLAY) != 0) return true;
         obs_data_t* settings = obs_source_get_settings(source);
         const bool main = strcmp(obs_data_get_string(settings, "overlay_id"), "main_overlay") == 0;
         if ((main || obs_data_get_bool(settings, "auto_resize")) &&
-            (obs_data_get_int(settings, "width") != video.base_width ||
-             obs_data_get_int(settings, "height") != video.base_height ||
-             obs_source_get_width(source) != video.base_width || obs_source_get_height(source) != video.base_height)) {
-            obs_data_set_int(settings, "width", video.base_width);
-            obs_data_set_int(settings, "height", video.base_height);
-            obs_source_update(source, settings);
+            (obs_data_get_int(settings, "width") != pending.video.base_width ||
+             obs_data_get_int(settings, "height") != pending.video.base_height ||
+             obs_source_get_width(source) != pending.video.base_width ||
+             obs_source_get_height(source) != pending.video.base_height)) {
+            if (obs_source_t* ref = obs_source_get_ref(source)) pending.sources.push_back(ref);
         }
         obs_data_release(settings);
         return true;
-    }, &video);
+    }, &pending);
+
+    for (obs_source_t* source : pending.sources) {
+        obs_data_t* settings = obs_source_get_settings(source);
+        obs_data_set_int(settings, "width", video.base_width);
+        obs_data_set_int(settings, "height", video.base_height);
+        obs_source_update(source, settings);
+        obs_data_release(settings);
+        obs_source_release(source);
+    }
 }
 
 vortideck_overlay_viewport get_main_overlay_viewport(uint32_t canvas_width, uint32_t canvas_height)
