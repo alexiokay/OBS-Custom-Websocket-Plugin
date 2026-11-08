@@ -56,6 +56,9 @@ target_sources(${CMAKE_PROJECT_NAME}
         obs_plugin/src/mdns_discovery.hpp
         obs_plugin/src/structured_mdns_query.cpp
         obs_plugin/src/structured_mdns_query.hpp
+        obs_plugin/src/preview_feed.cpp
+        obs_plugin/src/preview_feed.hpp
+        obs_plugin/src/preview_feed_protocol.hpp
         obs_plugin/src/ui/service_selection_dialog.cpp
         obs_plugin/src/ui/service_selection_dialog.hpp
         obs_plugin/src/ui/ServiceSelectionDialog.ui
@@ -132,6 +135,13 @@ if(BUILD_TESTING)
       -DMDNS_DISCOVERY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/mdns_discovery.cpp
       -DSTRUCTURED_MDNS_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/obs_plugin/src/structured_mdns_query.cpp
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/mdns-structured-policy.cmake)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(preview-feed-contract cmake/tests/preview-feed-contract.cpp)
+  target_include_directories(preview-feed-contract PRIVATE ${CMAKE_SOURCE_DIR}/obs_plugin/src)
+  set_target_properties(preview-feed-contract PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME preview-feed-contract COMMAND preview-feed-contract)
 endif()
 
 if(BUILD_TESTING)

@@ -91,6 +91,9 @@ target_sources(${CMAKE_PROJECT_NAME}
         src/mdns_discovery.hpp
         src/structured_mdns_query.cpp
         src/structured_mdns_query.hpp
+        src/preview_feed.cpp
+        src/preview_feed.hpp
+        src/preview_feed_protocol.hpp
         src/ui/service_selection_dialog.cpp
         src/ui/service_selection_dialog.hpp
         src/ui/ServiceSelectionDialog.ui

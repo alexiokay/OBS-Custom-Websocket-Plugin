@@ -2,6 +2,8 @@
 #include "ui/service_selection_dialog.hpp"
 #include "sources/overlay_source.h"
 #include "canvas_profile.hpp"
+#include "preview_feed.hpp"
+#include "preview_feed_protocol.hpp"
 #include <QTimer>
 #include <QPointer>
 #include "vortideck_common.h"
@@ -309,6 +311,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
     else if (event == OBS_FRONTEND_EVENT_EXIT)
     {
         blog(LOG_INFO, "[OBS Plugin] EXIT event received - performing shutdown");
+        vortideck::preview_feed::shutdown();
         m_shutting_down = true;
         if (g_canvas_observer) g_canvas_observer->stop();
 
@@ -345,6 +348,12 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
 
 void obs_module_post_load()
 {
+    // Live preview feed for the overlay editor: registers its private source
+    // and output types, otherwise idle until VortiDeck asks for it.
+    vortideck::preview_feed::initialize([](const nlohmann::json& message) {
+        return vorti::applets::obs_plugin::send_message(message);
+    });
+
     register_integration();
 
     // Register all available actions
@@ -367,6 +376,7 @@ void obs_module_post_load()
             if (m_shutting_down) return;
             if constexpr (OVERLAY_ENABLED) synchronize_overlay_sources_to_canvas();
             send_canvas_size_update();
+            vortideck::preview_feed::tick();
         });
         g_canvas_observer->start(1000);
     }
@@ -492,6 +502,8 @@ void vorti::applets::obs_plugin::websocket_close_handler(const websocketpp::conn
         }
     }
 
+    vortideck::preview_feed::on_control_disconnected();
+
     // Notify any waiting jthreads
     m_compressor_ready_cv.notify_all();
     m_initialization_cv.notify_all();
@@ -521,6 +533,7 @@ void vorti::applets::obs_plugin::disconnect()
     
     // Keep continuous discovery running during disconnects (not shutdown)
     // This allows it to find new services while we're disconnected
+    vortideck::preview_feed::on_control_disconnected();
 
     // Notify all waiting threads immediately
     m_compressor_ready_cv.notify_all();
@@ -1111,6 +1124,20 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
             return;
         }
 
+        // Live preview feed control (START / KEEPALIVE / STOP). The preview
+        // socket goes to the host and port this control connection uses.
+        if (message.contains("type") && message["type"].is_string() &&
+            message["type"].get<std::string>().starts_with("PREVIEW_FEED_")) {
+            vortideck::preview_feed::control_endpoint endpoint;
+            try {
+                const auto uri = m_websocket.get_con_from_hdl(connection_handle)->get_uri();
+                endpoint = {uri->get_secure(), uri->get_host(), uri->get_port()};
+            } catch (...) {
+            }
+            vortideck::preview_feed::handle_control_message(message, endpoint);
+            return;
+        }
+
         // Handle server_info messages (these don't have verb/path fields)
         if (message.contains("action") && !message["action"].is_null() && 
             message["action"].get<std::string>() == "server_info") {
@@ -1381,7 +1408,9 @@ bool vorti::applets::obs_plugin::register_integration()
                 { "author", s_integration_author },
                 { "description", s_integration_description },
                 { "icon", s_integration_icon_1 + s_integration_icon_2 },
-                { "manualRegistration", true }
+                { "manualRegistration", true },
+                { "protocolVersion", vortideck::preview::k_protocol_version },
+                { "capabilities", vortideck::preview_feed::capability() }
             }
         }
     };
@@ -4178,10 +4207,15 @@ void vorti::applets::obs_plugin::handle_canvas_apply_request(const nlohmann::jso
             // reads the profile, resets video and resizes the preview,
             // projectors and multiview. Calling obs_reset_video directly skips
             // that and can leave OBS hung.
+            // OBS refuses a video reset while any mix encodes, including the
+            // live preview view, so pause it around the reset.
+            vortideck::preview_feed::suspend_for_video_reset();
             obs_frontend_reset_video();
 
             obs_video_info actual{};
-            if (!obs_get_video_info(&actual) || actual.base_width != width || actual.base_height != height) {
+            const bool applied = obs_get_video_info(&actual) && actual.base_width == width && actual.base_height == height;
+            vortideck::preview_feed::resume_after_video_reset();
+            if (!applied) {
                 save_canvas_profile(profile, old_base, &old_output);
                 fail(request_id, "video_reset_failed",
                      "OBS did not apply the new base canvas. Stop any active output and try again");

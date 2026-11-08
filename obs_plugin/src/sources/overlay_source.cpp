@@ -1,5 +1,6 @@
 #include "overlay_source.h"
 #include "vortideck_common.h"
+#include "../preview_feed.hpp"
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/dstr.h>
@@ -450,6 +451,9 @@ static uint32_t overlay_source_get_height(void* data)
 static void overlay_source_render(void* data, gs_effect_t* effect)
 {
     UNUSED_PARAMETER(effect);
+    // The editor's live preview shows the scene without VortiDeck's overlay;
+    // the stream and recording (main mix) still draw it.
+    if (vortideck::preview_feed::should_skip_overlay_render()) return;
     struct overlay_source* context = (struct overlay_source*)data;
     obs_source_t* browser = acquire_browser(context);
     if (browser) {
