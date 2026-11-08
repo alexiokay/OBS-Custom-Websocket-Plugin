@@ -319,25 +319,16 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
             m_banner_manager.set_shutting_down();
         }
 
-        // CRITICAL: Stop websocket immediately to interrupt any pending connection attempts
-        // Only call stop() if websocket thread was started (which calls init_asio)
-        if (m_websocket_thread) {
-            try {
-                std::lock_guard<std::mutex> wl(m_lock);
-                m_websocket.stop();
-                blog(LOG_INFO, "[OBS Plugin] Websocket stopped");
-            } catch (const std::exception& e) {
-                blog(LOG_WARNING, "[OBS Plugin] Exception stopping websocket: %s", e.what());
-            } catch (...) {
-                blog(LOG_WARNING, "[OBS Plugin] Unknown exception stopping websocket");
-            }
-        }
+        // Stop asio, then join the connection thread (its only owner is this
+        // call). Afterwards no plugin thread touches the websocket.
+        shutdown_control_connection();
 
         // Notify any waiting condition variables to wake up and check shutdown flag
         m_compressor_ready_cv.notify_all();
 
-        // CRITICAL: Stop mDNS discovery FIRST before it tries to reconnect
-        // The discovery thread can still be running and accessing plugin memory
+        // The status loop and discovery read plugin and OBS state; join them
+        // now instead of letting them run past module unload.
+        stop_loop();
         stop_continuous_discovery();
 
         // Shutdown banner manager
@@ -359,12 +350,11 @@ void obs_module_post_load()
     // Register all available actions
     initialize_actions();
     
-    // Start connection in a separate jthread to avoid blocking OBS startup
-    std::jthread([]{
-        // Add a small delay to let OBS finish initializing
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        connect();
-    }).detach();
+    // Starts discovery and the connection thread and returns at once. The
+    // connection thread itself waits a moment for OBS to finish starting.
+    // (This used to be a detached thread that blocked in connect() and could
+    // end up joining the connection thread forever; see THREAD_OWNERSHIP.md.)
+    connect();
     register_regular_actions();
 
     obs_frontend_add_event_callback(handle_obs_frontend_event, nullptr);
@@ -422,22 +412,11 @@ void obs_module_unload()
         vorti::applets::obs_plugin::m_shutting_down = true;
     }
 
-    // CRITICAL: Immediately detach threads - DO NOT SLEEP during shutdown
-    // Sleeping blocks OBS shutdown and causes WASAPI/CEF crashes as they're torn down
-    // Threads have m_shutting_down flag set and will exit gracefully on their own
-
-    // Detach websocket thread immediately
-    if (vorti::applets::obs_plugin::m_websocket_thread &&
-        vorti::applets::obs_plugin::m_websocket_thread->joinable()) {
-        blog(LOG_INFO, "[OBS Plugin] Detaching websocket thread (will exit via shutdown flag)");
-        vorti::applets::obs_plugin::m_websocket_thread->detach();
-    }
-
-    // Detach mDNS discovery thread immediately
-    if (vorti::applets::obs_plugin::m_continuous_discovery_thread.joinable()) {
-        blog(LOG_INFO, "[OBS Plugin] Detaching mDNS discovery thread (will exit via shutdown flag)");
-        vorti::applets::obs_plugin::m_continuous_discovery_thread.detach();
-    }
+    // The EXIT event already stopped and joined every plugin thread. These
+    // calls are no-ops then; they only matter if EXIT never arrived.
+    vorti::applets::obs_plugin::shutdown_control_connection();
+    vorti::applets::obs_plugin::stop_loop();
+    vorti::applets::obs_plugin::stop_continuous_discovery();
 
     blog(LOG_INFO, "[OBS Plugin] OBS module unload complete");
 }
@@ -449,92 +428,38 @@ bool vorti::applets::obs_plugin::connect()
         return false;
     }
 
-    if (is_connected())
-    {
-        log_to_obs("Already connected");
-        return false;
-    }
-
-    log_to_obs("Starting connection process...");
-
-    // Start continuous mDNS discovery if enabled
+    // Discovery runs for the whole session, connected or not, so a restarted
+    // or moved VortiDeck is found again.
     if (m_use_mdns_discovery) {
-        log_to_obs("Starting continuous mDNS discovery for VortiDeck services...");
         start_continuous_discovery();
-        
-        // Try to load last known service first
-        if (load_last_known_service_state()) {
-            log_to_obs("Using last known VortiDeck service for connection");
-        } else {
-            log_to_obs("No previous service found, waiting for discovery...");
-            // Give discovery a few seconds to find a service
-            auto discovery_start = std::chrono::steady_clock::now();
-            while (!m_service_found.load() && !m_shutting_down && 
-                   (std::chrono::steady_clock::now() - discovery_start) < std::chrono::seconds(5)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
     } else {
         log_to_obs("mDNS discovery disabled, using fallback connection");
     }
 
+    bool started = false;
     {
         std::lock_guard<std::mutex> wl(m_lock);
-        m_websocket_open = false;
-        m_current_message_id = 1;
-        m_integration_guid.clear();
-        m_integration_instance.clear();
-
-        if (nullptr == m_websocket_thread)
-        {
-            m_websocket_thread.reset(new std::jthread(&vorti::applets::obs_plugin::_run_forever));
+        // init_asio() once, before the thread exists, so stop() at exit is
+        // valid exactly when the thread may be running asio.
+        if (!m_asio_initialized) {
+            m_websocket.init_asio();
+            m_websocket.clear_access_channels(websocketpp::log::alevel::all);
+            m_websocket.set_access_channels(websocketpp::log::alevel::connect);
+            m_websocket.set_access_channels(websocketpp::log::alevel::disconnect);
+            m_websocket.set_access_channels(websocketpp::log::alevel::app);
+            m_websocket.set_reuse_addr(true);
+            m_asio_initialized = true;
         }
+        started = m_websocket_thread.start([](std::stop_token stop) { _run_forever(stop); });
     }
-
-    // Wait for connection with timeout, checking shutdown flag periodically
-    {
-        std::unique_lock<std::mutex> lk(m_compressor_ready_mutex);
-        auto start_time = std::chrono::system_clock::now();
-        while (!m_websocket_open && !m_shutting_down) {
-            // Wait for 100ms at a time to check shutdown flag frequently
-            if (m_compressor_ready_cv.wait_for(lk, std::chrono::milliseconds(100)) == std::cv_status::timeout) {
-                // Check if total timeout exceeded
-                if (std::chrono::system_clock::now() - start_time > std::chrono::seconds(3)) {
-                    log_to_obs("Connection timeout - will retry later");
-                    disconnect();  // Clean up current attempt, but don't set m_shutting_down
-                    return false;  // This will trigger reconnection logic in _run_forever
-                }
-            }
-        }
-
-        // If we exited because of shutdown, don't proceed
-        if (m_shutting_down) {
-            log_to_obs("Connection wait interrupted by shutdown");
-            return false;
-        }
-    }
-
-    // Start initialization sequence
-    log_to_obs("Connection established, starting initialization sequence...");
-
-    // CRITICAL: Check shutdown flag again before initializing
-    if (m_shutting_down) {
-        log_to_obs("Aborting initialization - shutdown in progress");
-        return false;
-    }
-
-    // Reset failure counter on successful connection
-    m_connection_failure_count = 0;
-
-    // Registration will be handled by websocket_open_handler() when connection is truly open
-
-
-    log_to_obs("Initialization sequence completed successfully");
+    if (started) log_to_obs("Starting connection process...");
     return true;
 }
 
 
-// infinite reconnect
+// Switches to the currently selected service. Called from the UI thread (the
+// service dialog), so it must not wait: closing the current connection is
+// enough, the connection thread reconnects using get_connection_url().
 void vorti::applets::obs_plugin::reconnect() {
     if (m_shutting_down) {
         log_to_obs("Not attempting reconnection - shutting down");
@@ -542,38 +467,8 @@ void vorti::applets::obs_plugin::reconnect() {
     }
 
     log_to_obs("Starting reconnection sequence...");
-    
-    // First, properly clean up existing connection
     disconnect();
-
-    int attempt = 0;
-    const int retry_delay_seconds = 2;
-    
-    while (!is_connected() && !m_shutting_down) {
-        try {
-            log_to_obs(std::format("Reconnection attempt {}", attempt + 1));
-            
-            // Attempt to establish new connection with full initialization
-            if (connect()) {
-                log_to_obs("Reconnection successful");
-                return;
-            }
-            
-            attempt++;
-            // Interruptible sleep - check shutdown every 100ms
-            for (int i = 0; i < retry_delay_seconds * 10 && !m_shutting_down; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-        } catch (const std::exception& e) {
-            log_to_obs("Reconnection attempt failed: " + std::string(e.what()));
-            attempt++;
-            // Interruptible sleep - check shutdown every 100ms  
-            for (int i = 0; i < retry_delay_seconds * 10 && !m_shutting_down; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-    }
+    connect();
 }
 
 
@@ -634,71 +529,56 @@ void vorti::applets::obs_plugin::disconnect()
     // Stop the status update loop first
     stop_loop();
 
-    // FIXED: Improved websocket shutdown with timeout to prevent hangs
-    if (m_websocket_thread)
+    // Close the current connection. This is all a disconnect does: it may run
+    // on the UI thread (service dialog) or on the connection thread itself
+    // (inside websocket_open_handler), so it must neither join that thread
+    // nor stop or reset its io_context. Once the connection has closed,
+    // run() returns and _run_forever() reconnects.
+    // (The old version stopped asio and joined the connection thread here,
+    // which hung forever because that thread never exits before OBS does, and
+    // aborted OBS through std::terminate on a self-join or a double join.)
+    websocketpp::connection_hdl handle;
     {
-        try {
-            log_to_obs("Disconnect: Stopping websocket");
-
-            // CRITICAL: During shutdown, don't block - just detach and exit fast
-            if (m_shutting_down) {
-                log_to_obs("Disconnect: Shutdown in progress - detaching websocket thread");
-                if (m_websocket_thread->joinable()) {
-                    m_websocket_thread->request_stop();
-                    m_websocket_thread->detach();
-                }
-                m_websocket_thread.reset();
-                log_to_obs("Disconnect: Fast shutdown complete");
-                return;  // Exit immediately, don't block
-            }
-
-            // Stop the websocket gracefully
-            m_websocket.stop();
-
-            // Wait for jthread to finish with timeout to prevent hanging
-            if (m_websocket_thread->joinable())
-            {
-                log_to_obs("Disconnect: Requesting thread stop");
-                m_websocket_thread->request_stop();
-                
-                // Use a separate thread to join with timeout
-                std::atomic<bool> join_completed{false};
-                std::jthread timeout_thread([&]() {
-                    m_websocket_thread->join();
-                    join_completed = true;
-                });
-                
-                // Wait up to 3 seconds for graceful shutdown
-                auto timeout_start = std::chrono::steady_clock::now();
-                const auto timeout_duration = std::chrono::seconds(3);
-                
-                while (!join_completed && 
-                       (std::chrono::steady_clock::now() - timeout_start) < timeout_duration) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                
-                if (!join_completed) {
-                    log_to_obs("Disconnect: Thread join timeout - forcing cleanup");
-                    // Thread is stuck, just reset and let it die
-                    timeout_thread.detach();
-                } else {
-                    log_to_obs("Disconnect: Thread joined successfully");
-                }
-            }
-            
-            // Reset the websocket client state
-            m_websocket.reset();
-            
-        } catch (const std::exception& e) {
-            log_to_obs("Error during WebSocket shutdown: " + std::string(e.what()));
-        }
-        
-        // Reset the thread - at this point we've either joined or timed out
-        m_websocket_thread.reset();
-        log_to_obs("Disconnect: Websocket thread cleanup complete");
+        std::lock_guard<std::mutex> wl(m_lock);
+        handle = m_connection_handle;
+    }
+    websocketpp::lib::error_code ec;
+    m_websocket.close(handle, websocketpp::close::status::going_away, "disconnect", ec);
+    if (ec) {
+        // Not open (still connecting or already closed): the connection ends
+        // through its own connect/handshake timeout and the loop retries.
+        log_to_obs("Disconnect: no open connection to close (" + ec.message() + ")");
     }
 
     log_to_obs("Disconnect: Connection cleanup complete");
+}
+
+
+void vorti::applets::obs_plugin::shutdown_control_connection()
+{
+    // Order matters: flag and stop request first, so the connection loop
+    // cannot restart asio after the stop below (see run_control_connection).
+    m_shutting_down = true;
+    m_websocket_thread.request_stop();
+    {
+        std::lock_guard<std::mutex> wl(m_lock);
+        if (m_asio_initialized) {
+            try {
+                m_websocket.stop();
+            } catch (const std::exception& e) {
+                blog(LOG_WARNING, "[OBS Plugin] Exception stopping websocket: %s", e.what());
+            }
+        }
+    }
+    m_compressor_ready_cv.notify_all();
+    m_initialization_cv.notify_all();
+
+    // With asio stopped the thread leaves run() and its loop at once. The
+    // bound only matters if a message handler is blocked in an OBS call.
+    const auto result = m_websocket_thread.stop(std::chrono::seconds(3));
+    if (result != vortideck::lifecycle::stop_result::not_running) {
+        blog(LOG_INFO, "[OBS Plugin] Websocket thread %s", vortideck::lifecycle::to_string(result));
+    }
 }
 
 
@@ -709,103 +589,79 @@ bool vorti::applets::obs_plugin::is_connected()
 }
 
 
-void vorti::applets::obs_plugin::_run_forever()
+namespace {
+// The plugin's side of vortideck::lifecycle::run_control_connection().
+// Everything here runs on the connection thread.
+struct plugin_control_session {
+    bool open()
+    {
+        using namespace vorti::applets::obs_plugin;
+        ws_client::connection_ptr connection = _create_connection();
+        if (!connection) {
+            int failure_count = ++m_connection_failure_count;
+            log_to_obs(std::format("Failed to create connection - retrying in 1 second (failure #{}/10)", failure_count));
+
+            // After 10 failures, reset dialog flag to allow service selection again
+            if (failure_count >= 10) {
+                log_to_obs("Multiple connection failures - allowing service selection dialog again");
+                m_show_selection_dialog = false;
+                m_connection_failure_count = 0;
+            }
+            return false;
+        }
+        m_websocket.connect(connection);
+        return true;
+    }
+
+    void run()
+    {
+        using namespace vorti::applets::obs_plugin;
+        m_websocket.run();  // returns when the connection is gone or asio is stopped
+        {
+            std::lock_guard<std::mutex> wl(m_lock);
+            m_websocket_open = false;
+        }
+        if (!m_shutting_down) log_to_obs("Connection lost - attempting to reconnect in 1 second");
+    }
+
+    void reset() { vorti::applets::obs_plugin::m_websocket.reset(); }
+
+    void on_error(const std::string& message)
+    {
+        using namespace vorti::applets::obs_plugin;
+        {
+            std::lock_guard<std::mutex> wl(m_lock);
+            m_websocket_open = false;
+        }
+        log_to_obs("Exception in WebSocket loop: " + message);
+    }
+
+    std::chrono::milliseconds retry_delay(bool) const { return std::chrono::seconds(1); }
+};
+}  // namespace
+
+void vorti::applets::obs_plugin::_run_forever(std::stop_token stop)
 {
-    // Initial setup
-    {
-        std::lock_guard<std::mutex> wl(m_lock);
-        m_websocket.init_asio();
-        m_websocket.clear_access_channels(websocketpp::log::alevel::all);
-        m_websocket.set_access_channels(websocketpp::log::alevel::connect);
-        m_websocket.set_access_channels(websocketpp::log::alevel::disconnect);
-        m_websocket.set_access_channels(websocketpp::log::alevel::app);
-        
-        // Set a reasonable reuse address to prevent hanging
-        m_websocket.set_reuse_addr(true);
-    }
+    // Let OBS finish starting before the first attempt.
+    if (!vortideck::lifecycle::sleep_for(stop, std::chrono::seconds(1))) return;
 
-    while (!m_shutting_down)
-    {
-        try
-        {
-            websocketpp::lib::error_code ec;
-            ws_client::connection_ptr connection = _create_connection();
-            
-            if (!connection) {
-                int failure_count = ++m_connection_failure_count;
-                log_to_obs(std::format("Failed to create connection - retrying in 1 second (failure #{}/10)", failure_count));
-                
-                // After 10 failures, reset dialog flag to allow service selection again
-                if (failure_count >= 10) {
-                    log_to_obs("Multiple connection failures - allowing service selection dialog again");
-                    m_show_selection_dialog = false;
-                    m_connection_failure_count = 0; // Reset counter
-                }
-                
-                // Interruptible sleep - check shutdown every 100ms
-                for (int i = 0; i < 10 && !m_shutting_down; ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                continue;
-            }
-
-            // Connect and run
-            m_websocket.connect(connection);
-            
-            try {
-                // Run websocket with periodic shutdown checks
-                m_websocket.run();
-            } catch (const std::exception& e) {
-                log_to_obs("Exception in WebSocket run: " + std::string(e.what()));
-            }
-            
-            // Additional shutdown check after websocket.run() exits
-            if (m_shutting_down) {
-                log_to_obs("WebSocket run exited due to shutdown");
-                break;
-            }
-            
-            // If we get here, the connection was closed
-            {
-                std::lock_guard<std::mutex> wl(m_lock);
-                if (m_websocket_open) {
-                    m_websocket_open = false;
-                }
-            }
-            
-            log_to_obs("Connection lost - attempting to reconnect in 1 second");
-
-            // Reset for next attempt (skip if shutting down to avoid blocking)
-            if (!m_shutting_down) {
-                m_websocket.reset();
-            }
-
-            // Small delay before next attempt - interruptible
-            for (int i = 0; i < 10 && !m_shutting_down; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-        catch (const std::exception& e)
-        {
-            log_to_obs("Exception in WebSocket loop: " + std::string(e.what()));
-            
-            // Reset connection state
-            {
-                std::lock_guard<std::mutex> wl(m_lock);
-                m_websocket_open = false;
-            }
-
-            // Reset websocket (skip if shutting down to avoid blocking)
-            if (!m_shutting_down) {
-                m_websocket.reset();
-            }
-
-            // Interruptible sleep - check shutdown every 100ms
-            for (int i = 0; i < 10 && !m_shutting_down; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (m_use_mdns_discovery) {
+        if (load_last_known_service_state()) {
+            log_to_obs("Using last known VortiDeck service for connection");
+        } else {
+            log_to_obs("No previous service found, waiting for discovery...");
+            // Give discovery a few seconds to find a service
+            const auto discovery_start = std::chrono::steady_clock::now();
+            while (!m_service_found.load() && !m_shutting_down &&
+                   std::chrono::steady_clock::now() - discovery_start < std::chrono::seconds(5)) {
+                if (!vortideck::lifecycle::sleep_for(stop, std::chrono::milliseconds(100))) return;
             }
         }
     }
+
+    plugin_control_session session;
+    vortideck::lifecycle::run_control_connection(stop, m_shutting_down, session);
+    log_to_obs("WebSocket connection thread finished");
 }
 
 
@@ -849,7 +705,11 @@ ws_client::connection_ptr vorti::applets::obs_plugin::_create_connection()
         connection->add_subprotocol(m_subprotocol);
     }
 
-    m_connection_handle = connection->get_handle();
+    {
+        // Read by send_message() and disconnect() on other threads.
+        std::lock_guard<std::mutex> wl(m_lock);
+        m_connection_handle = connection->get_handle();
+    }
 
     return connection;
 }
@@ -1063,6 +923,7 @@ void vorti::applets::obs_plugin::websocket_open_handler(const websocketpp::conne
         obs_session_id.clear();
         obs_send_sequence = obs_receive_sequence = 0;
     }
+    m_connection_failure_count = 0;
     m_compressor_ready_cv.notify_one();
 
     // Send registration immediately after connection is established
@@ -2912,69 +2773,42 @@ bool vorti::applets::obs_plugin::send_message(nlohmann::json message)
 }
 
 
+// The status loop is started from the UI thread (post_load) and from the
+// websocket thread (after activation), and stopped from disconnect() on any
+// thread. m_loop_thread is its only owner, so those calls cannot race.
 void vorti::applets::obs_plugin::start_loop()
 {
-    if (!m_loop_thread.joinable())
-    {
-        m_loop_thread_running = true;
-        m_loop_thread = std::jthread(&loop_function);
-    }
+    if (m_shutting_down) return;
+    m_loop_thread.start([](std::stop_token stop) { loop_function(stop); });
 }
 
 
 void vorti::applets::obs_plugin::stop_loop()
 {
-    bool is_joining = false;
-    {
-        if (m_loop_thread.joinable())
-        {
-            std::lock_guard<std::mutex> wlock(m_thread_lock);
-            m_loop_thread_running = false;
-            is_joining = true;
-        }
-    }
-
-    // Stop the jthread
-    if (is_joining)
-    {
-        m_loop_thread.join();
+    // The loop sleeps on its stop token and never waits on the caller, so
+    // this returns within one status update. Never joins from the loop itself.
+    const auto result = m_loop_thread.stop(std::chrono::seconds(2));
+    if (result == vortideck::lifecycle::stop_result::detached_timeout) {
+        log_to_obs("Status loop did not stop in time; released it");
     }
 }
 
 
-void vorti::applets::obs_plugin::loop_function()
+void vorti::applets::obs_plugin::loop_function(std::stop_token stop)
 {
     os_cpu_usage_info_t *cpu_usage = os_cpu_usage_info_start();
 
-    while (true)
+    while (!m_shutting_down && !stop.stop_requested())
     {
-        // CRITICAL: Check shutdown flag first to exit immediately if shutting down
-        if (m_shutting_down) {
-            break;
-        }
-
-        bool is_loop_running = false;
-        long update_interval = 0;
-
-        {
-            std::lock_guard<std::mutex> wlock(m_thread_lock);
-            is_loop_running = m_loop_thread_running;
-            update_interval = m_update_interval;
-        }
-
-        if (is_loop_running)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(update_interval));
-        }
-        else
-        {
+        // Wakes at once when stop_loop() asks this run to end.
+        if (!vortideck::lifecycle::sleep_for(stop, std::chrono::milliseconds(m_update_interval))) {
             break;
         }
 
         std::lock_guard<std::mutex> wlock(m_thread_lock);
 
         // CRITICAL: Check shutdown flag again before calling obs_frontend functions
-        if (m_shutting_down) {
+        if (m_shutting_down || stop.stop_requested()) {
             break;
         }
 
@@ -3443,10 +3277,10 @@ void vorti::applets::obs_plugin::action_overlay_remove(const action_invoke_param
 
 void vorti::applets::obs_plugin::start_continuous_discovery()
 {
-    if (m_continuous_discovery_thread.joinable()) {
-        return; // Already running
+    if (m_shutting_down || m_continuous_discovery_thread.running()) {
+        return; // Already running, or OBS is closing
     }
-    
+
     log_to_obs("Starting continuous mDNS discovery thread");
     m_continuous_discovery_enabled = true;
     
@@ -3458,7 +3292,7 @@ void vorti::applets::obs_plugin::start_continuous_discovery()
     }
     
     // Start the continuous discovery thread
-    m_continuous_discovery_thread = std::jthread([]() { continuous_discovery_worker(); });
+    m_continuous_discovery_thread.start([](std::stop_token) { continuous_discovery_worker(); });
 }
 
 void vorti::applets::obs_plugin::stop_continuous_discovery()
@@ -3472,13 +3306,12 @@ void vorti::applets::obs_plugin::stop_continuous_discovery()
         m_mdns_discovery->stop_discovery();
     }
 
-    // Request thread stop - it will check m_shutting_down and exit
-    if (m_continuous_discovery_thread.joinable()) {
-        m_continuous_discovery_thread.request_stop();
-
-        // DON'T join or detach - just let it exit when it checks flags
-        // The process will terminate soon anyway
-        log_to_obs("Requested mDNS discovery thread to stop");
+    // The worker leaves its loop once the flags above are cleared. Join it so
+    // it does not keep running plugin code after the module is unloaded; an
+    // in-flight mDNS query is bounded, so give it a little longer.
+    const auto result = m_continuous_discovery_thread.stop(std::chrono::seconds(3));
+    if (result != vortideck::lifecycle::stop_result::not_running) {
+        log_to_obs(std::format("mDNS discovery thread {}", vortideck::lifecycle::to_string(result)));
     }
 }
 

@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "banner_manager.hpp"
+#include "connection_lifecycle.hpp"
 #include "mdns_discovery.hpp"
 
 // Qt includes for deep links
@@ -148,9 +149,15 @@ namespace vorti
                 }
             };
 
+            // Starts discovery and the connection thread; never blocks.
             bool connect();
+            // Drops the current connection so the connection thread reconnects
+            // (to a newly selected service, for example); never blocks.
             void reconnect();
+            // Closes the current connection; never joins the connection thread.
             void disconnect();
+            // OBS exit only: stops asio, then joins the connection thread.
+            void shutdown_control_connection();
             bool is_connected();
 
             // mDNS discovery functions with continuous search
@@ -178,7 +185,7 @@ namespace vorti
             static void connection_settings_menu_callback(void* data); // Static callback for OBS menu
             std::string get_connection_url();
 
-            void _run_forever();
+            void _run_forever(std::stop_token stop);
             ws_client::connection_ptr _create_connection();
 
             void websocket_open_handler(const websocketpp::connection_hdl &connection_handle);
@@ -271,7 +278,7 @@ namespace vorti
 
             void start_loop();
             void stop_loop();
-            void loop_function();
+            void loop_function(std::stop_token stop);
 
             std::atomic<bool> m_shutting_down;
             std::atomic<bool> m_collection_locked;
@@ -282,7 +289,10 @@ namespace vorti
             websocketpp::connection_hdl m_connection_handle;
             const std::string m_subprotocol = "json";
             const websocketpp::frame::opcode::value m_subprotocol_opcode = websocketpp::frame::opcode::text;
-            std::unique_ptr<std::jthread> m_websocket_thread;
+            // Owner: connect() starts it once, shutdown_control_connection()
+            // stops it. Nothing else joins or detaches it.
+            vortideck::lifecycle::owned_thread m_websocket_thread;
+            bool m_asio_initialized = false;  // guarded by m_lock
             uint16_t m_current_port = 9001;
 
             // mDNS discovery for VortiDeck services with continuous searching
@@ -293,7 +303,7 @@ namespace vorti
             
             // Continuous discovery management
             std::atomic<bool> m_continuous_discovery_enabled{true};
-            std::jthread m_continuous_discovery_thread;
+            vortideck::lifecycle::owned_thread m_continuous_discovery_thread;
             std::mutex m_discovered_services_mutex;
             std::vector<ServiceInfo> m_discovered_services;
             std::chrono::steady_clock::time_point m_last_discovery_time;
@@ -329,8 +339,7 @@ namespace vorti
 
             std::mutex m_thread_lock;
 
-            std::jthread m_loop_thread;
-            bool m_loop_thread_running = false;
+            vortideck::lifecycle::owned_thread m_loop_thread;  // owner: start_loop()/stop_loop()
 
             std::chrono::time_point<std::chrono::steady_clock> m_start_time;
             bool m_studio_mode = false;

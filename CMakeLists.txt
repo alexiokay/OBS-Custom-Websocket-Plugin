@@ -149,3 +149,22 @@ if(BUILD_TESTING)
     endforeach()
   endif()
 endif()
+
+if(BUILD_TESTING)
+  # Control-connection thread lifecycle under a VortiDeck that keeps going up
+  # and down. `--legacy <scenario>` reproduces the pre-fix crashes (manual).
+  add_executable(connection-lifecycle-stress cmake/tests/connection-lifecycle-stress.cpp)
+  target_include_directories(
+    connection-lifecycle-stress
+    PRIVATE
+      ${CMAKE_SOURCE_DIR}/obs_plugin/src
+      ${CMAKE_SOURCE_DIR}/other/websocketpp
+      ${CMAKE_SOURCE_DIR}/other/asio/asio/include)
+  set_target_properties(connection-lifecycle-stress PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  if(WIN32)
+    target_compile_definitions(connection-lifecycle-stress PRIVATE _WIN32_WINNT=0x0A00 _SILENCE_CXX23_ALIGNED_STORAGE_DEPRECATION_WARNING)
+    target_link_libraries(connection-lifecycle-stress PRIVATE ws2_32 mswsock)
+  endif()
+  add_test(NAME connection-lifecycle-stress COMMAND connection-lifecycle-stress --seconds 8)
+  set_tests_properties(connection-lifecycle-stress PROPERTIES TIMEOUT 60)
+endif()
