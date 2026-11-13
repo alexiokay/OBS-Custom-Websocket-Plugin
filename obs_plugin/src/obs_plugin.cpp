@@ -1,6 +1,7 @@
 #include "obs_plugin.hpp"
 #include "ui/service_selection_dialog.hpp"
 #include "sources/overlay_source.h"
+#include "sources/sponsor_placement.hpp"
 #include "canvas_profile.hpp"
 #include "preview_feed.hpp"
 #include "preview_feed_protocol.hpp"
@@ -63,7 +64,7 @@ void log_to_obs(std::string_view message);
 // Global function to access banner_manager from banner_source
 vorti::applets::banner_manager& get_global_banner_manager()
 {
-    return vorti::applets::obs_plugin::m_banner_manager;
+    return vorti::applets::obs_plugin::legacy_banner_manager();
 }
 
 // Global function to get WebSocket connection URL for banner defaults
@@ -244,7 +245,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
         // This prevents banner restoration threads from spawning during shutdown
         if constexpr (BANNER_MANAGER_ENABLED) {
             if (!m_shutting_down) {
-                m_banner_manager.cleanup_for_scene_collection_change();
+                legacy_banner_manager().cleanup_for_scene_collection_change();
             } else {
                 blog(LOG_INFO, "[OBS Plugin] Skipping banner cleanup - shutdown in progress");
             }
@@ -265,11 +266,11 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
             if constexpr (BANNER_MANAGER_ENABLED) {
                 // Use printf since log_to_obs is not available in this scope
                 printf("[OBS Plugin] Scene collection changed - re-initializing banners\n");
-                m_banner_manager.initialize_after_obs_ready();
+                legacy_banner_manager().initialize_after_obs_ready();
 
                 // SAFE: Enable signal connections after banners are stable
                 printf("[OBS Plugin] Enabling banner signal protection after scene collection change\n");
-                m_banner_manager.enable_signal_connections_when_safe();
+                legacy_banner_manager().enable_signal_connections_when_safe();
             }
         }
 
@@ -279,7 +280,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
                 static bool signals_enabled = false;
                 if (!signals_enabled) {
                     printf("[OBS Plugin] Scene list ready - enabling banner signal protection\n");
-                    m_banner_manager.enable_signal_connections_when_safe();
+                    legacy_banner_manager().enable_signal_connections_when_safe();
                     signals_enabled = true;
                 }
             }
@@ -319,7 +320,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
         // Sources are destroyed shortly after this event, before obs_module_unload()
         if constexpr (BANNER_MANAGER_ENABLED) {
             blog(LOG_INFO, "[OBS Plugin] Setting banner_manager shutdown flag in EXIT event");
-            m_banner_manager.set_shutting_down();
+            legacy_banner_manager().set_shutting_down();
         }
 
         // Stop asio, then join the connection thread (its only owner is this
@@ -337,7 +338,7 @@ static void handle_obs_frontend_event(enum obs_frontend_event event, void *)
         // Shutdown banner manager
         if constexpr (BANNER_MANAGER_ENABLED) {
             blog(LOG_INFO, "[OBS Plugin] Shutting down banner manager");
-            m_banner_manager.shutdown();
+            legacy_banner_manager().shutdown();
         }
 
         // DON'T stop websocket loop or uninitialize - process will terminate naturally
@@ -376,15 +377,15 @@ void obs_module_post_load()
             if (m_shutting_down) return;
             if constexpr (OVERLAY_ENABLED) synchronize_overlay_sources_to_canvas();
             send_canvas_size_update();
+            if (is_connected() && !vortideck::sponsor::bound_id.empty())
+                send_message(vortideck::sponsor::observe());
             vortideck::preview_feed::tick();
         });
         g_canvas_observer->start(1000);
     }
 
     // Register custom VortiDeck sources
-    if constexpr (BANNER_MANAGER_ENABLED) {
-        register_banner_source();   // Banner source for free users
-    }
+    register_banner_source(); // Existing saved scenes retain vortideck_banner_menu.
     if constexpr (OVERLAY_ENABLED) {
         register_overlay_source();  // Overlay source
     }
@@ -411,9 +412,9 @@ void obs_module_unload()
     // This stops signal handlers immediately, even if they're already queued
     if constexpr (BANNER_MANAGER_ENABLED) {
         blog(LOG_INFO, "[OBS Plugin] Setting banner_manager shutdown flag IMMEDIATELY");
-        vorti::applets::obs_plugin::m_banner_manager.set_shutting_down();
+        vorti::applets::obs_plugin::legacy_banner_manager().set_shutting_down();
         blog(LOG_INFO, "[OBS Plugin] Disconnecting banner_manager signals");
-        vorti::applets::obs_plugin::m_banner_manager.disconnect_all_signals();
+        vorti::applets::obs_plugin::legacy_banner_manager().disconnect_all_signals();
     }
 
     // Just set flag - everything else already cleaned up in EXIT event
@@ -1106,6 +1107,29 @@ void vorti::applets::obs_plugin::websocket_message_handler(const websocketpp::co
                     }, Qt::QueuedConnection);
                 }
             }
+            return;
+        }
+
+        if (message.value("type", "") == "SPONSOR_BIND" || message.value("type", "") == "SPONSOR_OBSERVE" || message.value("type", "") == "SPONSOR_FRAME") {
+            QMetaObject::invokeMethod(qApp, [message] {
+                if (m_shutting_down || !is_connected()) return;
+                try {
+                    const std::string id = message.at("placement");
+                    if (QUuid::fromString(QString::fromStdString(id)).isNull()) return;
+                    if (message.value("type", "") == "SPONSOR_BIND")
+                        vortideck::sponsor::bind(id, message.at("url"));
+                    else if (message.value("type", "") == "SPONSOR_FRAME") {
+                        if (id != vortideck::sponsor::bound_id) return;
+                        vortideck::sponsor::set_frame(message);
+                    }
+                    else if (message.contains("url"))
+                        vortideck::sponsor::reconnect(id, message.at("url"));
+                    vortideck::sponsor::bound_id = id;
+                    send_message(vortideck::sponsor::observe());
+                } catch (const std::exception& error) {
+                    send_message({{"type","SPONSOR_BIND_ERROR"},{"placement",message.value("placement","")},{"error",error.what()}});
+                }
+            }, Qt::QueuedConnection);
             return;
         }
 
@@ -2981,11 +3005,11 @@ void vorti::applets::obs_plugin::loop_function(std::stop_token stop)
 void vorti::applets::obs_plugin::create_obs_menu()
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
-        m_banner_manager.add_banner_menu();
+        legacy_banner_manager().add_banner_menu();
         
         // CRITICAL: Initialize banners after OBS is fully loaded
         // This prevents the "sources could not be unloaded" error
-        m_banner_manager.initialize_after_obs_ready();
+        legacy_banner_manager().initialize_after_obs_ready();
     }
     
     // Create top-level VortiDeck menu (replaces individual Tools menu items)
@@ -2999,7 +3023,7 @@ void vorti::applets::obs_plugin::action_banner_show(const action_invoke_paramete
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
         log_to_obs("ACTION_BANNER_SHOW: Showing banner");
-        m_banner_manager.show_banner();
+        legacy_banner_manager().show_banner();
     }
 }
 
@@ -3007,7 +3031,7 @@ void vorti::applets::obs_plugin::action_banner_hide(const action_invoke_paramete
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
         log_to_obs("ACTION_BANNER_HIDE: Hiding banner");
-        m_banner_manager.hide_banner();
+        legacy_banner_manager().hide_banner();
     }
 }
 
@@ -3015,7 +3039,7 @@ void vorti::applets::obs_plugin::action_banner_toggle(const action_invoke_parame
 {
     if constexpr (BANNER_MANAGER_ENABLED) {
         log_to_obs("ACTION_BANNER_TOGGLE: Toggling banner");
-        m_banner_manager.toggle_banner();
+        legacy_banner_manager().toggle_banner();
     }
 }
 
@@ -4018,11 +4042,11 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
     QMenu* vortideck_menu = menu_bar->addMenu("VortiDeck");
     
     // Add Banner Settings submenu item
-    QAction* banner_action = vortideck_menu->addAction("Banner Settings (ADS)");
+    QAction* banner_action = vortideck_menu->addAction("Sponsor Autopilot");
     QObject::connect(banner_action, &QAction::triggered, []() {
-        log_to_obs("VortiDeck Banner Settings (ADS) clicked from top-level menu");
+        log_to_obs("VortiDeck Sponsor Autopilot clicked from top-level menu");
         // Open VortiDeck banner settings page
-        DeepLinkHandler::open_vortideck_with_fallback("banner-settings");
+        DeepLinkHandler::open_vortideck_with_fallback("streaming/sponsors");
     });
     
     // Add separator
@@ -4044,7 +4068,7 @@ void vorti::applets::obs_plugin::create_vortideck_menu()
         }
     });
     
-    log_to_obs("✅ VortiDeck top-level menu created with Banner Settings (ADS), Overlays, and Connection Settings");
+    log_to_obs("✅ VortiDeck top-level menu created with Sponsor Autopilot, Overlays, and Connection Settings");
 }
 
 void vorti::applets::obs_plugin::connection_settings_menu_callback(void* data)

@@ -430,7 +430,11 @@ namespace vorti
             // clang-format on
 
             // Banner functionality - using separate banner manager class
-            banner_manager m_banner_manager;
+            // The retired free-tier manager stays dormant unless an explicit legacy build enables it.
+            inline banner_manager& legacy_banner_manager() {
+                static banner_manager manager;
+                return manager;
+            }
             
             // Feature flags - set to false to disable specific functionality
 
